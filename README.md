@@ -68,7 +68,7 @@ npm run dev
 | `npm run install:clean` | nuke and reinstall dependencies |
 | `npm run repair:native` | fixes better-sqlite3 if it gets out of sync with your node version |
 
-**you'll need:** Node.js 18+, and if you're building the actual desktop app (not just running the dev servers), Rust plus Tauri's platform prerequisites — see https://tauri.app/start/prerequisites/
+**you'll need:** Node.js 18+, and if you're building the actual desktop app (not just running the dev servers), Rust plus Tauri's platform prerequisites. see https://tauri.app/start/prerequisites/
 
 ### dev ports
 
