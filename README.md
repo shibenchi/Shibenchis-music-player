@@ -4,7 +4,7 @@ I built this because I didn't want to keep paying for Spotify or YouTube Premium
 
 ---
 
-## about this version, 1.3.1
+## about this version, and starting from 1.3.1
 
 Quick heads up on the version number: if you remember an older version of this, no, you didn't miss a bunch of releases between then and now. I'm running this off older code I picked back up, so I started a fresh numbering scheme instead of pretending it's a clean continuation from 1.0.0. Easier for me to just call it 1.3.1 and move on.
 
