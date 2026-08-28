@@ -1,0 +1,110 @@
+name: Build macOS release
+
+# fires on a version tag (push a "v1.3.2"-style tag to actually cut a
+# release) or manually from the Actions tab when you just want to test the
+# build first — a manual run NEVER publishes anything, it only ever
+# produces a downloadable .dmg workflow artifact
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# tauri-action needs to create a release and upload the .dmg to it — the
+# default GITHUB_TOKEN is read-only on newer repos unless you say otherwise
+# here, and without this a real tag push would fail right when it counts
+permissions:
+  contents: write
+
+env:
+  # the node version bundled INTO the app as the runtime that spawns
+  # server/index.js — doesnt need to match whatever node this workflow
+  # itself uses to run npm/react-scripts, just needs to be a real LTS
+  BUNDLED_NODE_VERSION: 22.11.0
+
+jobs:
+  build-macos:
+    # apple silicon runner — cross-compiles to x86_64 too below, so the
+    # final app is a universal binary that runs natively on both intel and
+    # apple silicon macs, not just whichever arch happened to build it
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node (build tooling)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # the app spawns this as a child process to run the actual server —
+      # its a plain binary resource, not something rust/cargo builds, so it
+      # has to be fetched and dropped into place before `tauri build` runs.
+      # x64 only (not universal) — runs natively on intel macs and via
+      # rosetta on apple silicon, which is a total non-issue for a short-
+      # lived local server process. saves bundling two copies for basically
+      # zero real benefit
+      - name: Fetch bundled Node.js runtime (darwin x64)
+        run: |
+          mkdir -p src-tauri/binaries
+          curl -fsSL "https://nodejs.org/dist/v${BUNDLED_NODE_VERSION}/node-v${BUNDLED_NODE_VERSION}-darwin-x64.tar.gz" -o node.tar.gz
+          tar -xzf node.tar.gz
+          cp "node-v${BUNDLED_NODE_VERSION}-darwin-x64/bin/node" src-tauri/binaries/node
+          chmod +x src-tauri/binaries/node
+          rm -rf node.tar.gz "node-v${BUNDLED_NODE_VERSION}-darwin-x64"
+
+      - name: Install frontend/root dependencies
+        run: npm ci
+
+      # separate, minimal package.json (server/runtime deps only, no
+      # react-scripts etc) — installed fresh HERE so better-sqlite3 (native
+      # module) resolves/compiles its actual mac binary instead of shipping
+      # whatever happens to be sitting in dist-server/node_modules from a
+      # previous windows build
+      - name: Install server runtime dependencies (native mac build)
+        working-directory: dist-server
+        run: npm install
+
+      - name: Build frontend
+        run: npm run build
+
+      # workflow_dispatch (manual test run) — just build it, no publishing.
+      # this is the ONLY step that runs for a manual run; the tag-push
+      # release step below is skipped entirely in that case
+      - name: Build the macOS app (test run, not published)
+        if: github.ref_type != 'tag'
+        run: npm run desktop-build -- --target universal-apple-darwin
+
+      - name: Upload .dmg as a workflow artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shibenchi-music-player-macos
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+      # real tag push — build it AND attach the .dmg to a draft github
+      # release named after the tag. this step (and only this step) is
+      # skipped entirely on a manual workflow_dispatch run
+      - name: Build + publish release (macOS, universal binary)
+        if: github.ref_type == 'tag'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: "Shibenchi's Music Player ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: false

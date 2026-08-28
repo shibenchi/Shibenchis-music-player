@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Shibenchi's music player</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0a0a0a;
+    color: #fef3e2;
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    overflow: hidden;
+  }
+  #wrap {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    -webkit-app-region: drag;
+  }
+  #ring {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    border: 3px solid rgba(255, 89, 0, 0.2);
+    border-top-color: #ff5900;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #phase {
+    font-size: 13px;
+    opacity: 0.75;
+    letter-spacing: 0.02em;
+  }
+  #barTrack {
+    width: 220px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+  }
+  #barFill {
+    height: 100%;
+    width: 0%;
+    background: #ff5900;
+    transition: width 0.25s ease;
+  }
+  #pct {
+    font-size: 11px;
+    opacity: 0.5;
+  }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="ring"></div>
+    <div id="barTrack"><div id="barFill"></div></div>
+    <div id="phase">starting…</div>
+    <div id="pct">0%</div>
+  </div>
+  <script>
+    function log(msg) {
+      try {
+        if (window.__TAURI__ && window.__TAURI__.core) {
+          window.__TAURI__.core.invoke('frontend_log', { source: 'splash', message: msg });
+        }
+      } catch (e) { /* nothing to fall back to here */ }
+    }
+
+    var phaseEl = document.getElementById('phase');
+    var fillEl = document.getElementById('barFill');
+    var pctEl = document.getElementById('pct');
+    var navigated = false;
+
+    function setProgress(percent, phase) {
+      fillEl.style.width = Math.max(0, Math.min(100, percent)) + '%';
+      pctEl.textContent = Math.round(percent) + '%';
+      if (phase) phaseEl.textContent = phase + '…';
+    }
+
+    function goToApp(url) {
+      if (navigated) return;
+      navigated = true;
+      log('navigating to ' + url);
+      window.location.href = url;
+    }
+
+    log('splash loaded, __TAURI__ present: ' + !!window.__TAURI__);
+    // independent of whether invoke/frontend_log actually works — visible
+    // via the OS window title even if the IPC bridge itself is broken.
+    document.title = 'TAURI=' + !!window.__TAURI__ + ' CORE=' + !!(window.__TAURI__ && window.__TAURI__.core) + ' EVENT=' + !!(window.__TAURI__ && window.__TAURI__.event);
+
+    if (window.__TAURI__ && window.__TAURI__.event) {
+      window.__TAURI__.event.listen('startup-progress', function (event) {
+        var p = event.payload || {};
+        setProgress(p.percent || 0, p.phase || '');
+      });
+      window.__TAURI__.event.listen('startup-ready', function (event) {
+        var p = event.payload || {};
+        setProgress(100, 'ready');
+        goToApp(p.url || 'http://localhost:3001');
+      });
+    } else {
+      log('window.__TAURI__ missing entirely — falling back to a fixed delay');
+      phaseEl.textContent = 'starting…';
+      setTimeout(function () { goToApp('http://localhost:3001'); }, 4000);
+    }
+
+    // absolute fallback: if for any reason the ready event never arrives
+    // (crash, event bus hiccup), don't leave the user stuck on a spinner
+    // forever.
+    setTimeout(function () {
+      if (!navigated) {
+        log('startup-ready never arrived after 25s, forcing navigation');
+        goToApp('http://localhost:3001');
+      }
+    }, 25000);
+  </script>
+</body>
+</html>

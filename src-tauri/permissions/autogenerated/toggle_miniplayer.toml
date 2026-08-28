@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toggle-miniplayer"
+description = "Enables the toggle_miniplayer command without any pre-configured scope."
+commands.allow = ["toggle_miniplayer"]
+
+[[permission]]
+identifier = "deny-toggle-miniplayer"
+description = "Denies the toggle_miniplayer command without any pre-configured scope."
+commands.deny = ["toggle_miniplayer"]

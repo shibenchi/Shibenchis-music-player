@@ -1,0 +1,44 @@
+node_modules
+build
+data
+downloads
+temp_audio
+logs
+backups
+
+# platform runtime binaries bundled into the app at build time (node.exe,
+# the mac node binary, etc) — these get fetched/placed fresh by whatever
+# machine or CI runner is actually doing the build, never committed
+src-tauri/binaries/
+.ai
+*.log
+.DS_Store
+Thumbs.db
+*.docx
+*.zip
+
+# keys and secrets
+KEY
+*.pem
+*_rsa
+*_ed25519
+id_rsa*
+id_ed25519*
+.env
+.env.*
+
+# allow png files in public folder (icons, images)
+!public/*.png
+
+# kept on disk, just not pushed
+CHANGELOG.md
+INSTALL.md
+LICENSE
+QUICKREF.md
+SMP notif.wav
+SMP notif 2.wav
+public/SMP notif.wav
+public/SMP notif 2.wav
+installer.bat
+start.bat
+stop.bat

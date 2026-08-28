@@ -1,0 +1,1101 @@
+html, body, #root {
+  height: 100%;
+}
+
+/* used on search results, dropdowns, cards sitting over the bg visualizer
+   canvas - translucent + blurred so whatevers drawing behind (bars,
+   particles etc) reads as a soft blur through it instead of a hard edge
+   showing through unblurred */
+.glass-dark {
+  background: rgba(10, 10, 10, 0.72) !important;
+  backdrop-filter: blur(14px) !important;
+  -webkit-backdrop-filter: blur(14px) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* theme vars, react updates these live */
+:root {
+  --theme-primary: rgb(255, 89, 0);
+  --theme-primary-rgb: 255, 89, 0;
+  --theme-primary-rgba: rgba(255, 89, 0, 0.25);
+  --theme-primary-dark: rgba(255, 89, 0, 0.15);
+  --theme-glow: rgba(255, 89, 0, 0.5);
+  --theme-shadow: rgba(255, 89, 0, 0.3);
+  --theme-neon-glow: 0 0 20px rgba(255, 89, 0, 0.6);
+  --border-radius-sm: 3px;
+  --border-radius-md: 5px;
+  --border-radius-lg: 6px;
+  --border-radius-xl: 8px;
+}
+
+/* neon red */
+[data-theme="neon-red"] {
+  --theme-primary: rgb(255, 30, 30);
+  --theme-primary-rgba: rgba(255, 30, 30, 0.25);
+  --theme-primary-dark: rgba(255, 30, 30, 0.15);
+  --theme-glow: rgba(255, 30, 30, 0.6);
+  --theme-shadow: rgba(255, 30, 30, 0.4);
+}
+
+/* neon yellow */
+[data-theme="neon-yellow"] {
+  --theme-primary: rgb(255, 230, 0);
+  --theme-primary-rgba: rgba(255, 230, 0, 0.25);
+  --theme-primary-dark: rgba(255, 230, 0, 0.15);
+  --theme-glow: rgba(255, 230, 0, 0.6);
+  --theme-shadow: rgba(255, 230, 0, 0.4);
+}
+
+/* neon green */
+[data-theme="neon-green"] {
+  --theme-primary: rgb(50, 255, 50);
+  --theme-primary-rgba: rgba(50, 255, 50, 0.25);
+  --theme-primary-dark: rgba(50, 255, 50, 0.15);
+  --theme-glow: rgba(50, 255, 50, 0.6);
+  --theme-shadow: rgba(50, 255, 50, 0.4);
+}
+
+/* neon blue */
+[data-theme="neon-blue"] {
+  --theme-primary: rgb(0, 200, 255);
+  --theme-primary-rgba: rgba(0, 200, 255, 0.25);
+  --theme-primary-dark: rgba(0, 200, 255, 0.15);
+  --theme-glow: rgba(0, 200, 255, 0.6);
+  --theme-shadow: rgba(0, 200, 255, 0.4);
+}
+
+/* bg is handled by index.html for the true oled black */
+
+.card {
+  /* solid dark card, subtle outline, keeping it simple */
+  background: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.08);
+  border: 1px solid var(--theme-primary) !important;
+  border-radius: var(--border-radius-md);
+  clip-path: none;
+}
+
+/* queue items, rounded corners */
+.track-item,
+.search-result-item {
+  border-radius: var(--border-radius-sm) !important;
+  margin-bottom: 10px;
+  transition: all 0.2s ease;
+  background: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.08);
+  border: 1px solid var(--theme-primary) !important;
+  cursor: pointer;
+}
+.track-item:last-child,
+.search-result-item:last-child {
+  margin-bottom: 0;
+}
+
+.snap-panel-body {
+  padding: 14px 16px !important;
+}
+
+.collab-track-item {
+  box-shadow: inset 3px 0 0 rgba(var(--theme-primary-rgb, 255, 89, 0), 0.28);
+}
+
+.collab-track-source {
+  box-shadow: inset 3px 0 0 rgba(var(--theme-primary-rgb, 255, 89, 0), 0.16);
+}
+
+/* track hover - theme bg, black text. border-color alone can basically
+   vanish if the theme color is already dark, so the light outer ring is
+   there to keep the hover state actually visible no matter what color */
+.track-item:hover {
+  background: var(--theme-primary) !important;
+  border-color: #000000 !important;
+  border-width: 2px !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.55), 0 4px 14px rgba(0, 0, 0, 0.4) !important;
+}
+
+.track-item:hover .fw-bold,
+.track-item:hover .text-muted {
+  color: #000000 !important;
+}
+
+/* icons go black on card hover. covers both .track-action-btn and the
+   plain queue-row buttons (trash/add/download) — those used to rely on a
+   janky js mouseenter/mouseleave hack setting the svg color/fill directly,
+   which had zero clue when the theme color changed while you werent
+   hovering it, so it just went stale until the next hover fixed it. found
+   that bug FOREVER after it kept "not updating right". plain css :hover
+   literally cannot go stale, its always just whatever the state is */
+.track-item:hover .track-action-btn svg,
+.track-item:hover .btn-group .btn svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* button borders go black on hover too */
+.track-item:hover .track-action-btn,
+.track-item:hover .btn-group .btn {
+  border-color: #000000 !important;
+}
+
+.track-item:hover .download-single-btn,
+.track-item:hover .download-single-btn svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+  border-color: #000000 !important;
+}
+
+/* keep track titles/artists in their original youtube casing */
+.track-item .fw-bold,
+.track-item .text-muted,
+.search-result-item .fw-semibold,
+.search-result-item .text-muted {
+  text-transform: none;
+}
+
+/* playlist tracks - thinner, height just does its thing */
+.playlist-track-item {
+  padding: 6px 8px !important;
+  min-height: auto;
+  height: auto;
+}
+
+.playlist-track-item .fw-bold,
+.playlist-track-item .text-muted {
+  font-size: 13px;
+  white-space: normal;
+  word-break: break-word;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.playlist-track-item .fw-bold {
+  max-width: 100%;
+  margin-bottom: 2px;
+}
+
+/* selected/active queue item */
+.track-item.active,
+.list-group-item.active {
+  background: var(--theme-primary-dark) !important;
+  border: 1px solid var(--theme-primary) !important;
+  color: rgba(255, 255, 255, 0.95) !important;
+}
+
+.track-item.active .fw-bold,
+.track-item.active .text-muted {
+  color: rgba(255, 255, 255, 0.95) !important;
+}
+
+/* active track hover - darker bg, theme text, black border */
+.track-item.active:hover {
+  background: var(--theme-primary-dark) !important;
+  border-color: #000000 !important;
+}
+
+.track-item.active:hover .fw-bold,
+.track-item.active:hover .text-muted {
+  color: var(--theme-primary) !important;
+}
+
+/* active track icons stay theme colored on hover instead of going black */
+.track-item.active:hover .track-action-btn svg {
+  color: var(--theme-primary) !important;
+  fill: var(--theme-primary) !important;
+}
+
+/* nah, no hover animation here, keep it flat */
+.track-item .fw-bold {
+  transition: none;
+}
+.track-item:hover .fw-bold {
+  color: inherit;
+}
+.track-item:hover {
+  background: rgba(0, 0, 0, 0.5);
+  transform: none;
+  box-shadow: none;
+}
+
+/* search result titles need to actually be readable on black */
+.fw-semibold.text-truncate {
+  color: #fff !important;
+}
+
+/* no hover animations on the main cards, was too much */
+.card-hover {
+  transition: none !important;
+}
+.card-hover:hover {
+  background: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.1) !important;
+  border-color: var(--theme-primary) !important;
+}
+
+.wire-panel:hover {
+  background: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.12) !important;
+  border-color: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.95) !important;
+}
+
+.sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 340px;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.92);
+  box-shadow: 0 0 16px var(--theme-shadow);
+  border-right: 1px solid var(--theme-primary);
+  transform: translateX(-100%);
+  transition: transform 0.25s ease;
+  overflow-y: auto;
+  z-index: 1100;
+}
+
+.sidebar.open {
+  transform: translateX(0);
+}
+
+.main-content {
+  transition: margin-left 0.25s ease;
+}
+
+.main-content.shifted {
+  margin-left: 340px;
+}
+
+.sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 1050;
+}
+
+.text-muted {
+  color: #fff !important;
+}
+
+/* placeholder text actually needs to be visible on a dark bg lol */
+.form-control::placeholder {
+  color: rgba(255, 255, 255, 0.85);
+  opacity: 1;
+}
+
+/* settings btn, top right */
+.settings-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 38px;
+  height: 38px;
+  border-radius: var(--border-radius-md);
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 1200;
+}
+
+.settings-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* vinyl record thumbnail */
+.vinyl-record {
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: #000000;
+  border: 1px solid var(--theme-primary);
+  box-shadow: 0 0 18px var(--theme-glow);
+  position: relative;
+  overflow: hidden;
+  margin: 0 auto;
+  animation: spin 12s linear infinite;
+}
+
+.vinyl-record.paused {
+  animation-play-state: paused;
+}
+
+.record-thumb {
+  position: absolute;
+  inset: 0;
+  opacity: 0.35;
+  object-fit: cover;
+  width: 100%;
+  height: 100%;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* the little center circle matches the theme color */
+.vinyl-record::after {
+  background: var(--theme-primary);
+}
+
+/* icon btn svgs, theme colored */
+.icon-btn svg,
+.btn svg {
+  color: var(--theme-primary);
+  fill: var(--theme-primary);
+  transition: all 0.2s ease;
+  transform: translateY(-2px);
+}
+
+/* on hover, icons go black, bg goes theme color */
+.icon-btn:hover svg,
+.btn:hover svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* buttons get a theme-colored border */
+.btn-outline-light,
+.btn-group .btn {
+  border: 1px solid var(--theme-primary) !important;
+}
+
+/* playlist tabs, bold text so it actually shows on black */
+.playlist-tab {
+  color: #fff;
+  transition: all 0.2s ease;
+}
+
+.playlist-tab:hover {
+  background: var(--theme-primary) !important;
+  color: #000000 !important;
+  border-color: var(--theme-primary) !important;
+}
+
+.playlist-tab.active {
+  color: #fff;
+}
+
+.fw-bold {
+  color: #fff !important;
+}
+
+/* less roundy everywhere, was too rounded before and looked kinda generic ngl */
+.btn,
+.form-control,
+.card,
+.modal-content,
+.dropdown-menu,
+.dropdown-item,
+.toast,
+.settings-btn,
+.playlist-tab,
+.track-item,
+.search-result-item {
+  border-radius: var(--border-radius-sm) !important;
+}
+
+.form-control,
+.form-control:focus,
+.form-control:hover {
+  background: rgba(0, 0, 0, 0.7);
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  box-shadow: none;
+}
+
+/* volume slider - hollow black circle w/ theme outline */
+.volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  outline: none;
+}
+
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: black;
+  border: 2px solid var(--theme-primary);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: black;
+  border: 2px solid var(--theme-primary);
+  cursor: pointer;
+  box-shadow: none;
+}
+
+/* eq slider, simple + dynamic theme color */
+input[type="range"].eq-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--theme-primary-dark);
+  outline: none;
+  margin: 0;
+}
+
+input[type="range"].eq-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--theme-primary);
+  border: 2px solid #000;
+  cursor: pointer;
+  box-shadow: 0 0 5px var(--theme-shadow);
+}
+
+input[type="range"].eq-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--theme-primary);
+  border: 2px solid #000;
+  cursor: pointer;
+  box-shadow: 0 0 5px var(--theme-shadow);
+}
+
+input[type="range"].eq-slider::-webkit-slider-runnable-track {
+  background: var(--theme-primary-dark);
+  border-radius: 2px;
+}
+
+input[type="range"].eq-slider::-moz-range-track {
+  background: var(--theme-primary-dark);
+  border-radius: 2px;
+}
+
+/* time knob - hollow black circle w/ theme outline */
+/* download bar's indeterminate state (dont know the total size yet) - a
+   themed chunk sliding across the track instead of bootstrap's default
+   striped thing, so it actually matches the rest of the custom bar */
+@keyframes download-progress-indeterminate {
+  0% { left: -40%; }
+  100% { left: 100%; }
+}
+
+.progress-knob {
+  background: black !important;
+  border: 2px solid var(--theme-primary) !important;
+  box-shadow: none !important;
+}
+
+/* settings modal - black bg, thin dynamic border */
+.settings-modal .modal-content,
+.settings-modal.modal-content,
+.modal.settings-modal .modal-content {
+  background: #000000 !important;
+  backdrop-filter: blur(8px) !important;
+  border: 1px solid var(--theme-primary) !important;
+  box-shadow: 0 0 30px var(--theme-shadow) !important;
+}
+
+.settings-modal .modal-header,
+.modal.settings-modal .modal-header {
+  border-bottom: 1px solid var(--theme-primary) !important;
+  background: #000000 !important;
+}
+
+.settings-modal .modal-title,
+.modal.settings-modal .modal-title {
+  color: var(--theme-primary) !important;
+}
+
+.settings-modal .modal-body,
+.modal.settings-modal .modal-body {
+  background: #000000 !important;
+  color: var(--theme-primary) !important;
+}
+
+.settings-modal .modal-footer,
+.modal.settings-modal .modal-footer {
+  background: #000000 !important;
+  border-top: 1px solid var(--theme-primary) !important;
+}
+
+.settings-modal .btn-close {
+  filter: invert(1) grayscale(1) brightness(2) !important;
+  opacity: 1 !important;
+}
+
+/* settings modal btns - hover flips to theme bg, black text */
+.settings-modal button,
+.settings-modal .btn {
+  transition: all 0.2s ease;
+}
+
+.settings-modal button:hover:not(:disabled),
+.settings-modal .btn:hover:not(:disabled) {
+  background: var(--theme-primary) !important;
+  color: #000000 !important;
+  border-color: var(--theme-primary) !important;
+}
+
+.settings-modal button:hover:not(:disabled) svg,
+.settings-modal .btn:hover:not(:disabled) svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* logout btn always hovers red, no exceptions */
+.logout-btn:hover {
+  background: #ff4444 !important;
+  color: #ffffff !important;
+  border-color: #ff4444 !important;
+}
+
+/* theme color container - transparent, thin dynamic border */
+.theme-color-container {
+  padding: 12px;
+  background: transparent !important;
+  border-radius: var(--border-radius-md);
+  border: 1px solid var(--theme-primary);
+  box-shadow: none;
+}
+
+/* header menu btn hover */
+.header-menu-btn:hover {
+  background: var(--theme-primary) !important;
+  color: #000000 !important;
+  border-color: var(--theme-primary) !important;
+}
+
+/* btn hover, bg turns theme color */
+.btn-outline-light:hover,
+.btn-group .btn:hover {
+  background: var(--theme-primary) !important;
+  border-color: var(--theme-primary) !important;
+  color: #000000 !important;
+}
+
+.btn-outline-light:hover svg,
+.btn-group .btn:hover svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* ==== simplified btn components, cleaner than the mess before ==== */
+
+/* icon btn (search results, small actions) */
+.icon-btn {
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.icon-btn:hover {
+  color: #000 !important;
+  border-color: #000 !important;
+  background: var(--theme-primary) !important;
+}
+
+.icon-btn:hover svg {
+  color: #000 !important;
+  fill: #000 !important;
+}
+
+.icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* track action btn (queue/playlist items) */
+.track-action-btn {
+  border-radius: 6px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.track-action-btn:hover {
+  transform: scale(1.15);
+  color: #000 !important;
+  border-color: #000 !important;
+}
+
+.track-action-btn.trash-btn {
+  border-color: #dc3545;
+  color: #dc3545;
+}
+
+.track-action-btn.trash-btn:hover {
+  border-color: #dc3545 !important;
+  background: rgba(220, 53, 69, 0.1) !important;
+}
+
+.track-action-btn.trash-btn:hover svg {
+  color: #dc3545 !important;
+  fill: #dc3545 !important;
+}
+
+.track-action-btn svg {
+  transition: all 0.2s ease;
+}
+
+/* control btn (playback controls) */
+.control-btn {
+  border-radius: 6px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+}
+
+.control-btn:hover:not(:disabled) {
+  color: #000 !important;
+  border-color: #000 !important;
+  background: var(--theme-primary) !important;
+}
+
+.control-btn:hover:not(:disabled) svg {
+  color: #000 !important;
+  fill: #000 !important;
+}
+
+.control-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.control-btn.active {
+  color: #000 !important;
+  border-color: #000 !important;
+  background: var(--theme-primary) !important;
+}
+
+.control-btn.active svg {
+  color: #000 !important;
+  fill: #000 !important;
+}
+
+/* theme btn (text buttons) */
+.theme-btn {
+  border-radius: 6px;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.theme-btn:hover:not(:disabled):not(.primary) {
+  color: #000 !important;
+  border-color: #000 !important;
+  background: var(--theme-primary) !important;
+}
+
+.theme-btn.danger {
+  border-color: #dc3545;
+  color: #dc3545;
+}
+
+.theme-btn.danger:hover {
+  border-color: #dc3545 !important;
+  background: rgba(220, 53, 69, 0.1) !important;
+}
+
+.theme-btn.success {
+  border-color: #198754;
+  color: #198754;
+}
+
+.theme-btn.success:hover {
+  border-color: #198754 !important;
+  background: rgba(25, 135, 84, 0.1) !important;
+}
+
+.theme-btn.primary {
+  background: var(--theme-primary);
+  color: #000;
+  border: none;
+}
+
+.theme-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* download all btn - text goes white on hover */
+.download-all-btn:hover {
+  color: #ffffff !important;
+}
+
+/* track action btns - svg changes when the btn/card is hovered */
+.track-action-btn,
+.track-action-btn svg {
+  transition: all 0.2s ease;
+}
+
+/* svg icons in btns, theme colored by default */
+.track-action-btn svg {
+  color: var(--theme-primary);
+  fill: var(--theme-primary);
+}
+
+/* svg goes black on direct btn hover */
+.track-action-btn:hover svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* play/pause btn hover */
+.play-pause-btn:hover {
+  background: var(--theme-primary) !important;
+  border-color: #000000 !important;
+  color: #000000 !important;
+}
+
+.play-pause-btn:hover svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* eq dropdown hover - flip colors, black border */
+.dropdown-menu {
+  border: 1px solid var(--theme-primary) !important;
+}
+
+.dropdown-item:hover {
+  background: var(--theme-primary) !important;
+  border-color: #000000 !important;
+  color: #000000 !important;
+}
+
+.dropdown-item:hover svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+/* modal backdrop, blurred */
+.modal-backdrop {
+  backdrop-filter: blur(4px) !important;
+  background: rgba(0, 0, 0, 0.7) !important;
+}
+
+/* playlist modal, also blurred */
+.modal-content.glass {
+  background: rgba(0, 0, 0, 0.95) !important;
+  backdrop-filter: blur(8px) !important;
+  border: 1px solid var(--theme-primary) !important;
+}
+
+.modal-content.glass .modal-header {
+  background: rgba(0, 0, 0, 0.95) !important;
+  border-bottom: 1px solid var(--theme-primary) !important;
+}
+
+.modal-content.glass .modal-title {
+  color: var(--theme-primary) !important;
+}
+
+.modal-content.glass .modal-body {
+  background: rgba(0, 0, 0, 0.95) !important;
+  color: #fff !important;
+}
+
+.modal-content.glass .modal-footer {
+  background: rgba(0, 0, 0, 0.95) !important;
+  border-top: 1px solid var(--theme-primary) !important;
+}
+
+/* theme color picker, get rid of the ugly default white bg */
+.theme-color-picker {
+  width: 100%;
+  height: 100%;
+  border: none;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.theme-color-picker::-webkit-color-swatch-wrapper {
+  padding: 0;
+  border: none;
+}
+
+.theme-color-picker::-webkit-color-swatch {
+  border: none;
+  border-radius: 0;
+}
+
+.theme-color-picker::-moz-color-swatch {
+  border: none;
+  border-radius: 0;
+}
+
+/* hide the scrollbar everywhere, scrolling still works fine tho */
+* {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+*::-webkit-scrollbar {
+  width: 0 !important;
+  height: 0 !important;
+  display: none !important;
+}
+
+/* download log panel, pinned to the bottom */
+.download-log-panel {
+  position: fixed;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 90%;
+  max-width: 600px;
+  background: rgba(0, 0, 0, 0.95);
+  border: 1px solid var(--theme-primary);
+  border-bottom: none;
+  border-radius: var(--border-radius-md) var(--border-radius-md) 0 0;
+  box-shadow: 0 0 20px var(--theme-shadow);
+  z-index: 2000;
+}
+
+.download-log-toggle {
+  width: 100%;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.8);
+  border: none;
+  border-bottom: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  font-size: 12px;
+  font-weight: bold;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.2s ease;
+}
+
+.download-log-toggle:hover {
+  background: var(--theme-primary);
+  color: #000000;
+}
+
+.download-log-content {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
+.download-log-entry {
+  display: flex;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  font-size: 11px;
+}
+
+.download-log-entry:last-child {
+  border-bottom: none;
+}
+
+.download-log-entry .log-timestamp {
+  color: var(--theme-primary);
+  min-width: 50px;
+  font-weight: bold;
+}
+
+.download-log-entry .log-message {
+  color: #fff;
+  flex: 1;
+}
+
+.download-log-entry.info .log-message {
+  color: #fff;
+}
+
+.download-log-entry.success .log-message {
+  color: #4caf50;
+}
+
+.download-log-entry.error .log-message {
+  color: #f44336;
+}
+
+/* the top nav bar that's always there */
+.top-nav-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 60px;
+  background: rgba(0, 0, 0, 0.9);
+  border-bottom: 2px solid var(--theme-primary);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+
+/* settings btn in the top bar. its resting color comes straight from the
+   button's own inline style (set from react state, same as everywhere
+   else) instead of these var(--theme-primary) rules — the svg already
+   inherits it fine via currentColor. used to ALSO set color/stroke here
+   via the css var and that was exactly how the two sources ended up
+   disagreeing depending on render/hover timing, ugh. fixed now */
+.top-nav-bar .settings-menu-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  margin-right: 16px;
+  transition: all 0.2s ease;
+}
+
+.top-nav-bar .settings-menu-btn:hover {
+  background: var(--theme-primary);
+  color: #000000;
+}
+
+.top-nav-bar .settings-menu-btn svg {
+  fill: none;
+  transition: all 0.2s ease;
+}
+
+.top-nav-bar .settings-menu-btn:hover svg {
+  color: #000000 !important;
+  stroke: #000000 !important;
+  fill: none !important;
+}
+
+/* settings modal, centered popup with a blurred bg */
+.settings-modal .modal-content {
+  background: rgba(0, 0, 0, 0.95) !important;
+  backdrop-filter: blur(8px) !important;
+  border: 1px solid var(--theme-primary) !important;
+  box-shadow: 0 0 30px var(--theme-shadow) !important;
+  border-radius: 12px !important;
+}
+
+.settings-modal .modal-header {
+  border-bottom: 1px solid var(--theme-primary) !important;
+  background: #000000 !important;
+}
+
+.settings-modal .modal-title {
+  color: var(--theme-primary) !important;
+  font-size: 18px !important;
+}
+
+.settings-modal .modal-body {
+  background: #000000 !important;
+  color: #fff !important;
+  padding: 24px !important;
+}
+
+.settings-modal .btn-close {
+  filter: invert(1) grayscale(1) brightness(2) !important;
+  opacity: 1 !important;
+}
+
+/* settings modal dialog, keep it centered */
+.settings-modal-dialog {
+  max-width: 500px;
+  margin: 2rem auto;
+}
+
+/* hue slider, rainbow gradient */
+.settings-modal input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 20px;
+  border-radius: 10px;
+  background: linear-gradient(to right, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000);
+  outline: none;
+  cursor: pointer;
+}
+
+.settings-modal input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #000;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+.settings-modal input[type="range"]::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2px solid #000;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+
+/* trash btn hover stuff */
+/* trash icon goes black when its card is hovered */
+.track-item:hover .trash-btn svg {
+  color: #000000 !important;
+  fill: #000000 !important;
+}
+
+.track-item:hover .trash-btn {
+  border-color: #000000 !important;
+}
+
+/* but hover the trash btn directly and its icon/border go red instead */
+.trash-btn:hover svg {
+  color: #dc3545 !important;
+  fill: #dc3545 !important;
+}
+
+.trash-btn:hover {
+  border-color: #dc3545 !important;
+  background: rgba(220, 53, 69, 0.1) !important;
+}
+
+/* old sidebar styles, replaced by the top nav + modal ages ago, keeping
+   these just in case something somewhere still refs the classes */
+.sidebar,
+.sidebar.open,
+.main-content.shifted,
+.sidebar-backdrop,
+.settings-sidebar,
+.settings-sidebar.open,
+.sidebar-overlay {
+  display: none !important;
+}

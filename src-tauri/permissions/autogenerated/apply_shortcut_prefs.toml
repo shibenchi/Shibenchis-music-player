@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-shortcut-prefs"
+description = "Enables the apply_shortcut_prefs command without any pre-configured scope."
+commands.allow = ["apply_shortcut_prefs"]
+
+[[permission]]
+identifier = "deny-apply-shortcut-prefs"
+description = "Denies the apply_shortcut_prefs command without any pre-configured scope."
+commands.deny = ["apply_shortcut_prefs"]
