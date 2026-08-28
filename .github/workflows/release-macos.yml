@@ -63,6 +63,18 @@ jobs:
           chmod +x src-tauri/binaries/node
           rm -rf node.tar.gz "node-v${BUNDLED_NODE_VERSION}-darwin-x64"
 
+      # tauri's own bundler ad-hoc signs the .app as a whole when theres no
+      # real signing identity configured (which is our case, no dev account
+      # yet), but it doesnt know this plain resource file is even an
+      # executable, so it can end up NOT properly signed on its own — and an
+      # unsigned binary getting spawned as a child process by the app is a
+      # classic way to get silently blocked by gatekeeper even though the
+      # app itself opened fine. signing it ad-hoc here, before its bundled
+      # in, means it carries its own valid signature regardless of whatever
+      # the outer .app signing pass does or doesnt notice
+      - name: Ad-hoc sign the bundled node binary
+        run: codesign --force --sign - src-tauri/binaries/node
+
       - name: Install frontend/root dependencies
         run: npm ci
 
