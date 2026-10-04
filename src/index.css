@@ -5,12 +5,23 @@ html, body, #root {
 /* used on search results, dropdowns, cards sitting over the bg visualizer
    canvas - translucent + blurred so whatevers drawing behind (bars,
    particles etc) reads as a soft blur through it instead of a hard edge
-   showing through unblurred */
+   showing through unblurred. bumped a touch darker than before - a bright
+   or busy visualizer preset was still washing out the text through it */
 .glass-dark {
-  background: rgba(10, 10, 10, 0.72) !important;
+  background: rgba(8, 8, 8, 0.8) !important;
   backdrop-filter: blur(14px) !important;
   -webkit-backdrop-filter: blur(14px) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+/* the "lighter" glass variant (main content cards) had no rule of its own
+   at all - it was just falling through to .card's 8% theme-tinted
+   background with no blur, so a lively visualizer behind it wasn't dimmed
+   or blurred at all and could overpower the floating card's own content */
+.glass {
+  background: rgba(5, 5, 5, 0.6) !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
 }
 
 /* theme vars, react updates these live */
@@ -79,7 +90,7 @@ html, body, #root {
 .search-result-item {
   border-radius: var(--border-radius-sm) !important;
   margin-bottom: 10px;
-  transition: all 0.2s ease;
+  transition: none;
   background: rgba(var(--theme-primary-rgb, 255, 89, 0), 0.08);
   border: 1px solid var(--theme-primary) !important;
   cursor: pointer;
@@ -117,7 +128,7 @@ html, body, #root {
 }
 
 /* icons go black on card hover. covers both .track-action-btn and the
-   plain queue-row buttons (trash/add/download) — those used to rely on a
+   plain queue-row buttons (trash/add/download) - those used to rely on a
    janky js mouseenter/mouseleave hack setting the svg color/fill directly,
    which had zero clue when the theme color changed while you werent
    hovering it, so it just went stale until the next hover fixed it. found
@@ -205,13 +216,11 @@ html, body, #root {
 .track-item .fw-bold {
   transition: none;
 }
-.track-item:hover .fw-bold {
-  color: inherit;
-}
+/* the hover colors live in the .track-item:hover rule near the top (they are
+   !important, so a second set of background/box-shadow/color values down here
+   never applied). this one only cancels any lift from bootstrap */
 .track-item:hover {
-  background: rgba(0, 0, 0, 0.5);
   transform: none;
-  box-shadow: none;
 }
 
 /* search result titles need to actually be readable on black */
@@ -244,17 +253,12 @@ html, body, #root {
   box-shadow: 0 0 16px var(--theme-shadow);
   border-right: 1px solid var(--theme-primary);
   transform: translateX(-100%);
-  transition: transform 0.25s ease;
   overflow-y: auto;
   z-index: 1100;
 }
 
 .sidebar.open {
   transform: translateX(0);
-}
-
-.main-content {
-  transition: margin-left 0.25s ease;
 }
 
 .main-content.shifted {
@@ -343,7 +347,7 @@ html, body, #root {
 .btn svg {
   color: var(--theme-primary);
   fill: var(--theme-primary);
-  transition: all 0.2s ease;
+  transition: none;
   transform: translateY(-2px);
 }
 
@@ -363,7 +367,7 @@ html, body, #root {
 /* playlist tabs, bold text so it actually shows on black */
 .playlist-tab {
   color: #fff;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .playlist-tab:hover {
@@ -393,6 +397,19 @@ html, body, #root {
 .track-item,
 .search-result-item {
   border-radius: var(--border-radius-sm) !important;
+}
+
+/* bootstrap ships its own transitions on these (color/background/border/
+   box-shadow easing on hover, focus, active) - same "hover states stay,
+   the animated easing into them goes" rule as the rest of this file,
+   just covering the handful of elements still running on bootstrap's
+   untouched defaults instead of a rule already declared above */
+.btn,
+.form-control,
+.nav-link,
+.dropdown-item,
+.dropdown-toggle {
+  transition: none !important;
 }
 
 .form-control,
@@ -537,7 +554,7 @@ input[type="range"].eq-slider::-moz-range-track {
 /* settings modal btns - hover flips to theme bg, black text */
 .settings-modal button,
 .settings-modal .btn {
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .settings-modal button:hover:not(:disabled),
@@ -603,7 +620,7 @@ input[type="range"].eq-slider::-moz-range-track {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .icon-btn:hover {
@@ -633,7 +650,7 @@ input[type="range"].eq-slider::-moz-range-track {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .track-action-btn:hover {
@@ -658,7 +675,7 @@ input[type="range"].eq-slider::-moz-range-track {
 }
 
 .track-action-btn svg {
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 /* control btn (playback controls) */
@@ -672,7 +689,7 @@ input[type="range"].eq-slider::-moz-range-track {
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .control-btn:hover:not(:disabled) {
@@ -692,14 +709,14 @@ input[type="range"].eq-slider::-moz-range-track {
 }
 
 .control-btn.active {
-  color: #000 !important;
+  color: #fff !important;
   border-color: #000 !important;
   background: var(--theme-primary) !important;
 }
 
 .control-btn.active svg {
-  color: #000 !important;
-  fill: #000 !important;
+  color: #fff !important;
+  fill: #fff !important;
 }
 
 /* theme btn (text buttons) */
@@ -710,7 +727,7 @@ input[type="range"].eq-slider::-moz-range-track {
   border: 1px solid var(--theme-primary);
   color: var(--theme-primary);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .theme-btn:hover:not(:disabled):not(.primary) {
@@ -741,7 +758,7 @@ input[type="range"].eq-slider::-moz-range-track {
 
 .theme-btn.primary {
   background: var(--theme-primary);
-  color: #000;
+  color: #fff;
   border: none;
 }
 
@@ -758,7 +775,7 @@ input[type="range"].eq-slider::-moz-range-track {
 /* track action btns - svg changes when the btn/card is hovered */
 .track-action-btn,
 .track-action-btn svg {
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 /* svg icons in btns, theme colored by default */
@@ -788,6 +805,14 @@ input[type="range"].eq-slider::-moz-range-track {
 /* eq dropdown hover - flip colors, black border */
 .dropdown-menu {
   border: 1px solid var(--theme-primary) !important;
+}
+
+/* bootstrap's default item color is near black (#212529), which is invisible
+   on the dark menus here. white until hovered, black on the theme color then */
+.dropdown-item,
+.dropdown-item-text,
+.dropdown-header {
+  color: #ffffff;
 }
 
 .dropdown-item:hover {
@@ -897,7 +922,7 @@ input[type="range"].eq-slider::-moz-range-track {
   font-weight: bold;
   cursor: pointer;
   text-align: left;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .download-log-toggle:hover {
@@ -964,7 +989,7 @@ input[type="range"].eq-slider::-moz-range-track {
 
 /* settings btn in the top bar. its resting color comes straight from the
    button's own inline style (set from react state, same as everywhere
-   else) instead of these var(--theme-primary) rules — the svg already
+   else) instead of these var(--theme-primary) rules - the svg already
    inherits it fine via currentColor. used to ALSO set color/stroke here
    via the css var and that was exactly how the two sources ended up
    disagreeing depending on render/hover timing, ugh. fixed now */
@@ -977,7 +1002,7 @@ input[type="range"].eq-slider::-moz-range-track {
   justify-content: center;
   padding: 8px;
   margin-right: 16px;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .top-nav-bar .settings-menu-btn:hover {
@@ -987,7 +1012,7 @@ input[type="range"].eq-slider::-moz-range-track {
 
 .top-nav-bar .settings-menu-btn svg {
   fill: none;
-  transition: all 0.2s ease;
+  transition: none;
 }
 
 .top-nav-bar .settings-menu-btn:hover svg {
@@ -996,13 +1021,56 @@ input[type="range"].eq-slider::-moz-range-track {
   fill: none !important;
 }
 
+/* phone-width screens: the title, the name and the three tabs do not all fit
+   in one row, so the title and the spacer go and the rest tightens up. the
+   !important is there because the bar sets its padding and gap inline */
+@media (max-width: 640px) {
+  .top-nav-bar {
+    padding: 0 8px !important;
+    gap: 8px !important;
+  }
+  .top-nav-bar .settings-menu-btn {
+    margin-right: 0;
+  }
+  .top-nav-title,
+  .top-nav-spacer {
+    display: none !important;
+  }
+  .top-nav-user {
+    max-width: 22vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 /* settings modal, centered popup with a blurred bg */
 .settings-modal .modal-content {
   background: rgba(0, 0, 0, 0.95) !important;
   backdrop-filter: blur(8px) !important;
   border: 1px solid var(--theme-primary) !important;
   box-shadow: 0 0 30px var(--theme-shadow) !important;
-  border-radius: 12px !important;
+  border-radius: var(--border-radius-sm) !important;
+}
+
+/* no slide/fade-in on open - it just appears, same "instant, no
+   animation" rule as everything else in this file. the slide that kept
+   showing up anyway was a leftover .modal-content rule in public/index.html
+   (animation: slideIn), so this also pins it off for every modal */
+.modal-content,
+.modal-dialog {
+  animation: none !important;
+}
+
+.settings-modal.fade .modal-dialog {
+  transition: none !important;
+  transform: none !important;
+}
+.settings-modal.fade {
+  transition: none !important;
+}
+.modal-backdrop.fade {
+  transition: none !important;
 }
 
 .settings-modal .modal-header {
@@ -1098,4 +1166,274 @@ input[type="range"].eq-slider::-moz-range-track {
 .settings-sidebar.open,
 .sidebar-overlay {
   display: none !important;
+}
+
+/* settings panel, flat and plain. square corners everywhere, no glow, no
+   shadows, no text shadows, one thin rule under each heading. this sits last
+   in the file with !important because most of the controls carry their own
+   inline radius and shadow styles */
+.settings-modal .modal-content,
+.settings-modal.modal-content,
+.modal.settings-modal .modal-content {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  /* it is near opaque black, so the blur behind it showed nothing and only
+     cost a re-blur over the moving background every frame */
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.settings-modal .modal-content *,
+.settings-modal .modal-content *::before,
+.settings-modal .modal-content *::after {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+
+.settings-modal .modal-body h4 {
+  color: #ffffff !important;
+  font-size: 12px !important;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--theme-primary);
+}
+
+.settings-modal .modal-header,
+.settings-modal .modal-body {
+  background: #000000 !important;
+}
+
+.settings-modal input[type="text"],
+.settings-modal input[type="password"],
+.settings-modal .form-control {
+  background: #000000 !important;
+  border: 1px solid var(--theme-primary) !important;
+  color: #ffffff !important;
+}
+
+.settings-modal input[type="text"]::placeholder,
+.settings-modal input[type="password"]::placeholder {
+  color: #8a8a8a;
+}
+
+.settings-modal input[type="range"]::-webkit-slider-thumb,
+.settings-modal input[type="range"]::-moz-range-thumb {
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+/* the little black-on-theme text in the settings controls stays white until hover */
+.settings-modal button,
+.settings-modal .btn {
+  color: #ffffff;
+}
+
+/* the little eq switch in the volume row. small on purpose, it used to be a
+   full width button of its own. white text until hovered like the rest */
+.eq-toggle {
+  padding: 2px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  background: transparent;
+  color: #ffffff;
+  border: 1px solid var(--theme-primary);
+  cursor: pointer;
+}
+
+.eq-toggle:hover {
+  background: var(--theme-primary);
+  color: #000000;
+}
+
+.eq-toggle.active {
+  background: var(--theme-primary);
+  color: #ffffff;
+}
+
+.eq-toggle.active:hover {
+  color: #000000;
+}
+
+/* drag handle under a resizable list */
+.resize-handle {
+  position: relative;
+  height: 12px;
+  margin-top: 4px;
+  cursor: ns-resize;
+  touch-action: none;
+  border-top: 1px solid var(--theme-primary);
+}
+
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 4px;
+  width: 32px;
+  height: 2px;
+  background: var(--theme-primary);
+  transform: translateX(-50%);
+  opacity: 0.8;
+}
+
+.resize-handle:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* social and collab views. flat and plain like the rest of the app: square
+   corners, no shadows, no gradients. most of these elements carry inline
+   styles, so the overrides need !important. plain buttons in here fill with
+   the theme color on hover, text goes black only then */
+.social-flat [style*="border-radius"],
+.social-flat button,
+.social-flat input,
+.social-flat textarea,
+.social-flat select {
+  border-radius: 0 !important;
+}
+
+.social-flat [style*="box-shadow"] {
+  box-shadow: none !important;
+}
+
+.social-flat [style*="gradient"] {
+  background-image: none !important;
+}
+
+.social-flat button:not(:disabled):hover {
+  background: var(--theme-primary) !important;
+  border-color: var(--theme-primary) !important;
+  color: #000000 !important;
+}
+
+.social-flat button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.social-flat input::placeholder,
+.social-flat textarea::placeholder {
+  color: #8a8a8a;
+}
+
+/* long words and links wrap instead of running past the edge of a panel */
+.social-flat {
+  overflow-wrap: anywhere;
+}
+
+/* phone-width screens: everything stacks in one column instead of sitting
+   side by side. the two column grids and the chat split are inline styles,
+   hence the !important */
+@media (max-width: 720px) {
+  .social-flat {
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 14px !important;
+  }
+  .social-flat .panel-split,
+  .social-flat .collab-setup-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .social-flat .panel-split-side {
+    border-left: 0 !important;
+    padding-left: 0 !important;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .social-flat .convo-list {
+    max-height: 260px !important;
+  }
+  /* the server card was cut off at a fixed height, let it grow with its text */
+  .social-flat .collab-setup-grid > .card {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  /* previews and status lines that ended in "..." get two lines first */
+  .social-flat [style*="text-overflow: ellipsis"] {
+    white-space: normal !important;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  /* a row with text on one side and buttons on the other lets the buttons
+     drop below the text when there is no room */
+  .social-flat [style*="justify-content: space-between"] {
+    flex-wrap: wrap;
+  }
+
+  /* the collab tab keeps its panels in two columns, which only make sense side
+     by side. on a phone the columns step aside and every panel is placed on its
+     own, so the order is the one that reads best: the player, then the queue,
+     then the chat. before a channel is joined the setup panel (where you join
+     one) comes first, since the rest only say "join a channel" */
+  .collab-flat > div {
+    display: contents !important;
+  }
+  .collab-flat [data-panel="collab-setup"] { order: 1; }
+  .collab-flat [data-panel="collab-player"] { order: 2; }
+  .collab-flat [data-panel="collab-queue"] { order: 3; }
+  .collab-flat [data-panel="collab-chat"] { order: 4; }
+  .collab-flat [data-panel="collab-collabplaylists"] { order: 5; }
+  .collab-flat.in-channel [data-panel="collab-player"] { order: 1; }
+  .collab-flat.in-channel [data-panel="collab-queue"] { order: 2; }
+  .collab-flat.in-channel [data-panel="collab-chat"] { order: 3; }
+  .collab-flat.in-channel [data-panel="collab-setup"] { order: 4; }
+  .collab-flat.in-channel [data-panel="collab-collabplaylists"] { order: 5; }
+}
+
+/* settings: a button is as wide as its text and sits on the right, instead of
+   being stretched across the whole box. the inline widths are why this needs
+   !important */
+.settings-modal .modal-body button[style*="width: 100%"],
+.settings-modal .modal-body .w-100 {
+  width: auto !important;
+  display: block !important;
+  margin-left: auto !important;
+  padding-left: 18px !important;
+  padding-right: 18px !important;
+}
+
+/* the animated background is drawn behind everything, and on a phone the
+   panels stack over nearly all of it. so there the panels let much more of it
+   through (lighter fill, hardly any blur) and the drawing itself is brighter */
+@media (max-width: 720px) {
+  .glass {
+    background: rgba(5, 5, 5, 0.34) !important;
+    backdrop-filter: blur(2px) !important;
+    -webkit-backdrop-filter: blur(2px) !important;
+  }
+  .glass-dark {
+    background: rgba(8, 8, 8, 0.5) !important;
+    backdrop-filter: blur(3px) !important;
+    -webkit-backdrop-filter: blur(3px) !important;
+  }
+  .visualizer-canvas {
+    filter: brightness(1.45) saturate(1.25);
+  }
+}
+
+/* panels in the order the layout editor saved. on a narrow screen the columns
+   step aside and each panel is placed by the number it carries, so the order
+   can cross from one column to the other */
+@media (max-width: 991.98px) {
+  .main-flat.custom-order {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    margin: 0;
+  }
+  .main-flat.custom-order > div {
+    display: contents !important;
+  }
+  .main-flat.custom-order [data-panel] {
+    order: var(--panel-order, 0);
+  }
+}
+@media (max-width: 720px) {
+  .social-flat.custom-order > div {
+    display: contents !important;
+  }
+  .social-flat.custom-order [data-panel],
+  .collab-flat.custom-order [data-panel] {
+    order: var(--panel-order, 0) !important;
+  }
 }

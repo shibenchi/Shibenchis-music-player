@@ -11,7 +11,7 @@ let cachedIsTauri = null;
 // frontend_log command, so ONE trace shows both sides of whatever just
 // happened instead of me trying to guess from a vague description of what
 // broke. goes through the same imported api this file already uses
-// (cachedApi), NOT window.__TAURI__ — that global is only reliable on
+// (cachedApi), NOT window.__TAURI__ - that global is only reliable on
 // plain unbundled pages, using it here just silently no-ops even when the
 // api's totally fine, which is somehow worse than not logging at all
 export function frontendLog(source, message) {
@@ -95,9 +95,34 @@ export async function chooseDownloadsFolder(currentPath) {
   }
 }
 
+// native "open" dialog for picking a single file to read (playlist
+// import), as opposed to saveFileWithDialog's "save as". no-ops outside
+// tauri like everything else here - the browser path (a plain <input
+// type="file">) lives in App.js itself since it needs no tauri api at all
+export async function pickTextFile(extensions) {
+  const isTauri = await isTauriApp();
+  if (!isTauri) return null;
+  try {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const { readTextFile } = await import('@tauri-apps/plugin-fs');
+    const path = await open({
+      multiple: false,
+      filters: [{ name: 'playlist', extensions }]
+    });
+    if (!path || typeof path !== 'string') return null; // bailed
+    const text = await readTextFile(path);
+    const name = path.split(/[\\/]/).pop() || path;
+    frontendLog('tauriApi', `pickTextFile: read ${text.length} chars from ${path}`);
+    return { name, text };
+  } catch (err) {
+    frontendLog('tauriApi', `pickTextFile FAILED: ${err?.message || err}`);
+    throw err;
+  }
+}
+
 // writes straight into whatever folder is configured, NO per-download
 // dialog anymore (thank god). makes the folder first if it doesnt exist
-// yet — the default "SMP Downloads" subfolder wont until the first
+// yet - the default "SMP Downloads" subfolder wont until the first
 // actual download happens
 export async function saveFileToFolder(folderPath, suggestedName, bytes) {
   const isTauri = await isTauriApp();
@@ -132,6 +157,48 @@ export async function applyShortcutPrefs(desktop, taskbar) {
   });
 }
 
+// the desktop and taskbar shortcuts carry their own icon file, so a new theme
+// color has to be written into them (rust does the writing, windows only)
+export async function recolorShortcuts(pngBytes, key) {
+  const api = await loadApi();
+  if (!api) return;
+  try {
+    await api.invoke('set_shortcut_icon', { png: Array.from(pngBytes), key });
+  } catch (err) {
+    frontendLog('tauriApi', `recolorShortcuts FAILED: ${err?.message || err}`);
+  }
+}
+
+// external links (ko-fi, etc) - a plain <a target="_blank"> silently does
+// nothing inside the tauri webview, theres no "open in system browser"
+// behavior for it to fall back on like a real browser tab has. has to go
+// through the opener plugin explicitly instead. no-ops-to-window.open in a
+// plain browser/pwa context, same pattern as everything else in this file
+export async function openExternalUrl(url) {
+  const isTauri = await isTauriApp();
+  if (!isTauri) {
+    window.open(url, '_blank', 'noopener,noreferrer');
+    return;
+  }
+  try {
+    const { openUrl } = await import('@tauri-apps/plugin-opener');
+    await openUrl(url);
+  } catch (err) {
+    frontendLog('tauriApi', `openExternalUrl FAILED for ${url}: ${err?.message || err}`);
+  }
+}
+
+// whether the mini player window may show up at all (the setting). the desktop
+// app only, the phone has its own switch
+export async function setMiniplayerEnabled(enabled) {
+  if (isAndroidApp()) return;
+  const api = await loadApi();
+  if (!api) return;
+  api.invoke('set_miniplayer_enabled', { enabled }).catch((err) => {
+    frontendLog('tauriApi', `setMiniplayerEnabled FAILED: ${err?.message || err}`);
+  });
+}
+
 export async function toggleMiniplayer() {
   const api = await loadApi();
   if (!api) {
@@ -142,7 +209,65 @@ export async function toggleMiniplayer() {
   api.invoke('toggle_miniplayer');
 }
 
+// the android app. its notification, home screen widget and floating (picture in
+// picture) player are native, and the native side hands the page a
+// window.SmpNative to report to. checked each time rather than once, it can
+// show up a moment after the page starts
+export function isAndroidApp() {
+  return typeof window !== 'undefined' && !!window.SmpNative;
+}
+
+let lastNativeReport = { key: '', pos: 0, at: 0, playing: false };
+
+// tells the native side what is playing. sendNowPlaying runs several times a
+// second while music plays, so this only passes it on when something real
+// changed (track, play or pause), when the position jumped (a seek), or every
+// ten seconds so the notification's progress bar cannot drift
+function reportToAndroid(state) {
+  if (!isAndroidApp() || !window.SmpNative.updateState) return;
+  const hasTrack = !!(state && state.title);
+  const position = (state && state.currentTime) || 0;
+  const now = Date.now();
+  const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom].join('|');
+  const expected = lastNativeReport.pos + (lastNativeReport.playing ? (now - lastNativeReport.at) / 1000 : 0);
+  const jumped = Math.abs(position - expected) > 2.5;
+  if (key === lastNativeReport.key && !jumped && now - lastNativeReport.at < 10000) return;
+  lastNativeReport = { key, pos: position, at: now, playing: !!state?.isPlaying };
+  const color = state?.themeColor;
+  try {
+    window.SmpNative.updateState(JSON.stringify({
+      hasTrack,
+      title: state?.title || '',
+      artist: state?.author || '',
+      thumb: state?.thumbnail || '',
+      playing: !!state?.isPlaying,
+      pos: position,
+      dur: state?.duration || 0,
+      shuffle: !!state?.shuffle,
+      repeat: state?.repeat || 'off',
+      volume: typeof state?.volume === 'number' ? state.volume : 1,
+      muted: !!state?.muted,
+      inRoom: !!state?.inRoom,
+      accent: color ? [color.r, color.g, color.b] : undefined
+    }));
+  } catch (err) {
+    frontendLog('tauriApi', `reportToAndroid failed: ${err?.message || err}`);
+  }
+}
+
+// the floating player window opening or closing. returns an unsubscribe fn
+export function onPictureInPicture(callback) {
+  if (typeof window === 'undefined') return () => {};
+  window.__smpPip = (on) => callback(!!on);
+  // the page may load while the window is already small
+  try {
+    if (isAndroidApp() && window.SmpNative.inPip && window.SmpNative.inPip()) callback(true);
+  } catch {}
+  return () => { delete window.__smpPip; };
+}
+
 export async function sendNowPlaying(state) {
+  reportToAndroid(state);
   const api = await loadApi();
   if (!api) return;
   api.emitTo('miniplayer', 'now-playing-update', state).catch((err) => {
@@ -154,7 +279,7 @@ export async function sendNowPlaying(state) {
 }
 
 // fires a LOT (several times a sec) whenever the miniplayer's open, unlike
-// sendNowPlaying — deliberately not logging rejections here, miniplayer
+// sendNowPlaying - deliberately not logging rejections here, miniplayer
 // just being closed is the normal case and logging that every frame would
 // flood the file with noise for something that isnt even an error
 export async function sendVisualizerFrame(frame) {
@@ -167,6 +292,15 @@ export async function sendVisualizerFrame(frame) {
 export function onMiniplayerControl(callback) {
   let unlisten = null;
   let cancelled = false;
+
+  // on android the notification, the widget and the floating player send their
+  // button presses here, and they map onto the same actions the desktop mini
+  // player sends
+  const nativeCommand = (command, arg) => {
+    if (['previous', 'next', 'play', 'pause', 'shuffle', 'repeat', 'mute', 'volume_up', 'volume_down'].includes(command)) callback(command);
+    else if (command === 'seek') callback({ type: 'seek', percent: arg });
+  };
+  if (typeof window !== 'undefined') window.__smpNativeCommand = nativeCommand;
 
   loadApi().then((api) => {
     if (!api || cancelled) return;
@@ -182,11 +316,12 @@ export function onMiniplayerControl(callback) {
   return () => {
     cancelled = true;
     if (unlisten) unlisten();
+    if (typeof window !== 'undefined' && window.__smpNativeCommand === nativeCommand) delete window.__smpNativeCommand;
   };
 }
 
 // miniplayer window only exists for like a split second before it
-// announces itself — without this it just sits on "nothing playing"
+// announces itself - without this it just sits on "nothing playing"
 // until whatever's already playing happens to tick over on its own
 // (track change, progress tick, theme change), which couldve been ages
 export function onMiniplayerReady(callback) {

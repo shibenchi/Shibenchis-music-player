@@ -1,11 +1,11 @@
 const path = require('path');
 const fs = require('fs');
 // videoId goes straight from the query string into path.join() for every
-// file this app touches (stream cache, downloads, thumbnail sidecars) —
+// file this app touches (stream cache, downloads, thumbnail sidecars) -
 // with nothing checking its shape, a request like
 // videoId=../../../../whatever could read/write files way outside
 // temp_audio/downloads. both local servers listen on all interfaces too (no
-// host restriction on .listen()), so this isnt just a same-machine thing —
+// host restriction on .listen()), so this isnt just a same-machine thing -
 // anything on the network can hit them. real youtube video ids are always
 // exactly 11 of these chars, so just requiring that shape closes the
 // traversal hole off entirely without touching every call site individually
@@ -20,7 +20,7 @@ const ytdlpBin = require('yt-dlp-exec');
 const ffmpegPath = require('ffmpeg-static');
 // yt-dlp-exec's bundled yt-dlp.exe is a pyinstaller "onefile" build, which
 // re-extracts its whole embedded python runtime to a temp dir on EVERY
-// single launch — measured a consistent ~5.3s of pure startup overhead on
+// single launch - measured a consistent ~5.3s of pure startup overhead on
 // this machine before a single network request even goes out, which was
 // most of what made "buffering" feel so long. the "onedir" distribution
 // (unpacked once at node_modules/yt-dlp-exec/bin/yt-dlp-fast/, see the repo
@@ -30,7 +30,7 @@ const ffmpegPath = require('ffmpeg-static');
 const fastYtdlpPath = path.join(__dirname, '..', 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp-fast', 'yt-dlp.exe');
 const ytdlpExec = fs.existsSync(fastYtdlpPath) ? ytdlpBin.create(fastYtdlpPath) : ytdlpBin;
 // bundling ffmpeg via ffmpeg-static so audio extraction just works out of
-// the box — yt-dlp's postprocessing (format conversion) hard-requires
+// the box - yt-dlp's postprocessing (format conversion) hard-requires
 // ffmpeg/ffprobe on PATH otherwise, and most people dont have that installed
 const ytdlp = (url, options = {}) => ytdlpExec(url, { ffmpegLocation: ffmpegPath, ...options });
 const ytSearch = require('yt-search');
@@ -39,6 +39,8 @@ const session = require('express-session');
 const cookieParser = require('cookie-parser');
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const validation = require('./validation');
+const { createMediaTools, AUDIO_FORMAT_SELECTOR } = require('./mediaUtils');
 
 // detect local helper mode (runs alongside the vps, just handles yt-dlp/ffmpeg endpoints)
 const IS_LOCAL_HELPER = process.argv.includes('--local-helper') || process.env.LOCAL_HELPER === '1';
@@ -46,7 +48,7 @@ const LOCAL_HELPER_PORT = Number(process.env.LOCAL_HELPER_PORT || process.env.PO
 
 // tauri sets APP_DATA_DIR once installed, pointing at a proper per-user
 // writable location (AppData\Roaming\<id>) instead of wherever this code
-// happens to be sitting — an installed app's own folder (program files)
+// happens to be sitting - an installed app's own folder (program files)
 // isnt writable by a normal user account. falls back to the project root
 // for plain `node server/index.js` dev runs where nothing set that var
 const APP_DATA_DIR = process.env.APP_DATA_DIR || path.join(__dirname, '..');
@@ -95,7 +97,7 @@ if (IS_LOCAL_HELPER) {
       'https://invidious.lunar.icu'
     ];
 
-    // race every instance at once instead of trying them one at a time —
+    // race every instance at once instead of trying them one at a time -
     // going sequentially with a 5s timeout each meant a search could take up
     // to 25s if the first few instances were down/slow, brutal. Promise.any
     // resolves as soon as the fastest instance returns a non-empty result,
@@ -120,7 +122,7 @@ if (IS_LOCAL_HELPER) {
         thumbnail: v.videoThumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`
       }));
     } catch {
-      // every invidious instance failed or came back empty — fall through
+      // every invidious instance failed or came back empty - fall through
       // to the yt-search fallback below, plan b time
     }
 
@@ -142,6 +144,8 @@ if (IS_LOCAL_HELPER) {
   helperApp.get('/api/playlist', async (req, res) => {
     const playlistId = String(req.query.list || req.query.playlistId || '').trim();
     if (!playlistId) return res.status(400).json({ error: 'Missing playlist ID' });
+    // the id goes straight into a url, so keep it to the characters real ids use
+    if (!/^[A-Za-z0-9_-]{2,80}$/.test(playlistId)) return res.status(400).json({ error: 'Invalid playlist ID' });
     try {
       const url = `https://www.youtube.com/playlist?list=${playlistId}`;
       const raw = await ytdlp(url, { dumpSingleJson: true, noWarnings: true, noCheckCertificate: true, skipDownload: true, flatPlaylist: true });
@@ -152,9 +156,11 @@ if (IS_LOCAL_HELPER) {
         videoId: e.id, title: e.title || e.title_short || `Track ${e.id}`,
         author: e.uploader || e.uploader_id || ''
       }));
+      noteYoutubeSuccess();
       res.json({ playlistId, title, items });
     } catch (error) {
-      res.status(500).json({ error: error.message || 'Failed to fetch playlist' });
+      noteYoutubeFailure(error);
+      sendYoutubeError(res, error, 'Failed to fetch playlist');
     }
   });
 
@@ -167,66 +173,24 @@ if (IS_LOCAL_HELPER) {
       const url = `https://www.youtube.com/watch?v=${videoId}`;
       const raw = await ytdlp(url, { dumpSingleJson: true, noWarnings: true, noCheckCertificate: true, skipDownload: true });
       const info = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      noteYoutubeSuccess();
       res.json({ videoId, title: info.title || '', author: info.uploader || info.channel || '' });
     } catch (error) {
-      res.status(500).json({ error: error.message || 'Failed to fetch video info' });
+      noteYoutubeFailure(error);
+      sendYoutubeError(res, error, 'Failed to fetch video info');
     }
   });
 
-  // one in-flight download per videoId, shared between the background
-  // cache-warmer and the fast-path fallback so we never spawn yt-dlp twice
-  // for the same track at the same time
-  const backgroundDownloads = new Map();
-  function downloadToCache(videoId, audioFile) {
-    if (backgroundDownloads.has(videoId)) return backgroundDownloads.get(videoId);
-    const promise = ytdlp(`https://www.youtube.com/watch?v=${videoId}`, {
-      extractAudio: true,
-      audioFormat: 'm4a',
-      output: audioFile,
-      noWarnings: true,
-      noCheckCertificate: true,
-      quiet: true
-    }).finally(() => backgroundDownloads.delete(videoId));
-    backgroundDownloads.set(videoId, promise);
-    return promise;
-  }
-
-  function serveLocalFile(req, res, filePath, contentType) {
-    const stats = fs.statSync(filePath);
-    const fileSize = stats.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
-
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Range',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
-      });
-      fs.createReadStream(filePath, { start, end }).pipe(res);
-    } else {
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Accept-Ranges': 'bytes',
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Range',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
-      });
-      fs.createReadStream(filePath).pipe(res);
-    }
-  }
+  // cache, range serving and youtube rate limit handling live in mediaUtils.js,
+  // shared with the full server's own media endpoints
+  const {
+    isBotCheckError, noteYoutubeFailure, noteYoutubeSuccess, inYoutubeCooldown,
+    sendYoutubeError, isCompleteAudioFile, downloadToCache, serveLocalFile, sweepLeftoverDownloads
+  } = createMediaTools({ ytdlp, log: helperLog });
+  sweepLeftoverDownloads(path.join(APP_DATA_DIR, 'temp_audio'));
 
   // resolved direct-cdn urls, kept around for a while so replaying a track
-  // or skipping back doesnt pay the yt-dlp resolve cost again — these urls
+  // or skipping back doesnt pay the yt-dlp resolve cost again - these urls
   // are normally valid for several hours, this just caches for less than
   // that so we stay well clear of them actually expiring mid-play
   const resolvedUrlCache = new Map(); // videoId -> { url, expiresAt }
@@ -235,7 +199,7 @@ if (IS_LOCAL_HELPER) {
 
   // the yt-dlp resolve is what actually makes clicking a new track feel
   // slow (youtube-side extraction time, not something more client/flag
-  // tweaking gets around) — everything else here just avoids paying that
+  // tweaking gets around) - everything else here just avoids paying that
   // cost twice: once via the resolved-url cache above, and once via
   // /api/prefetch getting called ahead of time for whatevers up next in queue
   function resolveDirectUrl(videoId) {
@@ -257,18 +221,27 @@ if (IS_LOCAL_HELPER) {
         noWarnings: true,
         noCheckCertificate: true,
         skipDownload: true,
-        format: 'bestaudio/best',
-        // the android client skips past most of the web client's js
-        // player + signature-decryption round trips, way faster
-        extractorArgs: 'youtube:player_client=android'
+        // the android client used to be picked here for speed (skips most
+        // of the web client's js/signature round trips) but youtube has
+        // since locked it down to a single muxed 360p video+audio format
+        // (itag 18) - no audio-only formats at all anymore. bestaudio/best
+        // was then falling all the way through to that muxed format, which
+        // is what was actually producing the corrupt/undecodable streams
+        // (DEMUXER_ERROR_COULD_NOT_OPEN) and the cascading track-skip
+        // failures. the default client still resolves proper audio-only
+        // m4a (itag 140) at basically the same wall-clock cost, verified
+        // both ways against several of the failing videoIds
+        format: AUDIO_FORMAT_SELECTOR
       });
       const info = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!info.url) throw new Error('no direct stream url resolved');
       resolvedUrlCache.set(videoId, { url: info.url, expiresAt: Date.now() + RESOLVED_URL_TTL_MS });
+      noteYoutubeSuccess();
       helperLog(`resolveDirectUrl(${videoId}): resolved in ${Date.now() - startedAt}ms`);
       return info.url;
     })()
       .catch((err) => {
+        noteYoutubeFailure(err);
         helperLog(`resolveDirectUrl(${videoId}): FAILED after ${Date.now() - startedAt}ms - ${err.message}`);
         throw err;
       })
@@ -287,12 +260,18 @@ if (IS_LOCAL_HELPER) {
     if (!videoId) return res.status(400).json({ error: 'Missing videoId query parameter' });
     if (!isValidVideoId(videoId)) return res.status(400).json({ error: 'Invalid videoId' });
     helperLog(`/api/prefetch(${videoId}): request received`);
+    // prefetch is a guess about what plays next, so it backs off completely
+    // while youtube is rate limiting us
+    if (inYoutubeCooldown()) {
+      helperLog(`/api/prefetch(${videoId}): skipped, youtube cooldown active`);
+      return res.json({ ok: false, error: 'paused while youtube is rate limiting', code: 'youtube_bot_check' });
+    }
     try {
       await resolveDirectUrl(videoId);
       res.json({ ok: true });
     } catch (error) {
       helperLog(`/api/prefetch(${videoId}): failed - ${error.message}`);
-      // not fatal — /api/stream will just resolve cold when it actually plays
+      // not fatal - /api/stream will just resolve cold when it actually plays
       res.json({ ok: false, error: error.message });
     }
   });
@@ -310,21 +289,27 @@ if (IS_LOCAL_HELPER) {
     const audioFile = path.join(tempDir, `${videoId}.m4a`);
 
     // already cached from a previous play (or a finished background
-    // download below) — serve straight off disk. this is also what makes
+    // download below) - serve straight off disk. this is also what makes
     // offline playback of anything youve listened to before work
     if (fs.existsSync(audioFile)) {
-      helperLog(`/api/stream(${videoId}): serving from disk cache, ${Date.now() - reqStartedAt}ms`);
-      try {
-        return serveLocalFile(req, res, audioFile, 'audio/m4a');
-      } catch (error) {
-        return res.status(500).json({ error: error.message || 'Stream failed' });
+      if (isCompleteAudioFile(audioFile)) {
+        helperLog(`/api/stream(${videoId}): serving from disk cache, ${Date.now() - reqStartedAt}ms`);
+        try {
+          return serveLocalFile(req, res, audioFile, 'audio/m4a');
+        } catch (error) {
+          return res.status(500).json({ error: error.message || 'Stream failed' });
+        }
       }
+      // a truncated or corrupt file from an older run. drop it and fetch
+      // the track fresh below instead of serving something undecodable
+      helperLog(`/api/stream(${videoId}): cached file is incomplete, discarding it`);
+      try { fs.unlinkSync(audioFile); } catch {}
     }
 
     // not cached to disk yet. resolving a direct cdn url (no download) and
     // proxying it live gets audio flowing without waiting for yt-dlp to
     // download+transcode the whole track first. proxied (not redirected) so
-    // playback stays same-origin — the web audio analyser powering the eq
+    // playback stays same-origin - the web audio analyser powering the eq
     // and visualizer taints/goes silent on cross-origin media elements, learned
     // that one the hard way
     //
@@ -333,6 +318,7 @@ if (IS_LOCAL_HELPER) {
     // instant as the resolve below just makes them fight over cpu/network
     // right when the resolve latency is what the user's staring at
     setTimeout(() => {
+      if (inYoutubeCooldown()) return;
       downloadToCache(videoId, audioFile).catch(() => {
         // background cache-warm failed; the fallback path below will retry
         // it inline if the fast path also fails too, otherwise just skip
@@ -344,15 +330,26 @@ if (IS_LOCAL_HELPER) {
       const directUrl = await resolveDirectUrl(videoId);
 
       let upstream;
+      // axios' timeout option is an idle socket timeout, and on a streamed
+      // body it kept running after the headers came back. a browser reads
+      // ahead and then sits idle while the song plays, so after 15 quiet
+      // seconds axios killed the connection mid-song and the player went
+      // into its retry-then-skip path. the 15 seconds now only covers
+      // waiting for youtube to start answering, and is cleared the moment
+      // it does
+      const connectAbort = new AbortController();
+      const connectTimer = setTimeout(() => connectAbort.abort(), 15000);
       try {
         upstream = await axios.get(directUrl, {
           headers: req.headers.range ? { range: req.headers.range } : {},
           responseType: 'stream',
-          timeout: 15000,
+          signal: connectAbort.signal,
           validateStatus: (status) => status >= 200 && status < 300
         });
+        clearTimeout(connectTimer);
       } catch (upstreamError) {
-        // cached url stopped working (expired early / revoked) — drop it
+        clearTimeout(connectTimer);
+        // cached url stopped working (expired early / revoked) - drop it
         // and let the outer catch fall through to a full re-resolve
         resolvedUrlCache.delete(videoId);
         throw upstreamError;
@@ -368,18 +365,51 @@ if (IS_LOCAL_HELPER) {
         'Access-Control-Allow-Headers': 'Range',
         'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
       });
+      // client skipped to another track or closed the page: stop pulling from
+      // youtube instead of leaving the upstream connection open
+      res.on('close', () => upstream.data.destroy());
+      upstream.data.on('error', () => res.destroy());
+
+      // a connection that has really died (youtube stopped sending while the
+      // browser is waiting for more) still needs to be cut, otherwise the
+      // player just hangs. but only count quiet time while we are not the
+      // slow side: if the browser has stopped reading, nothing arriving from
+      // youtube is expected
+      let lastUpstreamDataAt = Date.now();
+      upstream.data.on('data', () => { lastUpstreamDataAt = Date.now(); });
+      const deadStreamWatch = setInterval(() => {
+        if (!res.writableNeedDrain && Date.now() - lastUpstreamDataAt > 25000) {
+          helperLog(`/api/stream(${videoId}): upstream sent nothing for 25s while the client was waiting, closing`);
+          upstream.data.destroy();
+          res.destroy();
+        }
+      }, 5000);
+      res.on('close', () => clearInterval(deadStreamWatch));
+      upstream.data.on('close', () => clearInterval(deadStreamWatch));
+
       upstream.data.pipe(res);
-      upstream.data.on('error', () => res.end());
     } catch (fastPathError) {
+      // a bot check on the resolve means the full download below would hit the
+      // same wall, so dont double up on youtube, answer right away
+      if (isBotCheckError(fastPathError)) {
+        helperLog(`/api/stream(${videoId}): youtube bot check, not retrying`);
+        if (!res.headersSent) return sendYoutubeError(res, fastPathError, 'Stream failed');
+        return res.destroy();
+      }
       helperLog(`/api/stream(${videoId}): fast path FAILED at ${Date.now() - reqStartedAt}ms - ${fastPathError.message}, falling back to full download`);
-      // fast path failed (throttled/blocked/expired url) — fall back to the
+      // fast path failed (throttled/blocked/expired url) - fall back to the
       // original download-then-serve approach so playback still works
       try {
         await downloadToCache(videoId, audioFile);
         helperLog(`/api/stream(${videoId}): fallback download done, ${Date.now() - reqStartedAt}ms total`);
         serveLocalFile(req, res, audioFile, 'audio/m4a');
       } catch (fallbackError) {
-        res.status(500).json({ error: fallbackError.message || 'Stream failed' });
+        helperLog(`/api/stream(${videoId}): fallback FAILED - ${fallbackError.message}`);
+        if (!res.headersSent) {
+          sendYoutubeError(res, fallbackError, 'Stream failed');
+        } else {
+          res.destroy();
+        }
       }
     }
   });
@@ -403,7 +433,7 @@ if (IS_LOCAL_HELPER) {
       await ytdlp(`https://www.youtube.com/watch?v=${videoId}`, {
         // without an explicit format, yt-dlp defaults to the best *overall*
         // stream (often a combined video+audio one) and strips the video
-        // afterward — that combined stream's audio bitrate is typically
+        // afterward - that combined stream's audio bitrate is typically
         // lower than youtube's dedicated audio-only stream. asking for
         // bestaudio directly means the encode below starts from the
         // highest-bitrate source actually available
@@ -421,7 +451,8 @@ if (IS_LOCAL_HELPER) {
       res.setHeader('Accept-Ranges', 'bytes');
       fs.createReadStream(audioPath).pipe(res);
     } catch (error) {
-      res.status(500).json({ error: error.message || 'Download failed' });
+      noteYoutubeFailure(error);
+      sendYoutubeError(res, error, 'Download failed');
     }
   });
 
@@ -441,8 +472,10 @@ function projectPath(...segments) {
 }
 
 // logs live in the writable app-data dir, not "wherever this process
-// happened to be launched from" — process.cwd() isnt meaningful once
+// happened to be launched from" - process.cwd() isnt meaningful once
 // this runs as a bundled sidecar
+const logsDir = path.join(APP_DATA_DIR, 'logs');
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 
 // logging setup
 const logFile = path.join(logsDir, `server-${new Date().toISOString().split('T')[0]}.log`);
@@ -450,7 +483,8 @@ const errorLogFile = path.join(logsDir, `errors-${new Date().toISOString().split
 
 function logToFile(message, isError = false) {
   const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] ${message}\n`;
+  // one entry per line, so a name or message with a newline in it cant fake a log line
+  const logMessage = `[${timestamp}] ${String(message).replace(/[\r\n]+/g, ' ')}\n`;
 
   try {
     fs.appendFileSync(logFile, logMessage);
@@ -477,7 +511,7 @@ const TRUST_PROXY = String(process.env.TRUST_PROXY || '').toLowerCase() === '1' 
 const SESSION_COOKIE_SECURE = String(process.env.SESSION_COOKIE_SECURE || '').toLowerCase() === '1' || IS_PRODUCTION;
 const APP_ORIGIN = String(process.env.APP_ORIGIN || '').trim().replace(/\/+$/, '');
 const PUBLIC_WS_URL = String(process.env.PUBLIC_WS_URL || '').trim().replace(/\/+$/, '');
-// gotta be NOT '/ws' — that collides with webpack-dev-server's own hmr
+// gotta be NOT '/ws' - that collides with webpack-dev-server's own hmr
 // socket, which defaults to '/ws' too and steals the upgrade before it
 // reaches this server when running behind the CRA dev proxy (npm run dev
 // / react-start). took me a min to figure out why messages werent arriving
@@ -540,29 +574,101 @@ function decrementUserSocketCount(userId) {
 }
 
 // pull in the db module
-// auth token store, for cross-origin requests
-global.authTokens = global.authTokens || new Map();
+// auth token store, for cross-origin requests. tokens are random, expire
+// after 7 days and get revoked on logout
+const authTokens = validation.createAuthTokenStore(() => db.authTokenStorage);
+
+// slow down password guessing and mass account creation. keyed by ip, and for
+// logins also by the username being tried
+const loginAttemptLimiter = validation.createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10 });
+const loginIpLimiter = validation.createRateLimiter({ windowMs: 15 * 60 * 1000, max: 60 });
+const registerLimiter = validation.createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
+
+// who a request counts as for rate limiting. req.ip follows the forwarded
+// header when TRUST_PROXY is on, so set that when running behind caddy or every
+// visitor shares the proxy's address and one limit
+function getClientKey(req) {
+  return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+function tooManyAttempts(res, retryAfterSec) {
+  res.set('Retry-After', String(retryAfterSec));
+  const minutes = Math.max(1, Math.ceil(retryAfterSec / 60));
+  return res.status(429).json({ error: `Too many attempts, try again in ${minutes} minute${minutes === 1 ? '' : 's'}` });
+}
 
 const db = require('./database');
 
-function buildServerPayload(serverRecord, req = null) {
+// viewer: a user id, or true when the receiver is known to be a member. the
+// join code of a private channel is only included for members, everyone else
+// sees that it is private and nothing more
+function buildServerPayload(serverRecord, req = null, viewer = null) {
   if (!serverRecord) return null;
-  return {
+  const members = db.getServerMembers(serverRecord.id);
+  const viewerIsMember = viewer === true || (typeof viewer === 'string' && members.some((member) => member.user_id === viewer));
+  const payload = {
     ...serverRecord,
+    is_private: serverRecord.is_private ? 1 : 0,
     wsUrl: getPublicWsUrl(req),
     wsPath: WS_PATH,
-    members: db.getServerMembers(serverRecord.id)
+    members
+  };
+  if (!viewerIsMember) delete payload.join_code;
+  return payload;
+}
+
+// a theme color channel can really be 0 (pure red has no green and no blue), so only
+// a missing value falls back to the default. using || turned every 0 into the default
+// and a pink (255, 0, 85) came out as a salmon (255, 89, 85)
+function themeColorOf(settings) {
+  const channel = (value, fallback) => (value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? fallback : Number(value));
+  return {
+    r: channel(settings && settings.theme_color_r, 255),
+    g: channel(settings && settings.theme_color_g, 89),
+    b: channel(settings && settings.theme_color_b, 0)
   };
 }
 
-function buildServerListPayload(servers, req = null) {
-  return servers.map(serverRecord => buildServerPayload(serverRecord, req));
+function buildServerListPayload(servers, req = null, viewer = null) {
+  return servers.map(serverRecord => buildServerPayload(serverRecord, req, viewer));
 }
 
 function sendWs(ws, payload) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
   }
+}
+
+// what one device is playing, passed on to the account's other devices so they
+// can show "playing on your phone". text is cut to size and the picture must be
+// a web address, nothing else is trusted
+function sanitizeDeviceState(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const title = String(raw.title || '').trim().slice(0, 200);
+  if (!title) return null;
+  const number = (value) => (Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : 0);
+  const thumbnail = String(raw.thumbnail || '').trim().slice(0, 300);
+  return {
+    title,
+    author: String(raw.author || '').trim().slice(0, 200),
+    videoId: String(raw.videoId || '').trim().slice(0, 32),
+    thumbnail: /^https?:\/\//i.test(thumbnail) ? thumbnail : '',
+    source: raw.source === 'shared' ? 'shared' : 'personal',
+    playing: raw.playing === true,
+    position: number(raw.position),
+    duration: number(raw.duration),
+    at: Date.now()
+  };
+}
+
+function sanitizeDevice(raw) {
+  const device = raw && typeof raw === 'object' ? raw : {};
+  const kind = ['phone', 'computer', 'browser'].includes(device.kind) ? device.kind : 'browser';
+  return {
+    id: String(device.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64),
+    name: String(device.name || kind).trim().slice(0, 40) || kind,
+    kind
+  };
 }
 
 function sanitizeListeningState(listening) {
@@ -590,6 +696,18 @@ function sanitizeListeningState(listening) {
   };
 }
 
+// accounts that keep what they listen to from other people. looked up in the db
+// once, then kept here until the account saves its settings again
+const hiddenListeningCache = new Map();
+function isListeningHidden(userId) {
+  if (!hiddenListeningCache.has(userId)) {
+    let hidden = false;
+    try { hidden = db.getSettings(userId).hide_listening === 1; } catch { /* shown */ }
+    hiddenListeningCache.set(userId, hidden);
+  }
+  return hiddenListeningCache.get(userId);
+}
+
 function getConnectedUsers() {
   const connectedUsers = new Map();
 
@@ -597,7 +715,7 @@ function getConnectedUsers() {
     if (!client.userId || !client.username) return;
 
     const existing = connectedUsers.get(client.userId);
-    const listeningState = client.listeningState || existing?.listening_to || null;
+    const listeningState = isListeningHidden(client.userId) ? null : (client.listeningState || existing?.listening_to || null);
     const currentServerId = client.serverId || existing?.current_server_id || null;
 
     connectedUsers.set(client.userId, {
@@ -636,11 +754,295 @@ function broadcastServerQueue(serverId) {
   });
 }
 
+// === synced playback ===
+// every play, resume, seek and skip goes through a short "preparing" phase:
+// each member's player loads the track at the right spot and says it is ready,
+// and only once everyone is ready does the server hand out one shared start
+// time. so everybody hears the same audio at the same moment instead of
+// whoever's connection is fastest starting first. pause is instant.
+// the session lives in memory, a restart just leaves the channel paused.
+const SYNC_LEAD_MS = 700; // gap between "all ready" and the start, covers network delay
+// nobody starts before everyone listening is ready. a player that has not got
+// ready after this long is taken out of the sync (it is told, and can rejoin by
+// pressing play) so one broken player cannot hold a room silent forever. it is
+// never started out of step with the others
+const SYNC_DROP_AFTER_MS = 60000;
+const syncSessions = new Map(); // serverId -> session
+let syncRevisionCounter = 0;
+
+function newSyncRevision() {
+  syncRevisionCounter += 1;
+  return `${Date.now()}-${syncRevisionCounter}`;
+}
+
+// where the shared track is right now, in seconds
+function getSyncPosition(session, nowMs = Date.now()) {
+  if (!session) return 0;
+  if (session.phase === 'playing') {
+    return session.position + Math.max(0, (nowMs - session.startAtMs) / 1000);
+  }
+  return session.position;
+}
+
+// repeat and shuffle belong to the room, everyone in it sees and can change them
+const playModesCache = new Map(); // serverId -> { repeat_mode, shuffle }
+function getPlayModes(serverId) {
+  let modes = playModesCache.get(serverId);
+  if (!modes) {
+    try {
+      modes = db.getServerPlayModes(serverId);
+    } catch {
+      modes = { repeat_mode: 'off', shuffle: false };
+    }
+    playModesCache.set(serverId, modes);
+  }
+  return modes;
+}
+
+// who a start is still waiting on and why, one entry per person
+function getSyncWaiting(serverId, session) {
+  const seen = new Map();
+  wsClients.forEach((client, clientId) => {
+    if (client.serverId !== serverId || (client.syncMode !== 'yes' && client.syncMode !== 'auto')) return;
+    if (session.ready.has(clientId)) return;
+    const status = client.syncStatus && client.syncStatus.revision === session.revision ? client.syncStatus : null;
+    if (!seen.has(client.userId)) {
+      seen.set(client.userId, {
+        user_id: client.userId,
+        username: client.username,
+        reason: status ? status.reason : 'getting ready'
+      });
+    }
+  });
+  return [...seen.values()];
+}
+
+function getSyncedPlayerState(serverId) {
+  const base = db.getServerPlayerState(serverId);
+  const session = syncSessions.get(serverId);
+  const modes = getPlayModes(serverId);
+  const modeFields = { repeat_mode: modes.repeat_mode, shuffle: modes.shuffle };
+
+  if (!session) {
+    if (!base) {
+      if (modes.repeat_mode === 'off' && !modes.shuffle) return null;
+      return { server_id: serverId, current_track_id: null, is_playing: false, current_time: 0, volume: 1, sync_phase: 'paused', start_at_ms: null, ...modeFields };
+    }
+    // nothing live in memory (fresh start): the channel is simply paused
+    return { ...base, ...modeFields, is_playing: false, sync_phase: 'paused', start_at_ms: null };
+  }
+
+  return {
+    ...(base || {}),
+    ...modeFields,
+    server_id: serverId,
+    current_track_id: session.trackId,
+    is_playing: session.phase === 'playing',
+    current_time: session.position,
+    sync_updated_at_ms: session.phase === 'playing' ? session.startAtMs : session.updatedAtMs,
+    sync_phase: session.phase,
+    revision: session.revision,
+    start_at_ms: session.phase === 'playing' ? session.startAtMs : null,
+    sync_waiting: session.phase === 'preparing' ? getSyncWaiting(serverId, session) : []
+  };
+}
+
+function persistSyncSession(serverId, session) {
+  db.updateServerPlayerState(serverId, {
+    current_track_id: session.trackId,
+    is_playing: session.phase !== 'paused',
+    current_time: session.position,
+    volume: 1,
+    sync_updated_at_ms: session.phase === 'playing' ? session.startAtMs : session.updatedAtMs
+  });
+}
+
+// the sockets that have to be ready before a start: connections in this channel
+// that are playing along ("yes") or are about to join in on their own ("auto",
+// they are on the shared tab with nothing else playing). someone busy with their
+// own music ("no") neither hears it nor holds everyone up
+function getSyncParticipantIds(serverId) {
+  const ids = [];
+  wsClients.forEach((client, clientId) => {
+    if (client.serverId === serverId && (client.syncMode === 'yes' || client.syncMode === 'auto')) {
+      ids.push(clientId);
+    }
+  });
+  return ids;
+}
+
+// whoever sends a play request is by definition listening to the shared player,
+// even if their own "yes" report hasnt landed yet
+function markUserListening(serverId, userId) {
+  wsClients.forEach((client) => {
+    if (client.serverId === serverId && client.userId === userId) client.syncMode = 'yes';
+  });
+}
+
+function startSyncSession(serverId) {
+  const session = syncSessions.get(serverId);
+  if (!session || session.phase !== 'preparing') return;
+
+  clearTimeout(session.timer);
+  session.timer = null;
+  session.phase = 'playing';
+  session.startAtMs = Date.now() + SYNC_LEAD_MS;
+  session.revision = newSyncRevision();
+  persistSyncSession(serverId, session);
+  logToFile(`[SYNC] ${serverId} start at +${SYNC_LEAD_MS}ms, ${session.ready.size} ready`);
+  broadcastServerPlayerState(serverId);
+}
+
+// the guard timer of a start that has waited too long: whoever is still not ready
+// is taken out of the sync and told, then the room starts for everyone who is
+function dropSyncStragglers(serverId, revision) {
+  const session = syncSessions.get(serverId);
+  if (!session || session.phase !== 'preparing' || session.revision !== revision) return;
+  getSyncParticipantIds(serverId).forEach((clientId) => {
+    if (session.ready.has(clientId)) return;
+    const client = wsClients.get(clientId);
+    if (!client) return;
+    client.syncMode = 'no';
+    sendWs(client.ws, { type: 'sync_dropped', serverId, reason: 'your player did not get ready in time, press play to join the room again' });
+    logToFile(`[SYNC] ${serverId} dropped ${client.username} after ${SYNC_DROP_AFTER_MS}ms: ${client.syncStatus ? client.syncStatus.reason : 'no status'}`);
+  });
+  startSyncSession(serverId);
+}
+
+// a player's reason for not being ready yet changed: tell the room, at most a
+// few times a second and only when the list of who is waiting actually changed
+const waitingBroadcastTimers = new Map();
+function scheduleWaitingBroadcast(serverId) {
+  const session = syncSessions.get(serverId);
+  if (!session || session.phase !== 'preparing' || waitingBroadcastTimers.has(serverId)) return;
+  waitingBroadcastTimers.set(serverId, setTimeout(() => {
+    waitingBroadcastTimers.delete(serverId);
+    const live = syncSessions.get(serverId);
+    if (!live || live.phase !== 'preparing') return;
+    const key = JSON.stringify(getSyncWaiting(serverId, live));
+    if (live.lastWaitingKey === key) return;
+    live.lastWaitingKey = key;
+    broadcastServerPlayerState(serverId);
+  }, 400));
+}
+
+function maybeStartSyncSession(serverId) {
+  const session = syncSessions.get(serverId);
+  if (!session || session.phase !== 'preparing') return;
+  const participants = getSyncParticipantIds(serverId);
+  if (participants.every((clientId) => session.ready.has(clientId))) {
+    startSyncSession(serverId);
+  }
+}
+
+function handleSyncReady(serverId, clientId, revision) {
+  const session = syncSessions.get(serverId);
+  if (!session || session.phase !== 'preparing' || session.revision !== revision) return;
+  session.ready.add(clientId);
+  maybeStartSyncSession(serverId);
+}
+
+// a play/pause/seek/skip request from a member. returns what happened
+function applySyncCommand(serverId, cmd) {
+  const now = Date.now();
+  const session = syncSessions.get(serverId);
+  const persisted = db.getServerPlayerState(serverId);
+  const currentTrackId = session ? session.trackId : (persisted ? persisted.current_track_id : null);
+  const livePosition = session ? getSyncPosition(session, now) : Number((persisted && persisted.current_time) || 0);
+
+  // two people finishing the same song at once both ask for the next one, only
+  // the first should count. the request says which track it saw end
+  if (cmd.auto_advance_from && currentTrackId !== cmd.auto_advance_from) {
+    return { ignored: true };
+  }
+
+  const trackId = cmd.current_track_id || currentTrackId;
+  if (!trackId) return { ignored: true };
+  const requestedTime = Number.isFinite(cmd.current_time) && cmd.current_time >= 0 ? cmd.current_time : livePosition;
+
+  if (!cmd.is_playing) {
+    if (session && session.timer) clearTimeout(session.timer);
+    const paused = {
+      trackId,
+      phase: 'paused',
+      position: trackId === currentTrackId ? requestedTime : 0,
+      updatedAtMs: now,
+      startAtMs: null,
+      revision: newSyncRevision(),
+      ready: new Set(),
+      timer: null
+    };
+    syncSessions.set(serverId, paused);
+    persistSyncSession(serverId, paused);
+    broadcastServerPlayerState(serverId);
+    return { phase: 'paused' };
+  }
+
+  // already playing (or already preparing) this very spot: a repeat of the
+  // same request, nothing to redo
+  const sameTrack = session && session.trackId === trackId;
+  if (sameTrack && session.phase === 'playing' && Math.abs(requestedTime - livePosition) < 1.2) {
+    return { noop: true };
+  }
+  if (sameTrack && session.phase === 'preparing' && Math.abs(requestedTime - session.position) < 1.2) {
+    return { noop: true };
+  }
+
+  if (session && session.timer) clearTimeout(session.timer);
+  const preparing = {
+    trackId,
+    phase: 'preparing',
+    position: requestedTime,
+    updatedAtMs: now,
+    startAtMs: null,
+    revision: newSyncRevision(),
+    ready: new Set(),
+    timer: null
+  };
+  preparing.timer = setTimeout(() => dropSyncStragglers(serverId, preparing.revision), SYNC_DROP_AFTER_MS);
+  syncSessions.set(serverId, preparing);
+  persistSyncSession(serverId, preparing);
+  broadcastServerPlayerState(serverId);
+  maybeStartSyncSession(serverId); // starts right away when nobody is connected to wait for
+  return { phase: 'preparing' };
+}
+
+// the song that is playing (or paused on) was taken out of the queue. the room
+// must not be left pointing at a song that is gone (every player showed a blank
+// record and kept playing it): it moves on to the song that took its place, from
+// the start and playing if the room was, or lets go of the player when the queue
+// is now empty
+function handleCurrentTrackRemoved(serverId, removedTrackId, queueBefore) {
+  const session = syncSessions.get(serverId);
+  const persisted = db.getServerPlayerState(serverId);
+  const currentId = session ? session.trackId : (persisted ? persisted.current_track_id : null);
+  if (!currentId || currentId !== removedTrackId) return;
+  const queueNow = db.getServerQueue(serverId);
+  if (!queueNow.length) {
+    resetRoomPlayback(serverId);
+    return;
+  }
+  const index = Math.max(0, queueBefore.findIndex((track) => track.id === removedTrackId));
+  const next = queueNow[Math.min(index, queueNow.length - 1)];
+  const wasPlaying = Boolean(session && session.phase !== 'paused');
+  logToFile(`[SYNC] ${serverId} the playing song was removed, moving on to ${next.id}`);
+  applySyncCommand(serverId, { current_track_id: next.id, is_playing: wasPlaying, current_time: 0 });
+}
+
+// nothing to play any more (the queue was cleared): the room's player is reset
+function resetRoomPlayback(serverId) {
+  const session = syncSessions.get(serverId);
+  if (session && session.timer) clearTimeout(session.timer);
+  syncSessions.delete(serverId);
+  db.deleteServerPlayerState(serverId);
+  broadcastServerPlayerState(serverId);
+}
+
 function broadcastServerPlayerState(serverId) {
   broadcastToServer(serverId, {
     type: 'server_player_updated',
     serverId,
-    state: db.getServerPlayerState(serverId),
+    state: getSyncedPlayerState(serverId),
     server_now_ms: Date.now()
   });
 }
@@ -675,10 +1077,10 @@ function sendServerState(ws, serverId, req = null) {
   sendWs(ws, {
     type: 'initial_state',
     serverId,
-    server: buildServerPayload(serverRecord, req),
+    server: buildServerPayload(serverRecord, req, true),
     messages: db.getServerMessages(serverId),
     queue: db.getServerQueue(serverId),
-    player: db.getServerPlayerState(serverId),
+    player: getSyncedPlayerState(serverId),
     server_now_ms: Date.now(),
     members: db.getServerMembers(serverId),
     users: getConnectedUsers()
@@ -690,7 +1092,8 @@ function isServerMember(serverId, userId) {
 }
 
 function createWebSocketServer(server, sessionMiddleware) {
-  const wss = new WebSocket.Server({ noServer: true });
+  // 1MB is plenty for chat and track shares, the default is 100MB
+  const wss = new WebSocket.Server({ noServer: true, maxPayload: 1024 * 1024 });
 
   server.on('upgrade', (request, socket, head) => {
     const urlParts = request.url ? request.url.split('?') : ['', ''];
@@ -706,9 +1109,9 @@ function createWebSocketServer(server, sessionMiddleware) {
     const sidFromQuery = query.get('sid');
     if (sidFromQuery) {
       // try authTokens first (fast for cross-origin token auth)
-      if (global.authTokens && global.authTokens.has(sidFromQuery)) {
-        const userId = global.authTokens.get(sidFromQuery);
-        const user = db.getUserById(userId);
+      const tokenUserId = authTokens.resolve(sidFromQuery);
+      if (tokenUserId) {
+        const user = db.getUserById(tokenUserId);
         if (user) {
           request.session = { userId: user.id, username: user.username, isAdmin: user.is_admin };
           request.sessionID = sidFromQuery;
@@ -723,7 +1126,7 @@ function createWebSocketServer(server, sessionMiddleware) {
       // fallback to session store (standard cookies)
       if (sessionStore) {
         sessionStore.get(sidFromQuery, (err, session) => {
-          if (!err && session && session.userId) {
+          if (!err && session && session.userId && db.getUserById(session.userId)) {
             request.session = session;
             request.sessionID = sidFromQuery;
             logToFile(`[WS] auth via session store: ${session.username}`);
@@ -741,7 +1144,7 @@ function createWebSocketServer(server, sessionMiddleware) {
     }
 
     sessionMiddleware(request, {}, () => {
-      if (!request.session || !request.session.userId) {
+      if (!request.session || !request.session.userId || !db.getUserById(request.session.userId)) {
         logToFile(`[WS] auth failed for request at ${request.url}`, true);
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
@@ -766,14 +1169,15 @@ if (TRUST_PROXY) {
 
 // cors and body parsers (run these early)
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(cookieParser());
 
-// request logging
+// request logging. passwords and tokens get redacted before anything is
+// written, the log file is readable through the debug console
 app.use((req, res, next) => {
-  const q = Object.keys(req.query).length ? ` query=${JSON.stringify(req.query)}` : '';
-  const b = req.body && Object.keys(req.body).length ? ` body=${JSON.stringify(req.body)}` : '';
+  const q = Object.keys(req.query).length ? ` query=${JSON.stringify(validation.redactForLog(req.query))}` : '';
+  const b = req.body && Object.keys(req.body).length ? ` body=${JSON.stringify(validation.redactForLog(req.body))}` : '';
   logToFile(`[HTTP] ${req.method} ${req.path}${q}${b}`);
 
   res.on('finish', () => {
@@ -807,13 +1211,26 @@ app.use(sessionMiddleware);
 
 // token-based auth for cross-origin requests
 app.use((req, res, next) => {
-  // skip if already authed via cookie
-  if (req.session && req.session.userId) return next();
+  // cookie session: make sure the account still exists (it may have been
+  // deleted by an admin since login) and pick up its current admin flag
+  if (req.session && req.session.userId) {
+    const sessionUser = db.getUserById(req.session.userId);
+    if (!sessionUser) {
+      delete req.session.userId;
+      delete req.session.username;
+      delete req.session.isAdmin;
+    } else {
+      req.session.isAdmin = sessionUser.is_admin;
+      return next();
+    }
+  }
 
-  const token = req.headers['x-auth-token'] || req.query['token'] || req.query['sid'];
-  
-  if (token && global.authTokens) {
-    const userId = global.authTokens.get(token);
+  // header values are strings, but a repeated query param shows up as an array
+  const rawToken = req.headers['x-auth-token'] || req.query['token'] || req.query['sid'];
+  const token = typeof rawToken === 'string' ? rawToken : '';
+
+  if (token) {
+    const userId = authTokens.resolve(token);
     if (userId) {
       const user = db.getUserById(userId);
       if (user) {
@@ -832,7 +1249,7 @@ app.use((req, res, next) => {
         logToFile(`[AUTH] token valid but user ${userId} not found`, true);
       }
     } else if (token.startsWith('tok_')) {
-      logToFile(`[AUTH] invalid or expired token: ${token}`, true);
+      logToFile(`[AUTH] invalid or expired token: ${token.slice(0, 8)}...`, true);
     }
   }
   next();
@@ -846,7 +1263,7 @@ const requireAuth = (req, res, next) => {
   next();
 };
 
-// admin middleware — checks if the user is an admin
+// admin middleware - checks if the user is an admin
 const requireAdmin = (req, res, next) => {
   if (!req.session || !req.session.userId) {
     return res.status(401).json({ error: 'Authentication required' });
@@ -964,28 +1381,43 @@ app.get('/api/health', (req, res) => {
 // register new user
 app.post('/api/auth/register', (req, res) => {
   try {
-    const { username, password } = req.body;
+    const body = req.body || {};
 
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password required' });
+    // the admin names are reserved for whoever claims them first, everything
+    // else on the reserved list (null, admin, constructor, ...) is refused
+    const usernameCheck = validation.validateNewUsername(body.username, { allowReserved: db.ADMIN_USERNAMES });
+    if (!usernameCheck.ok) {
+      return res.status(400).json({ error: usernameCheck.error });
+    }
+    const username = usernameCheck.value;
+
+    const passwordCheck = validation.validateNewPassword(body.password, username);
+    if (!passwordCheck.ok) {
+      return res.status(400).json({ error: passwordCheck.error });
+    }
+    const password = passwordCheck.value;
+
+    const limit = registerLimiter.hit(getClientKey(req));
+    if (!limit.allowed) {
+      return tooManyAttempts(res, limit.retryAfterSec);
     }
 
-    if (username.length < 3 || username.length > 20) {
-      return res.status(400).json({ error: 'Username must be 3-20 characters' });
-    }
-
-    if (password.length < 4) {
-      return res.status(400).json({ error: 'Password must be at least 4 characters' });
-    }
-
-    // check if username taken
-    const existingUser = db.statements.getUserByUsername.get(username);
-    if (existingUser) {
+    // check if username taken, ignoring case
+    if (db.findUserByUsername(username)) {
       return res.status(409).json({ error: 'Username already exists' });
     }
 
     // create user
-    const user = db.createUser(username, password);
+    let user;
+    try {
+      user = db.createUser(username, password);
+    } catch (createErr) {
+      // two people registering the same name at the same moment
+      if (String(createErr.code || '').startsWith('SQLITE_CONSTRAINT')) {
+        return res.status(409).json({ error: 'Username already exists' });
+      }
+      throw createErr;
+    }
 
     // create session
     req.session.userId = user.id;
@@ -997,8 +1429,7 @@ app.post('/api/auth/register', (req, res) => {
     db.setOnlineStatus(user.id);
 
     logToFile(`[AUTH] User registered: ${username}`);
-    const authToken = 'tok_' + Date.now() + '_' + Math.random().toString(36).substr(2, 32);
-    global.authTokens.set(authToken, user.id);
+    const authToken = authTokens.issue(user.id);
     res.json({
       ok: true,
       user: { id: user.id, username: user.username, is_admin: user.is_admin },
@@ -1013,16 +1444,28 @@ app.post('/api/auth/register', (req, res) => {
 // login
 app.post('/api/auth/login', (req, res) => {
   try {
-    const { username, password } = req.body;
+    const fields = validation.readLoginFields(req.body);
+    if (!fields.ok) {
+      return res.status(400).json({ error: fields.error });
+    }
+    const { username, password } = fields;
 
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password required' });
+    const clientKey = getClientKey(req);
+    const ipLimit = loginIpLimiter.hit(clientKey);
+    if (!ipLimit.allowed) {
+      return tooManyAttempts(res, ipLimit.retryAfterSec);
+    }
+    const attemptKey = `${clientKey}|${username.toLowerCase()}`;
+    const attemptLimit = loginAttemptLimiter.hit(attemptKey);
+    if (!attemptLimit.allowed) {
+      return tooManyAttempts(res, attemptLimit.retryAfterSec);
     }
 
     const user = db.authenticateUser(username, password);
     if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
+    loginAttemptLimiter.reset(attemptKey);
 
     // sign out any existing session (one session per user)
     db.deleteUserSessionsByUserId(user.id);
@@ -1038,9 +1481,8 @@ app.post('/api/auth/login', (req, res) => {
     // set user as online
     db.setOnlineStatus(user.id);
 
-    logToFile(`[AUTH] User logged in: ${username} (previous sessions terminated)`);
-    const authToken = 'tok_' + Date.now() + '_' + Math.random().toString(36).substr(2, 32);
-    global.authTokens.set(authToken, user.id);
+    logToFile(`[AUTH] User logged in: ${user.username} (previous sessions terminated)`);
+    const authToken = authTokens.issue(user.id);
     res.json({
       ok: true,
       user: { id: user.id, username: user.username, is_admin: user.is_admin },
@@ -1056,6 +1498,12 @@ app.post('/api/auth/login', (req, res) => {
 app.post('/api/auth/logout', (req, res) => {
   const username = req.session.username;
   const userId = req.session.userId;
+
+  // the token has to die too or it keeps working after logout
+  const rawToken = req.headers['x-auth-token'];
+  if (typeof rawToken === 'string') {
+    authTokens.revoke(rawToken);
+  }
 
   // set user as offline
   if (userId) {
@@ -1102,6 +1550,52 @@ app.get('/api/auth/session-id', (req, res) => {
 
 // user data routes
 
+// every device a person is signed in on hears about a change the moment it is
+// saved, so a song added on the phone is on the computer a beat later. the app
+// that made the change hears it as well and skips it by its client id.
+// announcements only go out when the content really changed, otherwise two
+// devices saving the same data back and forth would announce forever. what is
+// compared is a short signature, not the rows, because every save rewrites the
+// track rows under new ids
+const accountDataSignatures = new Map(); // `${userId}:${scope}` -> signature last announced
+
+function accountDataSignature(userId, scope) {
+  if (scope === 'playlists') {
+    return JSON.stringify(db.getUserPlaylists(userId).map((p) => [p.id, p.name, p.tracks.map((t) => t.videoId)]));
+  }
+  if (scope === 'queue') {
+    return JSON.stringify(db.getUserQueue(userId).map((t) => t.videoId));
+  }
+  const s = db.getSettings(userId);
+  return JSON.stringify([s.theme_color_r, s.theme_color_g, s.theme_color_b, s.debug_mode, s.hide_listening]);
+}
+
+function announceAccountChange(userId, scope, req) {
+  try {
+    const signature = crypto.createHash('sha1').update(accountDataSignature(userId, scope)).digest('hex');
+    const key = `${userId}:${scope}`;
+    if (accountDataSignatures.get(key) === signature) return;
+    accountDataSignatures.set(key, signature);
+    const origin = String(req.get('x-client-id') || '').slice(0, 64);
+    broadcastWs({ type: 'account_data_changed', scope, origin }, (client) => client.userId === userId);
+  } catch (error) {
+    logToFile(`[ACCOUNT SYNC] announce failed: ${error.message}`, true);
+  }
+}
+
+app.use('/api/user', (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  res.on('finish', () => {
+    if (res.statusCode >= 400 || !req.session || !req.session.userId) return;
+    const path = req.originalUrl || '';
+    const scope = path.startsWith('/api/user/settings') ? 'settings'
+      : path.startsWith('/api/user/queue') ? 'queue'
+        : path.startsWith('/api/user/playlists') ? 'playlists' : null;
+    if (scope) announceAccountChange(req.session.userId, scope, req);
+  });
+  next();
+});
+
 // get user settings
 app.get('/api/user/settings', requireAuth, (req, res) => {
   try {
@@ -1112,7 +1606,8 @@ app.get('/api/user/settings', requireAuth, (req, res) => {
         theme_color_r: settings.theme_color_r,
         theme_color_g: settings.theme_color_g,
         theme_color_b: settings.theme_color_b,
-        debug_mode: settings.debug_mode === 1
+        debug_mode: settings.debug_mode === 1,
+        hide_listening: settings.hide_listening === 1
       } 
     });
   } catch (error) {
@@ -1124,13 +1619,18 @@ app.get('/api/user/settings', requireAuth, (req, res) => {
 // save user settings
 app.post('/api/user/settings', requireAuth, (req, res) => {
   try {
-    const { theme_color_r, theme_color_g, theme_color_b, debug_mode } = req.body;
+    const { theme_color_r, theme_color_g, theme_color_b, debug_mode, hide_listening } = req.body;
+    const wasHidden = isListeningHidden(req.session.userId);
     db.saveSettings(req.session.userId, {
       theme_color_r,
       theme_color_g,
       theme_color_b,
-      debug_mode
+      debug_mode,
+      hide_listening
     });
+    // everyone sees the change straight away, not at the next song
+    hiddenListeningCache.delete(req.session.userId);
+    if (isListeningHidden(req.session.userId) !== wasHidden) broadcastPresence();
     logToFile(`[SETTINGS] Saved for user: ${req.session.username}`);
     res.json({ ok: true });
   } catch (error) {
@@ -1153,10 +1653,11 @@ app.get('/api/user/playlists', requireAuth, (req, res) => {
 // create playlist
 app.post('/api/user/playlists', requireAuth, (req, res) => {
   try {
-    const { name } = req.body;
-    if (!name) {
-      return res.status(400).json({ error: 'Playlist name required' });
+    const nameCheck = validation.cleanText((req.body || {}).name, { field: 'Playlist name', max: 100 });
+    if (!nameCheck.ok) {
+      return res.status(400).json({ error: nameCheck.error });
     }
+    const name = nameCheck.value;
     const playlist = db.createPlaylist(req.session.userId, name);
     logToFile(`[PLAYLISTS] Created "${name}" for user: ${req.session.username}`);
     res.json({ ok: true, playlist });
@@ -1169,11 +1670,12 @@ app.post('/api/user/playlists', requireAuth, (req, res) => {
 // update playlist
 app.put('/api/user/playlists/:id', requireAuth, (req, res) => {
   try {
-    const { name } = req.body;
     const { id } = req.params;
-    if (!name) {
-      return res.status(400).json({ error: 'Playlist name required' });
+    const nameCheck = validation.cleanText((req.body || {}).name, { field: 'Playlist name', max: 100 });
+    if (!nameCheck.ok) {
+      return res.status(400).json({ error: nameCheck.error });
     }
+    const name = nameCheck.value;
     db.updatePlaylist(id, req.session.userId, name);
     logToFile(`[PLAYLISTS] Updated "${name}" for user: ${req.session.username}`);
     res.json({ ok: true });
@@ -1220,6 +1722,10 @@ app.post('/api/user/playlists/:id/tracks', requireAuth, (req, res) => {
 app.delete('/api/user/playlists/:playlistId/tracks/:trackId', requireAuth, (req, res) => {
   try {
     const { playlistId, trackId } = req.params;
+    // only the owner can touch a playlist's tracks
+    if (!db.getPlaylistById(playlistId, req.session.userId)) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
     db.removeTrackFromPlaylist(trackId, playlistId);
     res.json({ ok: true });
   } catch (error) {
@@ -1232,6 +1738,9 @@ app.delete('/api/user/playlists/:playlistId/tracks/:trackId', requireAuth, (req,
 app.delete('/api/user/playlists/:id/tracks', requireAuth, (req, res) => {
   try {
     const { id } = req.params;
+    if (!db.getPlaylistById(id, req.session.userId)) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
     db.clearPlaylist(id);
     res.json({ ok: true });
   } catch (error) {
@@ -1243,10 +1752,23 @@ app.delete('/api/user/playlists/:id/tracks', requireAuth, (req, res) => {
 // sync all playlists (bulk save from client)
 app.put('/api/user/playlists-sync', requireAuth, (req, res) => {
   try {
-    const { playlists } = req.body;
-    if (!Array.isArray(playlists)) {
+    const { playlists: rawPlaylists } = req.body || {};
+    if (!Array.isArray(rawPlaylists)) {
       return res.status(400).json({ error: 'Playlists must be an array' });
     }
+
+    // clean the names, and only keep ids that look like ids. a bad name just
+    // falls back to a default instead of failing the whole sync
+    const playlists = rawPlaylists
+      .filter((playlist) => playlist && typeof playlist === 'object')
+      .map((playlist) => {
+        const nameCheck = validation.cleanText(playlist.name, { field: 'Playlist name', max: 100 });
+        return {
+          ...playlist,
+          id: validation.cleanClientId(playlist.id) || undefined,
+          name: nameCheck.ok ? nameCheck.value : 'untitled playlist'
+        };
+      });
 
     const syncedPlaylists = db.replaceUserPlaylists(req.session.userId, playlists);
 
@@ -1283,19 +1805,48 @@ app.get('/api/servers/:serverId/collab-playlists', requireAuth, (req, res) => {
   }
 });
 
+// what happens to a channel's collab playlists reaches everyone in the channel
+// right away. the apps used to tell each other over the websocket, which the
+// server never passed on, so the other members saw nothing until they rejoined
+function broadcastCollab(serverId, payload) {
+  if (globalWss) broadcastToServer(serverId, { ...payload, serverId });
+}
+
 // create a collab playlist
 app.post('/api/servers/:serverId/collab-playlists', requireAuth, (req, res) => {
   try {
     const { serverId } = req.params;
-    const { id, name, createdBy } = req.body;
+    const body = req.body || {};
 
     const member = db.getServerMember(serverId, req.session.userId);
     if (!member) {
       return res.status(403).json({ error: 'Must be a server member to create collab playlists' });
     }
 
-    const playlist = db.createCollabPlaylist(id, serverId, name, createdBy || req.session.userId);
+    const nameCheck = validation.cleanText(body.name, { field: 'Playlist name', max: 100 });
+    if (!nameCheck.ok) {
+      return res.status(400).json({ error: nameCheck.error });
+    }
+    const name = nameCheck.value;
+    // the client picks the id so it can show the playlist right away, but it
+    // has to be a plain id. the creator is always whoever is logged in, a
+    // client supplied createdBy used to let anyone credit someone else
+    const id = validation.cleanClientId(body.id) || `collab_${crypto.randomUUID()}`;
+
+    let playlist;
+    try {
+      playlist = db.createCollabPlaylist(id, serverId, name, req.session.userId);
+    } catch (createErr) {
+      if (String(createErr.code || '').startsWith('SQLITE_CONSTRAINT')) {
+        return res.status(409).json({ error: 'Playlist id already in use' });
+      }
+      throw createErr;
+    }
     logToFile(`[COLLAB PLAYLISTS] Created "${name}" in server ${serverId} by ${req.session.username}`);
+    broadcastCollab(serverId, {
+      type: 'collab_playlist_created',
+      playlist: { id: playlist.id, name: playlist.name, tracks: [], createdBy: req.session.userId, createdAt: Date.now() }
+    });
     res.json({ ok: true, playlist });
   } catch (error) {
     logToFile(`[COLLAB PLAYLISTS] Create error: ${error.message}`, true);
@@ -1307,14 +1858,19 @@ app.post('/api/servers/:serverId/collab-playlists', requireAuth, (req, res) => {
 app.put('/api/servers/:serverId/collab-playlists/:playlistId', requireAuth, (req, res) => {
   try {
     const { serverId, playlistId } = req.params;
-    const { name } = req.body;
 
     const member = db.getServerMember(serverId, req.session.userId);
     if (!member) {
       return res.status(403).json({ error: 'Must be a server member to rename collab playlists' });
     }
 
-    db.updateCollabPlaylistName(playlistId, serverId, name);
+    const nameCheck = validation.cleanText((req.body || {}).name, { field: 'Playlist name', max: 100 });
+    if (!nameCheck.ok) {
+      return res.status(400).json({ error: nameCheck.error });
+    }
+
+    db.updateCollabPlaylistName(playlistId, serverId, nameCheck.value);
+    broadcastCollab(serverId, { type: 'collab_playlist_renamed', playlistId, name: nameCheck.value });
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[COLLAB PLAYLISTS] Rename error: ${error.message}`, true);
@@ -1333,6 +1889,7 @@ app.delete('/api/servers/:serverId/collab-playlists/:playlistId', requireAuth, (
     }
 
     db.deleteCollabPlaylist(playlistId, serverId);
+    broadcastCollab(serverId, { type: 'collab_playlist_deleted', playlistId });
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[COLLAB PLAYLISTS] Delete error: ${error.message}`, true);
@@ -1356,12 +1913,17 @@ app.post('/api/servers/:serverId/collab-playlists/:playlistId/tracks', requireAu
       return res.status(404).json({ error: 'Playlist not found' });
     }
 
+    const videoId = track && (track.video_id || track.videoId);
+    if (!videoId || !track.title) {
+      return res.status(400).json({ error: 'A track needs a video id and a title' });
+    }
     const trackId = `cpt_${crypto.randomUUID()}`;
     const newTrack = db.addTrackToCollabPlaylist(
-      trackId, playlistId, track.video_id || track.videoId, track.title, track.author,
-      track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url,
-      track.duration_ms || 0, req.session.userId
+      trackId, playlistId, videoId, track.title, track.author,
+      track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url || track.externalUrl,
+      track.duration_ms || track.durationMs || 0, req.session.userId
     );
+    broadcastCollab(serverId, { type: 'collab_playlist_track_added', playlistId, track: newTrack });
 
     res.json({ ok: true, track: newTrack });
   } catch (error) {
@@ -1381,6 +1943,7 @@ app.delete('/api/servers/:serverId/collab-playlists/:playlistId/tracks/:trackId'
     }
 
     db.removeTrackFromCollabPlaylist(trackId, playlistId);
+    broadcastCollab(serverId, { type: 'collab_playlist_track_removed', playlistId, trackId });
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[COLLAB PLAYLISTS] Remove track error: ${error.message}`, true);
@@ -1399,10 +1962,63 @@ app.delete('/api/servers/:serverId/collab-playlists/:playlistId/tracks', require
     }
 
     db.clearCollabPlaylist(playlistId);
+    broadcastCollab(serverId, { type: 'collab_playlist_cleared', playlistId });
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[COLLAB PLAYLISTS] Clear error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to clear collab playlist' });
+  }
+});
+
+// add many tracks at once (the whole room queue, say)
+app.post('/api/servers/:serverId/collab-playlists/:playlistId/tracks-bulk', requireAuth, (req, res) => {
+  try {
+    const { serverId, playlistId } = req.params;
+    const member = db.getServerMember(serverId, req.session.userId);
+    if (!member) {
+      return res.status(403).json({ error: 'Must be a server member to add tracks' });
+    }
+    const playlist = db.getCollabPlaylist(playlistId, serverId);
+    if (!playlist) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
+    const list = Array.isArray((req.body || {}).tracks) ? req.body.tracks.slice(0, 200) : [];
+    const added = [];
+    list.forEach((track) => {
+      const videoId = track && (track.video_id || track.videoId);
+      if (!videoId || !track.title) return;
+      added.push(db.addTrackToCollabPlaylist(
+        `cpt_${crypto.randomUUID()}`, playlistId, videoId, track.title, track.author,
+        track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url || track.externalUrl,
+        track.duration_ms || track.durationMs || 0, req.session.userId
+      ));
+    });
+    if (added.length) broadcastCollab(serverId, { type: 'collab_playlist_tracks_added', playlistId, tracks: added });
+    res.json({ ok: true, tracks: added });
+  } catch (error) {
+    logToFile(`[COLLAB PLAYLISTS] Bulk add error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to add tracks to collab playlist' });
+  }
+});
+
+// put the tracks of a collab playlist in a new order
+app.put('/api/servers/:serverId/collab-playlists/:playlistId/order', requireAuth, (req, res) => {
+  try {
+    const { serverId, playlistId } = req.params;
+    const member = db.getServerMember(serverId, req.session.userId);
+    if (!member) {
+      return res.status(403).json({ error: 'Must be a server member to reorder tracks' });
+    }
+    if (!db.getCollabPlaylist(playlistId, serverId)) {
+      return res.status(404).json({ error: 'Playlist not found' });
+    }
+    const ids = Array.isArray((req.body || {}).trackIds) ? req.body.trackIds.filter((id) => typeof id === 'string').slice(0, 1000) : [];
+    db.reorderCollabPlaylist(playlistId, ids);
+    broadcastCollab(serverId, { type: 'collab_playlist_reordered', playlistId, trackIds: ids });
+    res.json({ ok: true });
+  } catch (error) {
+    logToFile(`[COLLAB PLAYLISTS] Reorder error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to reorder collab playlist' });
   }
 });
 
@@ -1510,6 +2126,24 @@ app.post('/api/log', (req, res) => {
   res.json({ ok: true });
 });
 
+// yt-dlp work for a track (stream, download, info, search, playlist) belongs on
+// the user's own machine, through the local helper, because youtube blocks
+// datacenter ips and every request here costs the host cpu, disk and a ban
+// risk. so these endpoints only answer requests from the same machine or the
+// same home network. set DISABLE_MEDIA_ENDPOINTS=1 on a hosted server to turn
+// them off completely
+const MEDIA_API_PATHS = new Set(['/api/stream', '/api/download', '/api/info', '/api/search', '/api/playlist']);
+app.use((req, res, next) => {
+  if (!MEDIA_API_PATHS.has(req.path) || req.method === 'OPTIONS') return next();
+  if (process.env.DISABLE_MEDIA_ENDPOINTS === '1' || !validation.isPrivateNetworkRequest(req)) {
+    return res.status(403).json({ error: 'Audio is handled by the local helper on your own computer, not by this server' });
+  }
+  next();
+});
+
+const fullServerMedia = createMediaTools({ ytdlp, log: (message) => logToFile(`[MEDIA] ${message}`) });
+fullServerMedia.sweepLeftoverDownloads(path.join(APP_DATA_DIR, 'temp_audio'));
+
 app.get('/api/info', async (req, res) => {
   const videoId = String(req.query.videoId || '').trim();
 
@@ -1534,7 +2168,8 @@ app.get('/api/info', async (req, res) => {
     const author = info.uploader || info.channel || '';
     res.json({ videoId, title, author });
   } catch (error) {
-    res.status(500).json({ error: error.message || 'Failed to fetch video info' });
+    fullServerMedia.noteYoutubeFailure(error);
+    fullServerMedia.sendYoutubeError(res, error, 'Failed to fetch video info');
   }
 });
 
@@ -1653,6 +2288,10 @@ app.get('/api/playlist', async (req, res) => {
   if (!playlistId) {
     return res.status(400).json({ error: 'Missing playlist ID' });
   }
+  // the id goes straight into a url, so keep it to the characters real ids use
+  if (!/^[A-Za-z0-9_-]{2,80}$/.test(playlistId)) {
+    return res.status(400).json({ error: 'Invalid playlist ID' });
+  }
 
   try {
     const url = `https://www.youtube.com/playlist?list=${playlistId}`;
@@ -1677,9 +2316,9 @@ app.get('/api/playlist', async (req, res) => {
 
     res.json({ playlistId, title, items });
   } catch (error) {
-    const msg = `Playlist fetch failed for ${playlistId}: ${error.message}`;
-    logToFile(msg, 'error');
-    res.status(500).json({ error: msg });
+    logToFile(`Playlist fetch failed for ${playlistId}: ${error.message}`, true);
+    fullServerMedia.noteYoutubeFailure(error);
+    fullServerMedia.sendYoutubeError(res, error, `Playlist fetch failed for ${playlistId}`);
   }
 });
 
@@ -1709,13 +2348,15 @@ app.get('/api/download', async (req, res) => {
     .replace(/\s+/g, '_')
     .slice(0, 200);
 
-  const downloadsDir = path.join(__dirname, '..', 'downloads');
+  // app data dir, not next to the code: once installed the code lives in
+  // program files where a normal user account cant write
+  const downloadsDir = path.join(APP_DATA_DIR, 'downloads');
   if (!fs.existsSync(downloadsDir)) {
     fs.mkdirSync(downloadsDir, { recursive: true });
   }
 
   // working filename is keyed by videoId, NOT the (user-supplied,
-  // title-based) display name — two different tracks can sanitize down to
+  // title-based) display name - two different tracks can sanitize down to
   // the same "safeName" (or a batch download can race), which used to mean
   // one video's yt-dlp output/thumbnail temp files could collide with
   // another's and get embedded into the wrong track lol. videoId is unique
@@ -1867,74 +2508,36 @@ app.get('/api/stream', async (req, res) => {
 
   logToFile(`[Stream] Request for videoId: ${videoId}`);
 
-  const tempDir = path.join(__dirname, '..', 'temp_audio');
+  // same cache folder the helper uses, and a writable one once installed
+  const tempDir = path.join(APP_DATA_DIR, 'temp_audio');
   if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
   const audioFile = path.join(tempDir, `${videoId}.m4a`);
 
   try {
-    // download audio if not already cached
+    // a cached file only counts if it is whole, a truncated one gets redone
+    if (fs.existsSync(audioFile) && !fullServerMedia.isCompleteAudioFile(audioFile)) {
+      logToFile('[Stream] Cached file is incomplete, discarding it');
+      try { fs.unlinkSync(audioFile); } catch {}
+    }
+
+    // download audio if not already cached (written under a temp name and
+    // moved into place when finished, so a half written file is never served)
     if (!fs.existsSync(audioFile)) {
-      logToFile(`[Stream] Downloading audio to temp file...`);
-      await ytdlp(`https://www.youtube.com/watch?v=${videoId}`, {
-        extractAudio: true,
-        audioFormat: 'm4a',
-        output: audioFile,
-        noWarnings: true,
-        noCheckCertificate: true,
-        quiet: true
-      });
+      logToFile('[Stream] Downloading audio to temp file...');
+      await fullServerMedia.downloadToCache(videoId, audioFile);
       logToFile(`[Stream] Audio downloaded to ${audioFile}`);
     }
 
-    const stats = fs.statSync(audioFile);
-    const fileSize = stats.size;
-    const range = req.headers.range;
-
-    logToFile(`[Stream] Serving audio, fileSize: ${fileSize}, range: ${range || 'none'}`);
-
-    const contentType = 'audio/m4a';
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
-
-      logToFile(`[Stream] Range request: bytes ${start}-${end}/${fileSize}`);
-
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Range',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
-      });
-
-      fs.createReadStream(audioFile, { start, end }).pipe(res);
-    } else {
-      logToFile(`[Stream] Full request: bytes 0-${fileSize - 1}/${fileSize}`);
-
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Accept-Ranges': 'bytes',
-        'Content-Type': contentType,
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Range',
-        'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges'
-      });
-
-      fs.createReadStream(audioFile).pipe(res);
-    }
+    fullServerMedia.serveLocalFile(req, res, audioFile, 'audio/m4a', {
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Range'
+    });
   } catch (error) {
-    logToFile(`[Stream] Streaming error: ${error.message}`, 'error');
+    logToFile(`[Stream] Streaming error: ${error.message}`, true);
     if (!res.headersSent) {
-      res.status(500).json({ error: error.message || 'Streaming failed' });
+      fullServerMedia.sendYoutubeError(res, error, 'Streaming failed');
     } else {
-      res.end();
+      res.destroy();
     }
   }
 });
@@ -1945,9 +2548,19 @@ app.use((err, req, res, next) => {
   logToFile(`[ERROR] Stack: ${err.stack}`, true);
   logToFile(`[ERROR] Path: ${req.method} ${req.path}`, true);
 
-  // dont send html — always json for api routes
+  // dont send html - always json for api routes
   if (req.path.startsWith('/api/')) {
-    res.status(500).json({ error: 'Internal server error', details: err.message });
+    // a malformed or oversized body is the client's fault, not a server error
+    // (body-parser tags these with a 4xx status)
+    const clientStatus = Number(err.status || err.statusCode);
+    if (clientStatus >= 400 && clientStatus < 500) {
+      const message = clientStatus === 413 ? 'Request body too large' : 'Invalid request body';
+      return res.status(clientStatus).json({ error: message });
+    }
+    // the raw error message can name files and internals, dev only
+    const body = { error: 'Internal server error' };
+    if (!IS_PRODUCTION) body.details = err.message;
+    res.status(500).json(body);
   } else {
     next();
   }
@@ -1955,8 +2568,38 @@ app.use((err, req, res, next) => {
 
 // serve react static files - note: catch-all moved to end
 const resolvedBuildPath = projectPath('build');
+
+// the screens can be replaced by a newer signed bundle from the club server without
+// a new installer (see updates.js). on the installed app this decides whether the
+// files that came with it or a downloaded newer set are served
+const uiUpdates = require('./updates');
+let installerVersion = '0.0.0';
+try { installerVersion = JSON.parse(fs.readFileSync(projectPath('package.json'), 'utf8')).version || installerVersion; } catch { /* unknown */ }
+const uiUpdater = createUiUpdater();
+function createUiUpdater() {
+  try {
+    return uiUpdates.createUpdater({ appDataDir: APP_DATA_DIR, bundledDir: resolvedBuildPath, shellVersion: installerVersion, log: (message) => logToFile(message) });
+  } catch (error) {
+    logToFile(`[UPDATE] updater not available: ${error.message}`, true);
+    return null;
+  }
+}
+const bundledStatic = express.static(resolvedBuildPath);
+let downloadedStatic = null;
+let downloadedStaticDir = null;
+function activeBuildDir() {
+  return uiUpdater ? uiUpdater.activeDir() : resolvedBuildPath;
+}
 if (fs.existsSync(resolvedBuildPath)) {
-  app.use(express.static(resolvedBuildPath));
+  app.use((req, res, next) => {
+    const dir = activeBuildDir();
+    if (dir === resolvedBuildPath) return bundledStatic(req, res, next);
+    if (downloadedStaticDir !== dir) {
+      downloadedStatic = express.static(dir);
+      downloadedStaticDir = dir;
+    }
+    return downloadedStatic(req, res, next);
+  });
 } else {
   logToFile('React build folder not found; frontend will not be served from this server. Run `npm run react-start` or `npm run dev` to start the UI.');
 }
@@ -1970,17 +2613,55 @@ app.get('/package.json', (req, res) => {
   });
 });
 
-// add version endpoint
+// add version endpoint. `ui` is the version of the screens being served, which on
+// an installed app can be newer than `version` (the installer's own)
 app.get('/api/version', (req, res) => {
   try {
     const packageJson = JSON.parse(fs.readFileSync(projectPath('package.json'), 'utf8'));
-    res.json({ version: packageJson.version });
+    res.json({ version: packageJson.version, ui: uiUpdater ? uiUpdater.uiVersion() : packageJson.version });
   } catch (err) {
     res.status(500).json({ error: 'Could not read version' });
   }
 });
 
-// used to decide whether to show the first-run welcome dialog — a genuinely
+// ---- updates of the screens
+// the club server publishes them: update-files/manifest.json (signed) and the files
+// themselves under update-files/ui/. nothing is published when the folder is missing
+const updateFilesDir = projectPath('update-files');
+app.get('/api/update/manifest', (req, res) => {
+  const manifestFile = path.join(updateFilesDir, 'manifest.json');
+  if (!fs.existsSync(manifestFile)) return res.status(404).json({ error: 'No update published' });
+  res.set('Cache-Control', 'no-store');
+  res.type('json').send(fs.readFileSync(manifestFile, 'utf8'));
+});
+app.use('/api/update/ui', express.static(path.join(updateFilesDir, 'ui'), { index: false, dotfiles: 'deny', maxAge: 0 }));
+
+// an installed app asks its own server (this machine only) what is on offer and
+// has it fetched. a hosted server never does this for itself
+function updateAllowedHere(req) {
+  return Boolean(uiUpdater) && process.env.DISABLE_MEDIA_ENDPOINTS !== '1' && validation.isLocalRequest(req);
+}
+app.get('/api/update/status', async (req, res) => {
+  if (!updateAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
+  try {
+    res.json({ ok: true, ...(await uiUpdater.check(req.query.force === '1')) });
+  } catch (error) {
+    res.status(502).json({ error: error.message || 'Could not reach the update server' });
+  }
+});
+app.post('/api/update/apply', async (req, res) => {
+  if (!updateAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
+  try {
+    const result = await uiUpdater.apply();
+    res.json({ ok: true, version: result.version });
+  } catch (error) {
+    logToFile(`[UPDATE] apply failed: ${error.message}`, true);
+    const status = error.code === 'needs_installer' ? 409 : error.code === 'up_to_date' ? 200 : 502;
+    res.status(status).json({ ok: error.code === 'up_to_date', code: error.code || 'failed', error: error.message || 'Update failed' });
+  }
+});
+
+// used to decide whether to show the first-run welcome dialog - a genuinely
 // fresh install has no registered users at all. NOT "have i shown this
 // before" (thats a client-side localStorage flag, since a guest who never
 // registers should still only see it once)
@@ -1993,10 +2674,14 @@ app.get('/api/first-run-status', (req, res) => {
   }
 });
 
-// temp diagnostic: plain http endpoint, no tauri ipc involved at all —
+// temp diagnostic: plain http endpoint, no tauri ipc involved at all -
 // isolates "does frontend js even execute in the native window" from every
 // other layer of uncertainty (invoke, __TAURI__ global, event bus, etc)
 app.post('/api/debug-log', (req, res) => {
+  // only the desktop shell on this machine ever calls this
+  if (!validation.isLocalRequest(req)) {
+    return res.status(403).json({ error: 'Local requests only' });
+  }
   try {
     fs.appendFileSync(
       path.join(APP_DATA_DIR, 'rust_debug.log'),
@@ -2015,23 +2700,27 @@ app.get('/api/collab/port', (req, res) => {
   });
 });
 
+const USERNAME_SEARCH_MAX = 40;
+
 // user search endpoint - search users by username
-app.get('/api/users/search', (req, res) => {
+app.get('/api/users/search', requireAuth, (req, res) => {
   try {
     const query = req.query.q;
     if (!query || typeof query !== 'string') {
       return res.status(400).json({ error: 'Query parameter "q" is required' });
     }
 
-    const normalized = query.trim().toLowerCase();
+    const normalized = query.trim().toLowerCase().slice(0, USERNAME_SEARCH_MAX);
     if (normalized.length === 0) {
       return res.json({ users: [] });
     }
 
-    // grab all users from db and filter by username
+    // grab all users from db and filter by username, capped so a one letter
+    // search on a big server doesnt send back everyone
     const allUsers = db.db.prepare('SELECT id, username FROM users').all();
     const matchingUsers = allUsers
       .filter(user => user.username.toLowerCase().includes(normalized))
+      .slice(0, 25)
       .map(user => ({ id: user.id, username: user.username }));
 
     res.json({ users: matchingUsers });
@@ -2071,11 +2760,7 @@ app.get('/api/users', requireAuth, (req, res) => {
       try {
         const settings = db.getSettings(u.id);
         if (settings) {
-          userThemeColors[u.id] = {
-            r: settings.theme_color_r || 255,
-            g: settings.theme_color_g || 89,
-            b: settings.theme_color_b || 0
-          };
+          userThemeColors[u.id] = themeColorOf(settings);
         }
       } catch {}
     });
@@ -2106,11 +2791,8 @@ app.get('/api/users', requireAuth, (req, res) => {
 });
 
 // delete user (global admin only)
-app.delete('/api/users/:userId', requireAuth, (req, res) => {
+app.delete('/api/users/:userId', requireAuth, requireAdmin, (req, res) => {
   try {
-    if (!req.session.isAdmin) {
-      return res.status(403).json({ error: 'Admin privileges required' });
-    }
 
     const { userId } = req.params;
     if (userId === req.session.userId) {
@@ -2137,6 +2819,7 @@ app.delete('/api/users/:userId', requireAuth, (req, res) => {
     });
 
     db.deleteUser(userId);
+    authTokens.revokeUser(userId);
     logToFile(`[ADMIN] User ${req.session.username} deleted user ${targetUser.username} (${userId})`);
 
     if (globalWss) {
@@ -2343,11 +3026,12 @@ app.get('/api/messages/:userId', requireAuth, (req, res) => {
 app.post('/api/messages/:userId', requireAuth, (req, res) => {
   try {
     const { userId } = req.params;
-    const { message, text, sender_theme_color } = req.body;
-    const content = (message || text || '').trim();
-    if (!content) {
-      return res.status(400).json({ error: 'Message required' });
+    const { message, text, sender_theme_color } = req.body || {};
+    const contentCheck = validation.cleanText(message || text || '', { field: 'Message', max: 2000, multiline: true });
+    if (!contentCheck.ok) {
+      return res.status(400).json({ error: contentCheck.error });
     }
+    const content = contentCheck.value;
 
     const targetUser = db.getUserById(userId);
     if (!targetUser) {
@@ -2378,7 +3062,7 @@ app.get('/api/servers', requireAuth, (req, res) => {
   console.log('[API /api/servers] Request received, userId:', req.session?.userId);
   try {
     const servers = db.getAllActiveServers();
-    const serversWithDetails = buildServerListPayload(servers, req);
+    const serversWithDetails = buildServerListPayload(servers, req, req.session.userId);
     console.log('[API /api/servers] Sending response with', serversWithDetails.length, 'servers');
     res.json({ ok: true, servers: serversWithDetails });
   } catch (error) {
@@ -2391,41 +3075,44 @@ app.get('/api/servers', requireAuth, (req, res) => {
 // create new server
 app.post('/api/servers', requireAuth, (req, res) => {
   try {
-    const { name } = req.body;
-    if (!name) {
-      return res.status(400).json({ error: 'Server name required' });
+    const nameCheck = validation.cleanText((req.body || {}).name, { field: 'Server name', max: 50 });
+    if (!nameCheck.ok) {
+      return res.status(400).json({ error: nameCheck.error });
     }
+    const name = nameCheck.value;
 
     const wsPort = activeWsPort;
-    const server = db.createActiveServer(name, req.session.userId, req.session.username, wsPort);
-    const serverWithDetails = buildServerPayload(server, req);
-    logToFile(`[SERVERS] Server created: ${name} by ${req.session.username}`);
+    const body = req.body || {};
+    const isPrivate = body.isPrivate === true || body.isPrivate === 1 || body.isPrivate === '1' || body.isPrivate === 'true';
+    const server = db.createActiveServer(name, req.session.userId, req.session.username, wsPort, isPrivate);
+    logToFile(`[SERVERS] ${isPrivate ? 'Private server' : 'Server'} created: ${name} by ${req.session.username}`);
 
-    // let ws clients know theres a new server
+    // let ws clients know theres a new server. everyone is told about it, so the
+    // join code of a private one is left out of what is broadcast
     if (globalWss) {
       broadcastWs({
         type: 'server_created',
-        server: serverWithDetails
+        server: buildServerPayload(server, req)
       });
     }
-    
-    res.json({ ok: true, server: serverWithDetails });
+
+    // the host gets it with the code in it
+    res.json({ ok: true, server: buildServerPayload(server, req, req.session.userId) });
   } catch (error) {
     logToFile(`[SERVERS] Create server error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to create server' });
   }
 });
 
-// join server
-app.post('/api/servers/:serverId/join', requireAuth, (req, res) => {
-  try {
-    const { serverId } = req.params;
-    const server = db.getActiveServerById(serverId);
-    if (!server) {
-      return res.status(404).json({ error: 'Server not found' });
-    }
+// guessing codes: a handful of tries, then wait
+const joinCodeLimiter = validation.createRateLimiter({ windowMs: 10 * 60 * 1000, max: 12 });
 
-    const member = db.addServerMember(serverId, req.session.userId, req.session.username, 0);
+// put the signed in user into a server (the checks on who may are done by the caller)
+function joinServerAsUser(req, res, server) {
+  const serverId = server.id;
+  try {
+    // the host comes back as an admin
+    const member = db.addServerMember(serverId, req.session.userId, req.session.username, server.host_id === req.session.userId ? 1 : 0);
     if (member.error) {
       return res.status(400).json({ error: 'Already a member of this server' });
     }
@@ -2451,10 +3138,61 @@ app.post('/api/servers/:serverId/join', requireAuth, (req, res) => {
     res.json({
       ok: true,
       member,
-      server: buildServerPayload(server, req)
+      server: buildServerPayload(server, req, true)
     });
   } catch (error) {
     logToFile(`[SERVERS] Join server error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to join server' });
+  }
+}
+
+// join server. a private one needs its code, unless you are in it already
+app.post('/api/servers/:serverId/join', requireAuth, (req, res) => {
+  try {
+    const { serverId } = req.params;
+    const server = db.getActiveServerById(serverId);
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+
+    // a private one needs its code, the host who stepped out of it does not
+    if (server.is_private && server.host_id !== req.session.userId && !db.isServerMember(serverId, req.session.userId)) {
+      const limit = joinCodeLimiter.hit(`${req.session.userId}:${getClientKey(req)}`);
+      if (!limit.allowed) {
+        return tooManyAttempts(res, limit.retryAfterSec);
+      }
+      const given = String((req.body || {}).code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const real = String(server.join_code || '').toUpperCase();
+      if (!given || !real || given !== real) {
+        return res.status(403).json({ error: 'This server is private. Enter its code to join.', needs_code: true });
+      }
+    }
+
+    return joinServerAsUser(req, res, server);
+  } catch (error) {
+    logToFile(`[SERVERS] Join server error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to join server' });
+  }
+});
+
+// join with just a code, without picking the channel from the directory first
+app.post('/api/servers/join-code', requireAuth, (req, res) => {
+  try {
+    const limit = joinCodeLimiter.hit(`${req.session.userId}:${getClientKey(req)}`);
+    if (!limit.allowed) {
+      return tooManyAttempts(res, limit.retryAfterSec);
+    }
+    const server = db.getActiveServerByJoinCode((req.body || {}).code);
+    if (!server) {
+      return res.status(404).json({ error: 'No server has that code' });
+    }
+    const full = db.getActiveServerById(server.id);
+    if (db.isServerMember(server.id, req.session.userId)) {
+      return res.json({ ok: true, alreadyMember: true, server: buildServerPayload(full, req, true) });
+    }
+    return joinServerAsUser(req, res, full);
+  } catch (error) {
+    logToFile(`[SERVERS] Join by code error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to join server' });
   }
 });
@@ -2589,7 +3327,7 @@ app.post('/api/servers/:serverId/kick/:userId', requireAuth, (req, res) => {
 app.get('/api/servers/my', requireAuth, (req, res) => {
   try {
     const userServers = db.getUserServers(req.session.userId);
-    const serversWithDetails = buildServerListPayload(userServers, req);
+    const serversWithDetails = buildServerListPayload(userServers, req, req.session.userId);
     res.json({ ok: true, servers: serversWithDetails });
   } catch (error) {
     logToFile(`[SERVERS] Get user servers error: ${error.message}`, true);
@@ -2619,18 +3357,18 @@ app.get('/api/server/:serverId/messages', requireAuth, (req, res) => {
 app.post('/api/server/:serverId/messages', requireAuth, (req, res) => {
   try {
     const { serverId } = req.params;
-    const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
-
     if (!isServerMember(serverId, req.session.userId)) {
       return res.status(403).json({ error: 'Must be a server member to send messages' });
     }
 
-    if (!text) {
-      return res.status(400).json({ error: 'Message text required' });
+    const textCheck = validation.cleanText(req.body?.text, { field: 'Message text', max: 2000, multiline: true });
+    if (!textCheck.ok) {
+      return res.status(400).json({ error: textCheck.error });
     }
+    const text = textCheck.value;
 
     const settings = db.getSettings(req.session.userId);
-    const senderThemeColor = settings ? { r: settings.theme_color_r || 255, g: settings.theme_color_g || 89, b: settings.theme_color_b || 0 } : null;
+    const senderThemeColor = settings ? themeColorOf(settings) : null;
     const message = db.createServerMessage(serverId, req.session.userId, req.session.username, text, senderThemeColor);
     logToFile(`[SERVER CHAT] Message sent in ${serverId} by ${req.session.username}`);
 
@@ -2710,12 +3448,14 @@ app.delete('/api/server/:serverId/queue/:trackId', requireAuth, (req, res) => {
     if (!isServerMember(serverId, req.session.userId)) {
       return res.status(403).json({ error: 'Must be a server member to update the queue' });
     }
+    const queueBefore = db.getServerQueue(serverId);
     db.removeFromServerQueue(trackId, serverId);
     logToFile(`[SERVER QUEUE] Track removed from ${serverId}: ${trackId}`);
 
     if (globalWss) {
       broadcastServerQueue(serverId);
     }
+    handleCurrentTrackRemoved(serverId, trackId, queueBefore);
 
     res.json({ ok: true });
   } catch (error) {
@@ -2737,6 +3477,7 @@ app.delete('/api/server/:serverId/queue', requireAuth, (req, res) => {
     if (globalWss) {
       broadcastServerQueue(serverId);
     }
+    resetRoomPlayback(serverId);
 
     res.json({ ok: true });
   } catch (error) {
@@ -2749,30 +3490,52 @@ app.delete('/api/server/:serverId/queue', requireAuth, (req, res) => {
 app.post('/api/server/:serverId/player', requireAuth, (req, res) => {
   try {
     const { serverId } = req.params;
-    const { current_track_id, is_playing, current_time, volume, sync_updated_at_ms } = req.body;
+    const body = req.body || {};
 
     if (!isServerMember(serverId, req.session.userId)) {
       return res.status(403).json({ error: 'Must be a server member to update player state' });
     }
 
-    db.updateServerPlayerState(serverId, {
-      current_track_id,
-      is_playing,
-      current_time,
-      volume,
-      sync_updated_at_ms
+    const trackId = typeof body.current_track_id === 'string' && body.current_track_id.length <= 120
+      ? body.current_track_id
+      : null;
+    if (body.is_playing === true) markUserListening(serverId, req.session.userId);
+    const result = applySyncCommand(serverId, {
+      current_track_id: trackId,
+      is_playing: body.is_playing === true,
+      current_time: typeof body.current_time === 'number' ? body.current_time : undefined,
+      auto_advance_from: typeof body.auto_advance_from === 'string' ? body.auto_advance_from : null
     });
 
-    logToFile(`[SERVER PLAYER] State updated for ${serverId}`);
+    logToFile(`[SERVER PLAYER] ${serverId} ${body.is_playing === true ? 'play' : 'pause'} -> ${result.phase || (result.noop ? 'no change' : 'ignored')}`);
 
-    if (globalWss) {
-      broadcastServerPlayerState(serverId);
-    }
-
-    res.json({ ok: true });
+    res.json({ ok: true, ...result });
   } catch (error) {
     logToFile(`[SERVER PLAYER] Update state error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to update player state' });
+  }
+});
+
+// repeat and shuffle of the room's player. any member can change them
+app.post('/api/server/:serverId/player-modes', requireAuth, (req, res) => {
+  try {
+    const { serverId } = req.params;
+    const body = req.body || {};
+    if (!isServerMember(serverId, req.session.userId)) {
+      return res.status(403).json({ error: 'Must be a server member to change the player' });
+    }
+    const current = getPlayModes(serverId);
+    const repeat = ['off', 'all', 'one'].includes(body.repeat_mode) ? body.repeat_mode : current.repeat_mode;
+    const shuffle = typeof body.shuffle === 'boolean' ? body.shuffle : current.shuffle;
+    const next = { repeat_mode: repeat, shuffle };
+    db.setServerPlayModes(serverId, next);
+    playModesCache.set(serverId, next);
+    logToFile(`[SERVER PLAYER] ${serverId} modes repeat=${repeat} shuffle=${shuffle}`);
+    broadcastServerPlayerState(serverId);
+    res.json({ ok: true, ...next });
+  } catch (error) {
+    logToFile(`[SERVER PLAYER] Modes error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to change the player' });
   }
 });
 
@@ -2783,7 +3546,7 @@ app.get('/api/server/:serverId/player', requireAuth, (req, res) => {
     if (!isServerMember(serverId, req.session.userId)) {
       return res.status(403).json({ error: 'Must be a server member to view player state' });
     }
-    const state = db.getServerPlayerState(serverId);
+    const state = getSyncedPlayerState(serverId);
     res.json({ ok: true, state, server_now_ms: Date.now() });
   } catch (error) {
     logToFile(`[SERVER PLAYER] Get state error: ${error.message}`, true);
@@ -2799,6 +3562,10 @@ app.delete('/api/server/:serverId/player', requireAuth, (req, res) => {
       return res.status(403).json({ error: 'Must be a server member to update player state' });
     }
     db.deleteServerPlayerState(serverId);
+    const clearedSession = syncSessions.get(serverId);
+    if (clearedSession && clearedSession.timer) clearTimeout(clearedSession.timer);
+    syncSessions.delete(serverId);
+    playModesCache.delete(serverId);
     logToFile(`[SERVER PLAYER] State cleared for ${serverId}`);
 
     if (globalWss) {
@@ -2812,8 +3579,14 @@ app.delete('/api/server/:serverId/player', requireAuth, (req, res) => {
   }
 });
 
-// debug logs endpoint
+// debug logs endpoint. no login needed when you are on the same machine as the
+// server (the desktop app and plain localhost dev), anyone else has to be an
+// admin. the logs hold usernames, ips and request details
 app.get('/api/debug/logs', (req, res) => {
+  const isAdminUser = Boolean(req.session && req.session.userId && db.getUserById(req.session.userId)?.is_admin);
+  if (!validation.isLocalRequest(req) && !isAdminUser) {
+    return res.status(403).json({ error: 'Debug logs are only available on the host machine or to admins' });
+  }
   try {
     const lineLimit = Math.min(Number(req.query.lines) || 200, 2000);
     const readLastLines = (filePath, maxLines) => {
@@ -2838,7 +3611,7 @@ app.get('/api/debug/logs', (req, res) => {
 // serve react app catch-all (must be after all api routes)
 if (fs.existsSync(resolvedBuildPath)) {
   app.get('*', (req, res) => {
-    res.sendFile(path.join(resolvedBuildPath, 'index.html'));
+    res.sendFile(path.join(activeBuildDir(), 'index.html'));
   });
 } else {
   // simple fallback page so the server never returns enoent for '/'
@@ -2872,7 +3645,8 @@ wss.on('connection', (ws, request) => {
     userId,
     username,
     serverId: currentServerId,
-    listeningState: null
+    listeningState: null,
+    syncMode: 'no' // the client reports its real mode right after connecting
   });
 
   incrementUserSocketCount(userId);
@@ -2908,6 +3682,15 @@ wss.on('connection', (ws, request) => {
   if (currentServerId && isServerMember(currentServerId, userId)) {
     sendServerState(ws, currentServerId, request);
   }
+
+  // what the account's other devices are playing right now
+  const otherDevices = [];
+  wsClients.forEach((other, otherId) => {
+    if (otherId !== clientId && other.userId === userId && other.deviceState) {
+      otherDevices.push({ clientId: otherId, device: other.device, state: other.deviceState });
+    }
+  });
+  if (otherDevices.length) sendWs(ws, { type: 'device_states', devices: otherDevices });
   
   ws.on('message', (message) => {
     try {
@@ -2936,6 +3719,30 @@ wss.on('connection', (ws, request) => {
 
           if (previousSerialized !== nextSerialized) {
             broadcastPresence();
+          }
+          break;
+        }
+
+        case 'device_state': {
+          const nextDevice = sanitizeDevice(data.device);
+          const nextState = sanitizeDeviceState(data.state);
+          client.device = nextDevice;
+          client.deviceState = nextState;
+          broadcastWs({
+            type: 'device_state_changed',
+            from: { clientId, device: nextDevice },
+            state: nextState
+          }, (other) => other.userId === userId, clientId);
+          break;
+        }
+
+        case 'device_command': {
+          // "pause there" / "resume there" from another of the same account's devices
+          const command = ['pause', 'play'].includes(data.command) ? data.command : null;
+          if (!command || typeof data.to !== 'string' || data.to === clientId) break;
+          const target = wsClients.get(data.to);
+          if (target && target.userId === userId) {
+            sendWs(target.ws, { type: 'device_command', command, from: { clientId, device: client.device || null } });
           }
           break;
         }
@@ -2974,19 +3781,56 @@ wss.on('connection', (ws, request) => {
           sendWs(ws, { type: 'left_server', serverId: previousServerId });
           if (previousServerId) {
             broadcastServerMembers(previousServerId);
+            // they might have been the only one the others were waiting on
+            maybeStartSyncSession(previousServerId);
           }
           broadcastPresence();
+          break;
+        }
+
+        case 'sync_presence': {
+          if (data.mode === 'yes' || data.mode === 'auto' || data.mode === 'no') {
+            client.syncMode = data.mode;
+            // going to "no" may be exactly what the others were waiting on
+            if (client.serverId) maybeStartSyncSession(client.serverId);
+          }
+          break;
+        }
+
+        case 'sync_status': {
+          // why this player is not ready yet, shown to the room as the reason
+          // the start is waiting. text only, cut to size
+          const statusServerId = client.serverId;
+          if (statusServerId && typeof data.revision === 'string' && typeof data.reason === 'string') {
+            client.syncStatus = {
+              revision: data.revision,
+              reason: data.reason.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 80) || 'getting ready',
+              at: Date.now()
+            };
+            scheduleWaitingBroadcast(statusServerId);
+          }
+          break;
+        }
+
+        case 'sync_ready': {
+          // this player has loaded the track at the requested spot and is
+          // buffered enough to start
+          const readyServerId = client.serverId;
+          if (readyServerId && typeof data.revision === 'string') {
+            handleSyncReady(readyServerId, clientId, data.revision);
+          }
           break;
         }
 
         case 'chat':
         case 'chat_message': {
           const targetServerId = data.serverId || client.serverId;
-          const text = typeof data.text === 'string' ? data.text.trim() : '';
+          const wsTextCheck = validation.cleanText(data.text, { field: 'Message text', max: 2000, multiline: true });
 
-          if (!targetServerId || !text) {
+          if (!targetServerId || !wsTextCheck.ok) {
             break;
           }
+          const text = wsTextCheck.value;
 
           if (!isServerMember(targetServerId, userId)) {
             sendWs(ws, { type: 'error', error: 'Must be a server member to chat' });
@@ -2994,7 +3838,7 @@ wss.on('connection', (ws, request) => {
           }
 
           const sSettings = db.getSettings(userId);
-          const sSenderThemeColor = sSettings ? { r: sSettings.theme_color_r || 255, g: sSettings.theme_color_g || 89, b: sSettings.theme_color_b || 0 } : null;
+          const sSenderThemeColor = sSettings ? themeColorOf(sSettings) : null;
           const serverMessage = db.createServerMessage(targetServerId, userId, username, text, sSenderThemeColor);
           broadcastToServer(targetServerId, {
             type: 'chat_message',
@@ -3069,6 +3913,20 @@ wss.on('connection', (ws, request) => {
     const client = wsClients.get(clientId);
     wsClients.delete(clientId);
     console.log(`[WS] Total clients: ${wsClients.size}`);
+
+    // a dropped connection must not leave the room waiting for it
+    if (client?.serverId) {
+      maybeStartSyncSession(client.serverId);
+    }
+
+    // this device is gone, so the others stop showing it as playing
+    if (client?.deviceState) {
+      broadcastWs({
+        type: 'device_state_changed',
+        from: { clientId, device: client.device },
+        state: null
+      }, (other) => other.userId === client.userId);
+    }
 
     if (client?.userId) {
       const remainingConnections = decrementUserSocketCount(client.userId);

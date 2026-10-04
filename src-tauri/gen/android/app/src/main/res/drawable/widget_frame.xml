@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the outline of the home screen player. the app's default orange here, tinted with the theme color once it has been drawn. the card inside is inset by the padding, which is the thickness
+     of the outline -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#FFFF5900" />
+    <corners android:radius="26dp" />
+</shape>

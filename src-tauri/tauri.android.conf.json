@@ -1,0 +1,15 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Shibenchi's music player",
+        "url": "index.html"
+      }
+    ]
+  },
+  "bundle": {
+    "resources": null
+  }
+}

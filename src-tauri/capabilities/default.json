@@ -11,11 +11,16 @@
     "allow-toggle-miniplayer",
     "allow-frontend-log",
     "allow-apply-shortcut-prefs",
+    "allow-set-shortcut-icon",
+    "allow-set-miniplayer-enabled",
     "core:window:allow-start-dragging",
+    "core:window:allow-set-icon",
     "dialog:allow-save",
     "dialog:allow-open",
+    "opener:default",
     "fs:allow-write-file",
     "fs:allow-exists",
+    "fs:allow-read-text-file",
     {
       "identifier": "fs:allow-mkdir",
       "allow": [{ "path": "$DOWNLOAD/**" }]

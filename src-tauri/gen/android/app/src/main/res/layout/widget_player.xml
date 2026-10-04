@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- the home screen player, 4x4. the same card as the player in the app, a bit
+     smaller: the vinyl record, title and artist, the progress line with its
+     times, then shuffle, previous, play or pause, next and repeat, and a volume
+     row. everything is centered, the outline takes the theme color -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/widget_frame"
+    android:padding="3dp">
+
+    <LinearLayout
+        android:id="@+id/widget_inner"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@drawable/widget_inner"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:paddingStart="18dp"
+        android:paddingTop="14dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="10dp">
+
+        <ImageView
+            android:id="@+id/widget_art"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:contentDescription="@null"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_stat_music" />
+
+        <TextView
+            android:id="@+id/widget_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:text="nothing playing"
+            android:textColor="#FEF3E2"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/widget_artist"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="1dp"
+            android:ellipsize="end"
+            android:gravity="center"
+            android:maxLines="1"
+            android:text="open the app and pick a track"
+            android:textColor="#B3FEF3E2"
+            android:textSize="12sp" />
+
+        <!-- the progress line, with twenty invisible tap zones laid over it: a tap
+             on the line jumps to that point in the song. a widget cannot be dragged,
+             so this is as close to a scrubber as it gets -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="28dp"
+            android:layout_marginTop="6dp">
+
+            <ProgressBar
+                android:id="@+id/widget_progress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="4dp"
+                android:layout_gravity="center_vertical"
+                android:max="1000"
+                android:progress="0"
+                android:progressDrawable="@drawable/widget_progress" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="horizontal">
+                <ImageButton
+                    android:id="@+id/widget_seek_0"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_1"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_2"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_3"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_4"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_5"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_6"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_7"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_8"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_9"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_10"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_11"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_12"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_13"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_14"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_15"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_16"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_17"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_18"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+                <ImageButton
+                    android:id="@+id/widget_seek_19"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:background="@null"
+                    android:contentDescription="seek" />
+            </LinearLayout>
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="-4dp"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/widget_time_now"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="start"
+                android:text="0:00"
+                android:textColor="#B3FEF3E2"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/widget_time_total"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:gravity="end"
+                android:text="--:--"
+                android:textColor="#B3FEF3E2"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageButton
+                android:id="@+id/widget_shuffle"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="@null"
+                android:contentDescription="shuffle"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_shuffle" />
+
+            <ImageButton
+                android:id="@+id/widget_prev"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:background="@null"
+                android:contentDescription="previous"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_prev" />
+
+            <ImageButton
+                android:id="@+id/widget_toggle"
+                android:layout_width="58dp"
+                android:layout_height="52dp"
+                android:background="@null"
+                android:contentDescription="play or pause"
+                android:padding="8dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_play" />
+
+            <ImageButton
+                android:id="@+id/widget_next"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:background="@null"
+                android:contentDescription="next"
+                android:padding="10dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_next" />
+
+            <ImageButton
+                android:id="@+id/widget_repeat"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:background="@null"
+                android:contentDescription="repeat"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_repeat" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <ImageButton
+                android:id="@+id/widget_mute"
+                android:layout_width="36dp"
+                android:layout_height="34dp"
+                android:background="@null"
+                android:contentDescription="mute"
+                android:padding="8dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_volume_up" />
+
+            <ImageButton
+                android:id="@+id/widget_vol_down"
+                android:layout_width="36dp"
+                android:layout_height="34dp"
+                android:background="@null"
+                android:contentDescription="volume down"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_minus" />
+
+            <TextView
+                android:id="@+id/widget_volume"
+                android:layout_width="46dp"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:text="100%"
+                android:textColor="#FEF3E2"
+                android:textSize="12sp" />
+
+            <ImageButton
+                android:id="@+id/widget_vol_up"
+                android:layout_width="36dp"
+                android:layout_height="34dp"
+                android:background="@null"
+                android:contentDescription="volume up"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/ic_plus" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

@@ -329,7 +329,7 @@
         left: 50%;
         transform: translate(-50%, -50%);
         /* percentage, not a fixed px, so this scales with whatever size
-           .vinyl-record actually is instead of assuming ~120-180px — a fixed
+           .vinyl-record actually is instead of assuming ~120-180px, a fixed
            40px label circle is fine on the main player's disc but was
            exactly as big as the miniplayer's entire 40px disc, completely
            covering the thumbnail under it. dumb bug, easy fix */
@@ -629,7 +629,6 @@
         padding: 24px;
         max-width: 400px;
         width: 90%;
-        animation: slideIn 0.3s ease-out;
         box-shadow: var(--theme-neon-glow);
       }
 
@@ -646,7 +645,6 @@
         align-items: center;
         gap: 12px;
         box-shadow: var(--theme-neon-glow);
-        animation: slideIn 0.3s ease-out;
         z-index: 1001;
       }
 

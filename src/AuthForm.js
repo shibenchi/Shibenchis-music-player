@@ -1,6 +1,22 @@
 import React, { useState } from 'react';
 import { socialFetch } from './socialApi';
 
+// same rules the server enforces, checked here too so the error shows up
+// before a round trip. the server still has the final say
+const USERNAME_PATTERN = /^[A-Za-z0-9_]+$/;
+
+function checkRegisterFields(username, password) {
+  if (username !== username.trim()) return 'username cannot start or end with a space';
+  if (username.length < 3 || username.length > 20) return 'username must be 3-20 characters';
+  if (!USERNAME_PATTERN.test(username)) return 'username can only use letters, numbers and underscores';
+  if (!/[A-Za-z0-9]/.test(username)) return 'username needs at least one letter or number';
+  if (password.length < 8) return 'password must be at least 8 characters';
+  if (new TextEncoder().encode(password).length > 72) return 'password is too long (72 bytes max)';
+  if (!password.trim()) return 'password cannot be only spaces';
+  if (password.toLowerCase() === username.toLowerCase()) return 'password cannot be the same as your username';
+  return '';
+}
+
 // auth form component for login/register
 export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) {
   const [isLogin, setIsLogin] = useState(true);
@@ -22,7 +38,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
       if (isLogin) {
         const res = await socialFetch('/api/auth/login', {
           method: 'POST',
-          body: JSON.stringify({ username, password })
+          body: JSON.stringify({ username: username.trim(), password })
         });
 
         const contentType = res.headers.get('content-type');
@@ -49,6 +65,11 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
       } else {
         if (password !== confirmPassword) {
           throw new Error('passwords do not match');
+        }
+
+        const problem = checkRegisterFields(username, password);
+        if (problem) {
+          throw new Error(problem);
         }
 
         const res = await socialFetch('/api/auth/register', {
@@ -79,7 +100,13 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
         onAuthSuccess(data.user);
       }
     } catch (err) {
-      setError(err.message);
+      // a browser reports every network failure as a bare "Failed to fetch"
+      // (or "Load failed" / "NetworkError"). that means the social server could
+      // not be reached at all, which is not something a wrong password causes
+      const unreachable = err instanceof TypeError || /failed to fetch|load failed|networkerror/i.test(err.message || '');
+      setError(unreachable
+        ? "can't reach the account server right now. check your connection and try again in a minute"
+        : err.message);
     } finally {
       setLoading(false);
     }
@@ -116,7 +143,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
               marginLeft: '8px',
               padding: '2px 8px',
               background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-              color: '#000',
+              color: '#fff',
               borderRadius: '4px',
               fontSize: '11px',
               fontWeight: 'bold'
@@ -136,8 +163,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
             borderRadius: '6px',
             color: '#ff4444',
             fontSize: '13px',
-            cursor: 'pointer',
-            transition: 'all 0.2s ease'
+            cursor: 'pointer'
           }}
         >
           logout
@@ -154,8 +180,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
     borderRadius: '6px',
     color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
     fontSize: '13px',
-    outline: 'none',
-    transition: 'all 0.2s ease'
+    outline: 'none'
   };
 
   const labelStyle = {
@@ -171,11 +196,10 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
     background: loading ? 'rgba(128, 128, 128, 0.3)' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
     border: 'none',
     borderRadius: '6px',
-    color: '#000',
+    color: '#fff',
     fontSize: '13px',
     fontWeight: 'bold',
-    cursor: loading ? 'not-allowed' : 'pointer',
-    transition: 'all 0.2s ease'
+    cursor: loading ? 'not-allowed' : 'pointer'
   };
 
   const linkStyle = {
@@ -202,11 +226,14 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            placeholder="enter username"
+            placeholder={isLogin ? 'enter username' : 'letters, numbers, underscore'}
+            maxLength={isLogin ? 256 : 20}
             style={inputStyle}
             disabled={loading}
             autoFocus
             autoComplete="username"
+            autoCapitalize="none"
+            spellCheck={false}
           />
         </div>
 
@@ -216,10 +243,11 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="enter password"
+            placeholder={isLogin ? 'enter password' : 'at least 8 characters'}
+            maxLength={isLogin ? 256 : 72}
             style={inputStyle}
             disabled={loading}
-            autoComplete="current-password"
+            autoComplete={isLogin ? 'current-password' : 'new-password'}
           />
         </div>
 

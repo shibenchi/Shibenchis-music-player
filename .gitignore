@@ -42,3 +42,5 @@ public/SMP notif 2.wav
 installer.bat
 start.bat
 stop.bat
+build-web/
+update-files/

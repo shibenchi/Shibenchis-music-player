@@ -4,7 +4,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 
 // tauri sets APP_DATA_DIR to a proper per-user writable spot
-// (AppData\Roaming\<id>) once its installed — program files, where the app
+// (AppData\Roaming\<id>) once its installed - program files, where the app
 // actually lives, isnt writable by a normal user account, learned that one
 // the hard way. falls back to the old project-relative path for plain
 // `node server` dev runs where this var never gets set anyway
@@ -19,6 +19,19 @@ if (!fs.existsSync(dataDir)) {
 }
 
 const db = new Database(dbPath);
+
+// usernames that get admin when the account is created. comma separated list
+// in ADMIN_USERNAMES, defaults to the project owner, matched ignoring case.
+// register the admin account first after a fresh deploy, since whoever
+// claims one of these names gets admin
+const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || 'shibenchi')
+  .split(',')
+  .map((name) => name.trim().toLowerCase())
+  .filter(Boolean);
+
+// bcrypt compare against this when the username doesnt exist, so a wrong
+// username takes as long as a wrong password and cant be told apart by timing
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
 
 // turn on foreign keys
 db.pragma('foreign_keys = ON');
@@ -45,6 +58,14 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
+  -- login tokens, kept as a hash so a restart (a deploy) does not log everybody out
+  CREATE TABLE IF NOT EXISTS auth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   -- whos online right now
   CREATE TABLE IF NOT EXISTS online_status (
     user_id TEXT PRIMARY KEY,
@@ -61,6 +82,7 @@ db.exec(`
     theme_color_g INTEGER DEFAULT 89,
     theme_color_b INTEGER DEFAULT 0,
     debug_mode INTEGER DEFAULT 0,
+    hide_listening INTEGER DEFAULT 0,
     updated_at INTEGER DEFAULT (strftime('%s', 'now')),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
@@ -232,6 +254,14 @@ db.exec(`
     FOREIGN KEY (server_id) REFERENCES active_servers(id) ON DELETE CASCADE
   );
 
+  -- repeat and shuffle of a room's player, shared by everyone in it
+  CREATE TABLE IF NOT EXISTS server_play_modes (
+    server_id TEXT PRIMARY KEY,
+    repeat_mode TEXT NOT NULL DEFAULT 'off',
+    shuffle INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (server_id) REFERENCES active_servers(id) ON DELETE CASCADE
+  );
+
   -- server chat log
   CREATE TABLE IF NOT EXISTS server_messages (
     id TEXT PRIMARY KEY,
@@ -293,6 +323,13 @@ try {
   // already exists, whatever, moving on
 }
 
+// migration: hide what the account is listening to from other people
+try {
+  db.prepare('ALTER TABLE user_settings ADD COLUMN hide_listening INTEGER DEFAULT 0').run();
+} catch (err) {
+  // already exists, whatever, moving on
+}
+
 // migration: add sender_theme_color col to dms
 try {
   db.prepare('ALTER TABLE direct_messages ADD COLUMN sender_theme_color TEXT DEFAULT NULL').run();
@@ -328,11 +365,28 @@ try {
   // already exists, whatever, moving on
 }
 
-// make shibenchi (me lol) admin if that account already exists
 try {
-  db.prepare('UPDATE users SET is_admin = 1 WHERE username = ?').run('shibenchi');
+  db.prepare('ALTER TABLE collab_playlist_tracks ADD COLUMN position INTEGER').run();
+} catch (err) {
+  // already there
+}
+
+// make the configured admin accounts admin if they already exist
+try {
+  ADMIN_USERNAMES.forEach((name) => {
+    db.prepare('UPDATE users SET is_admin = 1 WHERE lower(username) = ?').run(name);
+  });
 } catch (err) {
   // account doesnt exist yet, itll get set on first creation instead
+}
+
+// usernames are unique ignoring case, so "Bob" and "bob" cant both exist and
+// pass for each other. an older db with a clash already in it skips this and
+// the check in the register route still blocks new clashes
+try {
+  db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_nocase ON users(username COLLATE NOCASE)').run();
+} catch (err) {
+  console.warn('[DB] could not add the case-insensitive username index (existing names clash):', err.message);
 }
 
 // migration: make sure online_status table exists (older dbs might predate it)
@@ -366,7 +420,10 @@ const columnMigrations = [
   ['server_queue', 'thumbnail', 'TEXT'],
   ['server_queue', 'external_url', 'TEXT'],
   ['server_queue', 'duration_ms', 'INTEGER DEFAULT 0'],
-  ['server_messages', 'sender_theme_color', 'TEXT DEFAULT NULL']
+  ['server_messages', 'sender_theme_color', 'TEXT DEFAULT NULL'],
+  // private channels: listed in the directory, joined only with the code
+  ['active_servers', 'is_private', 'INTEGER DEFAULT 0'],
+  ['active_servers', 'join_code', 'TEXT DEFAULT NULL']
 ];
 
 columnMigrations.forEach(([table, column, definition]) => {
@@ -377,7 +434,7 @@ columnMigrations.forEach(([table, column, definition]) => {
   }
 });
 
-// fixing busted foreign keys on server_queue / server_player_state — the
+// fixing busted foreign keys on server_queue / server_player_state - the
 // original schema had them pointing at users(id) instead of
 // active_servers(id), my bad. CREATE TABLE IF NOT EXISTS wont touch a table
 // that already exists so gotta rebuild these ones by hand here
@@ -411,7 +468,7 @@ try {
     db.pragma('foreign_keys = ON');
   }
 } catch (err) {
-  // table doesnt exist yet, or this migration already ran — either way we're fine
+  // table doesnt exist yet, or this migration already ran - either way we're fine
 }
 
 try {
@@ -438,7 +495,7 @@ try {
     db.pragma('foreign_keys = ON');
   }
 } catch (err) {
-  // table doesnt exist yet, or this migration already ran — either way we're fine
+  // table doesnt exist yet, or this migration already ran - either way we're fine
 }
 
 const statements = {
@@ -448,6 +505,9 @@ const statements = {
   `),
   getUserByUsername: db.prepare(`
     SELECT * FROM users WHERE username = ?
+  `),
+  getUserByUsernameNoCase: db.prepare(`
+    SELECT * FROM users WHERE username = ? COLLATE NOCASE
   `),
   getUserById: db.prepare(`
     SELECT * FROM users WHERE id = ?
@@ -481,13 +541,14 @@ const statements = {
     SELECT * FROM user_settings WHERE user_id = ?
   `),
   upsertSettings: db.prepare(`
-    INSERT INTO user_settings (user_id, theme_color_r, theme_color_g, theme_color_b, debug_mode, updated_at)
-    VALUES (?, ?, ?, ?, ?, strftime('%s', 'now'))
+    INSERT INTO user_settings (user_id, theme_color_r, theme_color_g, theme_color_b, debug_mode, hide_listening, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, strftime('%s', 'now'))
     ON CONFLICT(user_id) DO UPDATE SET
       theme_color_r = excluded.theme_color_r,
       theme_color_g = excluded.theme_color_g,
       theme_color_b = excluded.theme_color_b,
       debug_mode = excluded.debug_mode,
+      hide_listening = excluded.hide_listening,
       updated_at = strftime('%s', 'now')
   `),
 
@@ -535,6 +596,9 @@ const statements = {
   `),
   createPlaylistWithId: db.prepare(`
     INSERT INTO playlists (id, user_id, name) VALUES (?, ?, ?)
+  `),
+  playlistIdExists: db.prepare(`
+    SELECT 1 FROM playlists WHERE id = ?
   `),
   getUserPlaylists: db.prepare(`
     SELECT * FROM playlists WHERE user_id = ? ORDER BY created_at
@@ -612,7 +676,10 @@ const statements = {
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getCollabPlaylistTracks: db.prepare(`
-    SELECT * FROM collab_playlist_tracks WHERE playlist_id = ? ORDER BY added_at
+    SELECT * FROM collab_playlist_tracks WHERE playlist_id = ? ORDER BY COALESCE(position, 1000000000 + added_at), rowid
+  `),
+  setCollabTrackPosition: db.prepare(`
+    UPDATE collab_playlist_tracks SET position = ? WHERE id = ? AND playlist_id = ?
   `),
   removeTrackFromCollabPlaylist: db.prepare(`
     DELETE FROM collab_playlist_tracks WHERE id = ? AND playlist_id = ?
@@ -740,6 +807,13 @@ const statements = {
   deleteServerPlayerState: db.prepare(`
     DELETE FROM server_player_state WHERE server_id = ?
   `),
+  getServerPlayModes: db.prepare(`
+    SELECT repeat_mode, shuffle FROM server_play_modes WHERE server_id = ?
+  `),
+  upsertServerPlayModes: db.prepare(`
+    INSERT INTO server_play_modes (server_id, repeat_mode, shuffle) VALUES (?, ?, ?)
+    ON CONFLICT(server_id) DO UPDATE SET repeat_mode = excluded.repeat_mode, shuffle = excluded.shuffle
+  `),
 
   // server chat history
   createServerMessage: db.prepare(`
@@ -750,10 +824,30 @@ const statements = {
     SELECT * FROM server_messages WHERE server_id = ? ORDER BY created_at DESC LIMIT ?
   `),
 
+  // login tokens
+  saveAuthToken: db.prepare(`
+    INSERT OR REPLACE INTO auth_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)
+  `),
+  getAuthToken: db.prepare(`
+    SELECT user_id, expires_at FROM auth_tokens WHERE token_hash = ?
+  `),
+  deleteAuthToken: db.prepare(`
+    DELETE FROM auth_tokens WHERE token_hash = ?
+  `),
+  deleteAuthTokensForUser: db.prepare(`
+    DELETE FROM auth_tokens WHERE user_id = ?
+  `),
+  deleteExpiredAuthTokens: db.prepare(`
+    DELETE FROM auth_tokens WHERE expires_at <= ?
+  `),
+
   // active servers
   createActiveServer: db.prepare(`
-    INSERT INTO active_servers (id, name, host_id, host_username, ws_port)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO active_servers (id, name, host_id, host_username, ws_port, is_private, join_code)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  getActiveServerByJoinCode: db.prepare(`
+    SELECT * FROM active_servers WHERE is_private = 1 AND join_code = ?
   `),
   getAllActiveServers: db.prepare(`
     SELECT * FROM active_servers ORDER BY created_at DESC
@@ -928,7 +1022,7 @@ function normalizeStoredTrack(track = {}) {
 
 const acceptFriendRequestTxn = db.transaction((requestId, receiverId = null) => {
   // prepping statements right here inside the transaction instead of
-  // reusing the shared ones — more reliable this way
+  // reusing the shared ones - more reliable this way
   const getFriendReq = db.prepare('SELECT * FROM friend_requests WHERE id = ?');
   const checkFriend = db.prepare('SELECT * FROM friends WHERE user_id = ? AND friend_id = ?');
   const addFriendStmt = db.prepare('INSERT OR IGNORE INTO friends (id, user_id, friend_id) VALUES (?, ?, ?)');
@@ -975,6 +1069,7 @@ const declineFriendRequestTxn = db.transaction((requestId, receiverId = null) =>
 module.exports = {
   db,
   statements,
+  ADMIN_USERNAMES,
   createPlaylistTrackId,
   createDownloadedTrackId,
   createSessionId,
@@ -991,7 +1086,7 @@ module.exports = {
   createUser: (username, password) => {
     const id = `user_${crypto.randomUUID()}`;
     const passwordHash = bcrypt.hashSync(password, 10);
-    const isAdmin = username === 'shibenchi' ? 1 : 0;
+    const isAdmin = ADMIN_USERNAMES.includes(String(username).toLowerCase()) ? 1 : 0;
 
     // stick the user in with their admin flag
     db.prepare('INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)').run(
@@ -999,14 +1094,26 @@ module.exports = {
     );
 
     // give em default settings so they've got something to start with
-    statements.upsertSettings.run(id, 255, 89, 0, 0);
+    statements.upsertSettings.run(id, 255, 89, 0, 0, 0);
 
     return { id, username, is_admin: isAdmin === 1 };
   },
 
+  // exact match first so an old db with two names that differ only by case
+  // still logs each one in correctly, then fall back to ignoring case
+  findUserByUsername: (username) => {
+    return statements.getUserByUsername.get(username)
+      || statements.getUserByUsernameNoCase.get(username)
+      || null;
+  },
+
   authenticateUser: (username, password) => {
-    const user = statements.getUserByUsername.get(username);
-    if (!user) return null;
+    const user = statements.getUserByUsername.get(username)
+      || statements.getUserByUsernameNoCase.get(username);
+    if (!user) {
+      bcrypt.compareSync(password, DUMMY_PASSWORD_HASH);
+      return null;
+    }
 
     const valid = bcrypt.compareSync(password, user.password_hash);
     if (!valid) return null;
@@ -1026,7 +1133,7 @@ module.exports = {
 
   // sessions
   createUserSession: (userId, sessionId = null) => {
-    // kill any existing session for this user first — only one at a time allowed
+    // kill any existing session for this user first - only one at a time allowed
     statements.deleteUserSessionsByUserId.run(userId);
 
     const id = `session_${crypto.randomUUID()}`;
@@ -1061,17 +1168,23 @@ module.exports = {
       theme_color_r: 255,
       theme_color_g: 89,
       theme_color_b: 0,
-      debug_mode: 0
+      debug_mode: 0,
+      hide_listening: 0
     };
   },
 
   saveSettings: (userId, settings) => {
+    // an older app saves its settings without this field, that must not switch it back
+    const hideListening = settings.hide_listening === undefined
+      ? ((statements.getSettings.get(userId) || {}).hide_listening || 0)
+      : (settings.hide_listening ? 1 : 0);
     statements.upsertSettings.run(
       userId,
       settings.theme_color_r,
       settings.theme_color_g,
       settings.theme_color_b,
-      settings.debug_mode ? 1 : 0
+      settings.debug_mode ? 1 : 0,
+      hideListening
     );
   },
 
@@ -1165,7 +1278,13 @@ module.exports = {
       statements.deleteUserPlaylists.run(userId);
 
       incomingPlaylists.forEach((playlist) => {
-        const playlistId = String(playlist.id || `playlist_${crypto.randomUUID()}`).trim();
+        let playlistId = String(playlist.id || `playlist_${crypto.randomUUID()}`).trim();
+        // this user's own playlists were just cleared, so an id that still
+        // exists belongs to someone else (or repeats in this batch). take a
+        // fresh id instead of failing the whole sync on the primary key
+        if (statements.playlistIdExists.get(playlistId)) {
+          playlistId = `playlist_${crypto.randomUUID()}`;
+        }
         const playlistName = String(playlist.name || 'untitled playlist').trim();
         statements.createPlaylistWithId.run(playlistId, userId, playlistName);
 
@@ -1359,6 +1478,16 @@ module.exports = {
     statements.deleteServerPlayerState.run(serverId);
   },
 
+  // repeat ('off' | 'all' | 'one') and shuffle of a room's player
+  getServerPlayModes: (serverId) => {
+    const row = statements.getServerPlayModes.get(serverId);
+    return row ? { repeat_mode: row.repeat_mode, shuffle: row.shuffle === 1 } : { repeat_mode: 'off', shuffle: false };
+  },
+
+  setServerPlayModes: (serverId, modes) => {
+    statements.upsertServerPlayModes.run(serverId, modes.repeat_mode, modes.shuffle ? 1 : 0);
+  },
+
   // server chat history
   createServerMessage: (serverId, userId, username, message, senderThemeColor = null) => {
     const id = createServerMessageId();
@@ -1382,13 +1511,41 @@ module.exports = {
   },
 
   // active servers
-  createActiveServer: (name, hostId, hostUsername, wsPort) => {
+  createActiveServer: (name, hostId, hostUsername, wsPort, isPrivate = false) => {
     const id = createServerId();
-    statements.createActiveServer.run(id, name, hostId, hostUsername, wsPort);
+    // a private channel gets a code: 8 characters without the ones that look
+    // alike (0/O, 1/I/L), so it can be read out or typed from a message
+    let joinCode = null;
+    if (isPrivate) {
+      const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+      for (let attempt = 0; attempt < 25 && !joinCode; attempt += 1) {
+        let candidate = '';
+        for (let i = 0; i < 8; i += 1) candidate += alphabet[crypto.randomInt(alphabet.length)];
+        if (!statements.getActiveServerByJoinCode.get(candidate)) joinCode = candidate;
+      }
+      if (!joinCode) throw new Error('could not make a join code');
+    }
+    statements.createActiveServer.run(id, name, hostId, hostUsername, wsPort, isPrivate ? 1 : 0, joinCode);
     // host gets added as admin automatically, makes sense they'd own their own server
     const memberId = createServerMemberId();
     statements.addServerMember.run(memberId, id, hostId, hostUsername, 1);
-    return { id, name, host_id: hostId, host_username: hostUsername, ws_port: wsPort };
+    return { id, name, host_id: hostId, host_username: hostUsername, ws_port: wsPort, is_private: isPrivate ? 1 : 0, join_code: joinCode };
+  },
+
+  // login tokens: only the hash of a token is stored
+  authTokenStorage: {
+    save: (tokenHash, userId, expiresAt) => { statements.saveAuthToken.run(tokenHash, userId, expiresAt); },
+    get: (tokenHash) => statements.getAuthToken.get(tokenHash) || null,
+    remove: (tokenHash) => { statements.deleteAuthToken.run(tokenHash); },
+    removeUser: (userId) => { statements.deleteAuthTokensForUser.run(userId); },
+    removeExpired: (now) => { statements.deleteExpiredAuthTokens.run(now); }
+  },
+
+  // the channel a code belongs to. spaces, dashes and case do not matter
+  getActiveServerByJoinCode: (rawCode) => {
+    const code = String(rawCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (code.length < 6) return null;
+    return statements.getActiveServerByJoinCode.get(code) || null;
   },
 
   getAllActiveServers: () => {
@@ -1554,5 +1711,13 @@ module.exports = {
 
   clearCollabPlaylist: (playlistId) => {
     statements.clearCollabPlaylist.run(playlistId);
+  },
+
+  // the tracks of a playlist in the order given (ids not listed keep their place after them)
+  reorderCollabPlaylist: (playlistId, trackIds) => {
+    const apply = db.transaction((ids) => {
+      ids.forEach((trackId, index) => statements.setCollabTrackPosition.run(index, trackId, playlistId));
+    });
+    apply(trackIds);
   }
 };
