@@ -1115,6 +1115,12 @@ function syncReasonFor(el, hasSource, targetTime, stage) {
   return 'getting ready';
 }
 
+// the phone says "offline" for a second or two when it hops between wifi and mobile data or
+// passes a gap in coverage. only a loss that lasts counts, so the status text and the offline
+// screens do not flip (and throw you out of the collab tab) for those moments
+const OFFLINE_CONFIRM_MS = 6000;
+let networkConfirmedDown = typeof navigator !== 'undefined' && navigator.onLine === false;
+
 // the version of the screens that are running, put in by the build. a dev run has
 // none and asks the server it was loaded from instead
 const BUILT_VERSION = process.env.REACT_APP_VERSION || '';
@@ -1725,7 +1731,7 @@ export default function App({
   // few seconds: waiting to start, the helper answering or the first part arriving
   // all take that long normally and need no explaining
   const describeBuffering = ({ stage, seconds, shared = false, preparing = false, connected = true, waiting = null }) => {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    if (networkConfirmedDown) {
       return shared ? 'no connection, the room is out of reach' : 'no connection, this song is not saved for offline';
     }
     if (shared && !connected) return 'lost the connection to the room, reconnecting...';
@@ -1837,6 +1843,8 @@ export default function App({
   // opens the download page, 'reload' (the web version) just loads the page again
   const [updateKind, setUpdateKind] = useState('reload');
   const [updateBusy, setUpdateBusy] = useState(false);
+  // the signed list of the newest screens the phone was handed (see UiUpdater.kt)
+  const updateEnvelopeRef = useRef('');
   // the banner stays away once closed, until an even newer version comes out
   const [dismissedVersion, setDismissedVersion] = useState('');
 
@@ -1852,11 +1860,23 @@ export default function App({
   useEffect(() => { offlineIdsRef.current = offlineIds; }, [offlineIds]);
   const [isOnline, setIsOnline] = useState(() => (typeof navigator === 'undefined' ? true : navigator.onLine !== false));
   useEffect(() => {
-    const goOnline = () => setIsOnline(true);
-    const goOffline = () => setIsOnline(false);
+    let offlineTimer = null;
+    const goOnline = () => {
+      clearTimeout(offlineTimer);
+      networkConfirmedDown = false;
+      setIsOnline(true);
+    };
+    const goOffline = () => {
+      clearTimeout(offlineTimer);
+      offlineTimer = setTimeout(() => {
+        networkConfirmedDown = true;
+        setIsOnline(false);
+      }, OFFLINE_CONFIRM_MS);
+    };
     window.addEventListener('online', goOnline);
     window.addEventListener('offline', goOffline);
     return () => {
+      clearTimeout(offlineTimer);
       window.removeEventListener('online', goOnline);
       window.removeEventListener('offline', goOffline);
     };
@@ -2002,6 +2022,8 @@ export default function App({
   const lastViewedChannels = useRef({}); // { channelId: timestamp }
 
   const wsRef = useRef(null);
+  // when the socket last went down (0 while it is up), to tell a blink from a real absence
+  const wsDownSinceRef = useRef(0);
   const conversationListRef = useRef([]);
   const dmScrollRef = useRef(null);
   const channelScrollRef = useRef(null);
@@ -2579,7 +2601,16 @@ export default function App({
     try {
       const data = await fetchJson('/api/messages/conversations');
       const next = Array.isArray(data?.conversations) ? data.conversations : [];
-      setConversationList((prev) => normalizeConversationList(next, prev));
+      setConversationList((prev) => {
+        const merged = normalizeConversationList(next, prev);
+        // a chat that was just opened has no messages yet, so the server does not list it.
+        // dropping it here made the first message to anyone new impossible to send
+        const openId = selectedConversationRef.current;
+        const placeholder = openId && !merged.some((entry) => entry.user_id === openId)
+          ? (Array.isArray(prev) ? prev : []).find((entry) => entry.user_id === openId)
+          : null;
+        return placeholder ? [placeholder, ...merged] : merged;
+      });
     } catch (error) {
       // silent fail - polling hits localhost without auth cookies during dev
       // conversation list is maintained by upsertConversationPreview instead
@@ -2860,7 +2891,10 @@ export default function App({
     }
 
     const targetEntry = conversationListRef.current.find((entry) => entry.user_id === selectedConversationId);
-    const targetUsername = targetEntry?.username || '';
+    // the person list knows the name too, a brand new chat is not in the conversation list yet
+    const targetUsername = targetEntry?.username
+      || allUsers.find((entry) => entry.id === selectedConversationId)?.username
+      || '';
 
     if (!targetUsername) {
       showNotification('could not find user', 'warning');
@@ -2918,7 +2952,7 @@ export default function App({
       }
       showNotification(error.message || 'failed to send message', 'warning');
     }
-  }, [addDebugLog, currentUserId, currentUsername, dmText, pushDirectMessage, selectedConversationId, showNotification, upsertConversationPreview]);
+  }, [addDebugLog, allUsers, currentUserId, currentUsername, dmText, pushDirectMessage, selectedConversationId, showNotification, upsertConversationPreview]);
 
   const joinChannel = useCallback(async (channel, code = '', options = {}) => {
     const targetChannel = typeof channel === 'string'
@@ -4021,6 +4055,30 @@ export default function App({
       }
     };
 
+    // the user list is fetched again when someone comes or goes. a burst of changes (every device
+    // that reconnects counts) used to be one request each, thousands in an evening for a handful
+    // of people, so they are gathered into one, and none are made while the page is hidden
+    let usersSoonTimer = null;
+    let usersDirty = false;
+    const refreshUsersSoon = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        usersDirty = true;
+        return;
+      }
+      if (usersSoonTimer) return;
+      usersSoonTimer = setTimeout(() => {
+        usersSoonTimer = null;
+        refreshUsers();
+      }, 1500);
+    };
+    const onUsersVisible = () => {
+      if (document.visibilityState === 'visible' && usersDirty) {
+        usersDirty = false;
+        refreshUsers();
+      }
+    };
+    document.addEventListener('visibilitychange', onUsersVisible);
+
     const connect = () => {
       if (cancelled) return;
       if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
@@ -4062,6 +4120,7 @@ export default function App({
           wsRef.current = null;
         }
         setIsConnected(false);
+        if (!wsDownSinceRef.current) wsDownSinceRef.current = Date.now();
         // what the other devices were playing is unknown until the connection is back
         setOtherDevices({});
         if (cancelled) return;
@@ -4091,8 +4150,13 @@ export default function App({
               }
               refreshUsers();
               refreshChannels();
-              // (re)connected: pick up anything that changed while away
-              accountChangeHandlerRef.current({ scope: 'all', origin: '' });
+              // (re)connected: pick up anything that changed while away. a connection that only
+              // dropped for a few seconds missed nothing worth downloading the whole queue,
+              // the playlists and the settings again for
+              if (!wsDownSinceRef.current || Date.now() - wsDownSinceRef.current > 15000) {
+                accountChangeHandlerRef.current({ scope: 'all', origin: '' });
+              }
+              wsDownSinceRef.current = 0;
               break;
 
             case 'account_data_changed':
@@ -4100,12 +4164,12 @@ export default function App({
               break;
 
             case 'presence_update':
-              refreshUsers();
+              refreshUsersSoon();
               break;
 
             case 'user_joined':
             case 'user_left':
-              refreshUsers();
+              refreshUsersSoon();
               break;
 
             case 'direct_message': {
@@ -4446,6 +4510,8 @@ export default function App({
     return () => {
       cancelled = true;
       clearReconnect();
+      clearTimeout(usersSoonTimer);
+      document.removeEventListener('visibilitychange', onUsersVisible);
       if (socket) {
         const isConnecting = socket.readyState === WebSocket.CONNECTING;
         socket.onerror = null;
@@ -4989,7 +5055,7 @@ export default function App({
     // audio ready" until it times out and then skipping through the whole queue
     if (
       isAndroidApp() && nextSource !== 'shared'
-      && typeof navigator !== 'undefined' && navigator.onLine === false
+      && networkConfirmedDown
       && !offlineIdsRef.current.has(track.videoId)
     ) {
       const savedLeft = list.some((item) => item && offlineIdsRef.current.has(normalizeTrack(item).videoId));
@@ -6401,7 +6467,8 @@ export default function App({
         for (let i = 0; i < points; i++) wave[i] = time[Math.floor((i * span) / points)];
         return { baseHue, isPlaying: true, preset: visualizerPreset, bins, wave, bassPulse: Math.min(1, state.bassPulse), volumeLevel: volumeSum / freq.length / 255 };
       };
-      fallbackTimer = setInterval(() => {
+      let fastTick = true;
+      const tick = () => {
         if (feedMiniplayer) {
           if (performance.now() - (state.lastMiniSentAt || 0) < 150) return;
           const frame = buildFrame();
@@ -6411,17 +6478,25 @@ export default function App({
           }
           return;
         }
-        // the phone: about thirty frames a second (the window smooths between them). the window is only drawn when it is on screen, say so and the frames stop for a while
-        if (state.vizSkip > 0) { state.vizSkip -= 1; return; }
+        // the phone: about thirty frames a second (the window smooths between them)
         const frame = buildFrame();
         if (!frame) return;
         const text = `${Math.round(frame.baseHue)},${frame.bassPulse.toFixed(2)},${frame.preset === 'wave' ? 1 : 0};${frame.bins.join(',')};${frame.wave.join(',')}`;
+        let drawn = false;
         try {
-          if (!window.SmpNative.vizFrame(text)) state.vizSkip = 10;
+          drawn = Boolean(window.SmpNative.vizFrame(text));
         } catch {
-          state.vizSkip = 40;
+          drawn = false;
         }
-      }, 33);
+        // the window is only drawn while it is on screen. when it is not, a slow tick is
+        // enough to notice it coming back
+        if (drawn !== fastTick) {
+          fastTick = drawn;
+          clearInterval(fallbackTimer);
+          fallbackTimer = setInterval(tick, drawn ? 33 : 400);
+        }
+      };
+      fallbackTimer = setInterval(tick, 33);
     }
 
     return () => {
@@ -7491,6 +7566,83 @@ export default function App({
     });
   }, []);
 
+  // Discord rich presence (the computer app only): what is playing shows on the Discord that is
+  // running on this computer. the local server talks to it. the button only exists where that
+  // works (it needs the application id set up in the server), and nothing is sent while the
+  // listening activity is hidden on the account
+  const [discordAvailable, setDiscordAvailable] = useState(false);
+  const [discordOn, setDiscordOn] = useState(() => {
+    try { return window.localStorage.getItem('music_discord_status') !== 'off'; } catch { return true; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('music_discord_status', discordOn ? 'on' : 'off'); } catch { /* not remembered */ }
+  }, [discordOn]);
+  useEffect(() => {
+    if (!isTauriDesktop || isAndroidApp()) return undefined;
+    let stopped = false;
+    fetch('/api/discord/status')
+      .then((response) => (response.ok && (response.headers.get('content-type') || '').includes('json') ? response.json() : null))
+      .then((status) => { if (!stopped) setDiscordAvailable(Boolean(status && status.available)); })
+      .catch(() => {});
+    return () => { stopped = true; };
+  }, [isTauriDesktop]);
+  // the phone cannot talk to Discord itself, but this computer knows what the account's phone
+  // plays (the same relay that shows it in the app), so that is shown when nothing plays here
+  const discordRemoteRef = useRef(null);
+  discordRemoteRef.current = remoteNow;
+  useEffect(() => {
+    if (!discordAvailable) return undefined;
+    const post = (body) => fetch('/api/discord/activity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).catch(() => {});
+    const ownPlaying = Boolean(currentTrack && currentTrack.title && isPlaying);
+    const remotePlayingNow = !ownPlaying && Boolean(remotePlaying && discordRemoteRef.current && discordRemoteRef.current.track && discordRemoteRef.current.track.title);
+    const ownPaused = Boolean(currentTrack && currentTrack.title) && !ownPlaying && !remotePlayingNow;
+    if (!discordOn || hideListening || (!ownPlaying && !remotePlayingNow && !ownPaused)) {
+      post({ clear: true });
+      return undefined;
+    }
+    const send = () => {
+      if (ownPlaying || ownPaused) {
+        const audio = audioRef.current;
+        post({
+          title: currentTrack.title,
+          artist: currentTrack.author || '',
+          thumbnail: currentTrack.thumbnail || '',
+          playing: ownPlaying,
+          position: audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+          duration: audio && Number.isFinite(audio.duration) ? audio.duration : 0,
+          shared: playbackSource === 'shared'
+        });
+        return;
+      }
+      const remote = discordRemoteRef.current;
+      if (!remote || !remote.track) return;
+      post({
+        title: remote.track.title,
+        artist: remote.track.author || '',
+        thumbnail: remote.track.thumbnail || '',
+        playing: true,
+        position: remote.position,
+        duration: remote.duration,
+        shared: false,
+        device: 'phone'
+      });
+    };
+    send();
+    if (ownPaused) {
+      // a song that has been paused for ten minutes is not what someone is listening to any more
+      const stale = setTimeout(() => post({ clear: true }), 10 * 60 * 1000);
+      return () => clearTimeout(stale);
+    }
+    // the progress bar on Discord is worked out from where the song was when this was sent,
+    // a seek makes it drift, so it is sent again now and then
+    const timer = setInterval(send, 30000);
+    return () => clearInterval(timer);
+  }, [currentTrack, discordAvailable, discordOn, hideListening, isPlaying, playbackSource, remotePlaying, remoteNow && remoteNow.track && remoteNow.track.videoId]);
+
   // looks for a newer version on the server the app belongs to: now, every ten
   // minutes, and when the window comes back into view
   useEffect(() => {
@@ -7532,7 +7684,24 @@ export default function App({
 
         let kind = 'reload';
         if (isAndroidApp()) {
+          // the screens can be swapped in the app when this app knows how and the update is only
+          // screens. otherwise the download page
           kind = 'installer';
+          try {
+            if (typeof window.SmpNative.uiUpdateCheck === 'function') {
+              const manifestResponse = await fetch(socialUrl('/api/update/manifest'), { cache: 'no-store' });
+              if (manifestResponse.ok) {
+                const envelopeText = await manifestResponse.text();
+                const verdict = JSON.parse(window.SmpNative.uiUpdateCheck(envelopeText));
+                if (verdict.ok && verdict.canApply && verdict.newer) {
+                  kind = 'live';
+                  updateEnvelopeRef.current = envelopeText;
+                }
+              }
+            }
+          } catch {
+            // stays on the download page
+          }
         } else if (isTauriDesktop) {
           // the installed app asks its own server whether the new screens can be
           // downloaded into it. an installer too old for that, or an update that
@@ -7566,6 +7735,16 @@ export default function App({
     };
   }, [isTauriDesktop]);
 
+  // screens that were downloaded for the app are kept once this page has run for a few seconds
+  // without trouble. if it never gets this far the app goes back to the screens it came with
+  useEffect(() => {
+    if (!isAndroidApp() || typeof window.SmpNative.uiConfirm !== 'function') return undefined;
+    const timer = setTimeout(() => {
+      try { window.SmpNative.uiConfirm(); } catch { /* nothing to confirm */ }
+    }, 10000);
+    return () => clearTimeout(timer);
+  }, []);
+
   const applyUpdate = useCallback(async () => {
     if (updateBusy) return;
     if (updateKind === 'installer') {
@@ -7574,6 +7753,35 @@ export default function App({
     }
     if (updateKind !== 'live') {
       window.location.reload();
+      return;
+    }
+    if (isAndroidApp()) {
+      // the phone downloads and checks the new screens itself, this only waits for it to finish
+      setUpdateBusy(true);
+      let started = false;
+      try {
+        started = window.SmpNative.uiUpdateApply(updateEnvelopeRef.current, socialUrl('/').replace(/\/+$/, ''));
+      } catch {
+        started = false;
+      }
+      if (!started) {
+        showNotification('could not update, try again in a bit', 'error');
+        setUpdateBusy(false);
+        return;
+      }
+      const began = Date.now();
+      const poll = setInterval(() => {
+        let progress = {};
+        try { progress = JSON.parse(window.SmpNative.uiUpdateState()); } catch { /* look again */ }
+        if (progress.state === 'done') {
+          clearInterval(poll);
+          setTimeout(() => window.location.reload(), 300);
+        } else if (progress.state === 'failed' || Date.now() - began > 120000) {
+          clearInterval(poll);
+          showNotification('could not update, try again in a bit', 'error');
+          setUpdateBusy(false);
+        }
+      }, 600);
       return;
     }
     setUpdateBusy(true);
@@ -7740,12 +7948,18 @@ export default function App({
   // shared-channel playback (server dictates the queue, not us)
   useEffect(() => {
     if (!currentTrack || shuffle || currentChannelId) return;
-    const upcoming = playNextQueue.length > 0
-      ? playNextQueue[0]
-      : (playIndex + 1 < queue.length ? queue[playIndex + 1] : (repeatMode === 'all' ? queue[0] : null));
-    if (!upcoming?.videoId || upcoming.videoId === currentTrack.videoId) return;
-    resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(upcoming.videoId)}`)
-      .then((url) => fetch(url))
+    // what plays next, in order: the songs queued to play next, then the queue after this one
+    const ahead = [...playNextQueue];
+    for (let i = playIndex + 1; ahead.length < 2 && i < queue.length; i += 1) ahead.push(queue[i]);
+    if (!ahead.length && repeatMode === 'all' && queue.length) ahead.push(queue[0]);
+    // the phone has the next two downloaded whole (on wifi, see the audio helper) so a change of
+    // network does not cut a song or the one after it. the computer only looks the next one up
+    const wanted = ahead
+      .slice(0, isAndroidApp() ? 2 : 1)
+      .filter((track) => track?.videoId && track.videoId !== currentTrack.videoId);
+    if (!wanted.length) return;
+    wanted
+      .reduce((chain, track) => chain.then(() => resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(track.videoId)}${isAndroidApp() ? '&full=1' : ''}`).then((url) => fetch(url))), Promise.resolve())
       .catch(() => {
         // best-effort - /api/stream just resolves cold when actually played
       });
@@ -10713,7 +10927,7 @@ export default function App({
             <ListGroup variant="flush" style={{ maxHeight: '180px', overflowY: 'auto' }}>
               {queue.length === 0 ? (
                 <div style={wireEmptyStyle}>your queue is empty</div>
-              ) : queue.slice(0, 10).map((track, index) => (
+              ) : queue.map((track, index) => (
                 <ListGroup.Item
                   key={`${track.videoId}-${index}`}
                   className="track-item border-0 d-flex justify-content-between align-items-start"
@@ -12514,6 +12728,27 @@ export default function App({
                 }}
               >
                 what i'm listening to: {hideListening ? 'hidden' : 'shown'}
+              </button>
+            </div>
+          )}
+
+          {discordAvailable && (
+            <div style={{ marginBottom: '15px' }}>
+              <button
+                onClick={() => setDiscordOn((on) => !on)}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  background: discordOn ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
+                  border: `1px solid ${dimBorderColor(themeColor)}`,
+                  borderRadius: '6px',
+                  color: discordOn ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  fontWeight: discordOn ? 'bold' : 'normal'
+                }}
+              >
+                discord status: {discordOn ? 'on' : 'off'}
               </button>
             </div>
           )}

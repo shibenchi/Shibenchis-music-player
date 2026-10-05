@@ -195,6 +195,11 @@ object FloatingPlayer {
         hide()
         return
       }
+      if (!interactive(view.context)) {
+        // the screen is off and nobody sees the card, look again later instead of drawing it sixteen times a second
+        main.postDelayed(this, 1000)
+        return
+      }
       view.refresh(false)
       main.postDelayed(this, if (NowPlaying.playing) 60 else 500)
     }

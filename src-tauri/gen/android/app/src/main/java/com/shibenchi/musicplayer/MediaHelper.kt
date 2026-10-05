@@ -44,6 +44,15 @@ class MediaHelper private constructor(private val context: Context) {
     private const val UPDATE_EVERY_MS = 12L * 60 * 60 * 1000
     private val VIDEO_ID = Regex("^[A-Za-z0-9_-]{6,20}$")
     private val LIST_ID = Regex("^[A-Za-z0-9_-]{2,80}$")
+    // the phone has no usable network for a moment: wifi roaming to a new address, a gap in
+    // coverage. youtube is fine, asking again in a second is cheap, while yt-dlp takes eight
+    // seconds to find out the same thing (and a second yt-dlp download another eight)
+    private val NETWORK_TROUBLE = Regex(
+      "unable to resolve host|no address associated|network is unreachable|errno 7\\b|errno 101|errno 113|temporary failure in name resolution|getaddrinfo|software caused connection abort|connection reset|connection refused|failed to connect|unknownhost|unreachable",
+      RegexOption.IGNORE_CASE
+    )
+    // how long to wait before looking again, one entry per try
+    private val NETWORK_RETRY_DELAYS_MS = longArrayOf(800, 1500, 2500, 4000)
     private val BOT_CHECK = Regex(
       "confirm you.?re not a bot|sign in to confirm|http error 429|too many requests|unusual traffic",
       RegexOption.IGNORE_CASE
@@ -69,6 +78,8 @@ class MediaHelper private constructor(private val context: Context) {
   private class Failure(val status: Int, message: String, val code: String? = null) : Exception(message)
 
   private val pool = Executors.newCachedThreadPool()
+  // debug builds only: the next lookups fail as if the network was gone, to see the retry work
+  private val simulatedDnsFailures = java.util.concurrent.atomic.AtomicInteger(0)
   private val ready = CountDownLatch(1)
   @Volatile private var initError: String? = null
 
@@ -298,6 +309,10 @@ class MediaHelper private constructor(private val context: Context) {
       "/api/debug/ytdlp" -> if (BuildConfig.DEBUG) apiDebug(req, out) else throw Failure(404, "not found")
       "/api/debug/client" -> if (BuildConfig.DEBUG) apiDebugClient(req, out) else throw Failure(404, "not found")
       "/api/debug/full" -> if (BuildConfig.DEBUG) apiDebugFull(req, out) else throw Failure(404, "not found")
+      "/api/debug/simulate-dns" -> if (BuildConfig.DEBUG) {
+        simulatedDnsFailures.set(req.query["count"]?.toIntOrNull() ?: 3)
+        sendJson(req, out, 200, JSONObject().put("ok", true).put("failures", simulatedDnsFailures.get()))
+      } else throw Failure(404, "not found")
       else -> throw Failure(404, "not found")
     }
   }
@@ -481,18 +496,80 @@ class MediaHelper private constructor(private val context: Context) {
     resolvedUrls[videoId]?.let { if (it.expiresAt > System.currentTimeMillis()) return it }
     val resolved = shared(resolving, videoId) {
       try {
-        val audio = YouTubeDirect.audio(videoId)
+        val audio = retryOnNetworkTrouble("direct audio lookup for $videoId") {
+          if (BuildConfig.DEBUG && simulatedDnsFailures.getAndUpdate { if (it > 0) it - 1 else 0 } > 0) {
+            throw java.net.UnknownHostException("simulated: no address associated with hostname")
+          }
+          YouTubeDirect.audio(videoId)
+        }
         noteYoutubeOk()
         // the link says how long it lives, stop using it a few minutes before that
         val ttl = minOf(RESOLVED_URL_TTL_MS, audio.expiresInSec * 1000 - 5 * 60_000).coerceAtLeast(60_000)
         Resolved(audio.url, mapOf("User-Agent" to audio.userAgent), System.currentTimeMillis() + ttl, audio.size)
       } catch (direct: Exception) {
+        if (isNetworkProblem(direct)) throw Failure(503, "no network right now, try again in a moment", "network_down")
         Log.i(TAG, "direct audio lookup failed for $videoId (${direct.message}), using yt-dlp")
         resolveWithYtDlp(videoId)
       }
     }
     resolvedUrls[videoId] = resolved
     return resolved
+  }
+
+  private fun isNetworkProblem(t: Throwable?): Boolean {
+    var e: Throwable? = t
+    var depth = 0
+    while (e != null && depth < 6) {
+      if (e is java.net.UnknownHostException || e is java.net.ConnectException || e is java.net.NoRouteToHostException) return true
+      if (NETWORK_TROUBLE.containsMatchIn(e.message.orEmpty())) return true
+      e = e.cause
+      depth++
+    }
+    return false
+  }
+
+  // runs a lookup again, a few times over about nine seconds, while the only thing wrong is the
+  // network. any other failure goes up at once
+  private fun <T> retryOnNetworkTrouble(what: String, work: () -> T): T {
+    var attempt = 0
+    while (true) {
+      try {
+        return work()
+      } catch (e: Exception) {
+        if (!isNetworkProblem(e) || attempt >= NETWORK_RETRY_DELAYS_MS.size) throw e
+        Log.i(TAG, "$what: no network yet (${e.message}), looking again in ${NETWORK_RETRY_DELAYS_MS[attempt]} ms")
+        Thread.sleep(NETWORK_RETRY_DELAYS_MS[attempt])
+        attempt++
+      }
+    }
+  }
+
+  // not on mobile data: songs are only downloaded ahead of time on a connection that is not metered
+  private fun onUnmeteredNetwork(): Boolean = try {
+    val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
+    cm != null && !cm.isActiveNetworkMetered
+  } catch (e: Exception) {
+    false
+  }
+
+  // the next songs of the queue are downloaded whole ahead of time, one at a time. a youtube link
+  // is tied to the address of the phone that asked for it, so when the wifi hands the phone a new
+  // address (it does that every few minutes on some networks) every link stops working in the
+  // middle of a song or right before the next one. a song that is already on the phone does not care
+  private val prefetching = java.util.concurrent.Semaphore(1)
+  private fun startFullPrefetch(id: String) {
+    if (isCompleteAudioFile(File(cacheDir, "$id.m4a")) || isCompleteAudioFile(File(offlineDir, "$id.m4a"))) return
+    if (inCooldown() || !onUnmeteredNetwork()) return
+    pool.execute {
+      if (!prefetching.tryAcquire()) return@execute // one at a time, the next ask tries again
+      try {
+        downloadToCache(id)
+      } catch (e: Exception) {
+        Log.i(TAG, "prefetch of $id failed: ${e.message}")
+      } finally {
+        prefetching.release()
+      }
+    }
   }
 
   // the link yt-dlp finds takes five seconds or so, but unlike the quick one it
@@ -531,6 +608,7 @@ class MediaHelper private constructor(private val context: Context) {
     }
     try {
       resolveDirectUrl(id)
+      if (req.query["full"] == "1") startFullPrefetch(id)
       sendJson(req, out, 200, JSONObject().put("ok", true))
     } catch (e: Failure) {
       // not fatal, the stream request just resolves again when the track plays
@@ -568,6 +646,12 @@ class MediaHelper private constructor(private val context: Context) {
       if (fast is IOException && fast !is UpstreamFailure) throw fast
       val failure = asFailure(fast)
       if (failure.code == "youtube_bot_check") throw failure
+      if (failure.code == "network_down" || isNetworkProblem(fast) || isNetworkProblem(failure)) {
+        // no downloads without a network, the player asks again by itself. the link is dropped, the
+        // address of the phone is probably not the one it was made for any more
+        resolvedUrls.remove(id)
+        throw if (failure.code == "network_down") failure else Failure(503, "no network right now, try again in a moment", "network_down")
+      }
       Log.i(TAG, "stream fast path failed for $id (${failure.message}), downloading instead")
       val file = downloadToCache(id)
       serveFile(req, out, file, "audio/m4a")
@@ -820,6 +904,7 @@ class MediaHelper private constructor(private val context: Context) {
         try {
           downloadInPieces(videoId, made)
         } catch (fast: Exception) {
+          if (isNetworkProblem(fast)) throw Failure(503, "no network right now, try again in a moment", "network_down")
           Log.i(TAG, "piecewise download failed for $videoId (${fast.message}), using yt-dlp")
           made.delete()
           ytdlp(

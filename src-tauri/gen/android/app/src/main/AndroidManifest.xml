@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- to know whether the connection is metered (songs are only downloaded ahead on one that is not) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- the media notification and keeping music going with the screen off -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

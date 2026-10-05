@@ -20,6 +20,8 @@ class MainActivity : TauriActivity() {
       statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
       navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT)
     )
+    // before the page loads: screens that never reported in last time, or that the apk has caught up with, go
+    UiUpdater.startupCheck(applicationContext)
     super.onCreate(savedInstanceState)
     Playback.activity = WeakReference(this)
 

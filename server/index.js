@@ -767,6 +767,32 @@ const SYNC_LEAD_MS = 700; // gap between "all ready" and the start, covers netwo
 // pressing play) so one broken player cannot hold a room silent forever. it is
 // never started out of step with the others
 const SYNC_DROP_AFTER_MS = 60000;
+// once the first player is ready the rest get this long, not the whole minute. a player that
+// works is ready a few seconds after the first one, and one that has not made it by now is
+// not going to (its audio helper can not find the song, it lost its connection), while the
+// whole room waits for it. it is taken out of the start like a straggler at the end of the
+// minute is, and told, and it can join again by pressing play
+const SYNC_LATE_GRACE_MS = 20000;
+// a player that was taken out of a start is not waited for again by the starts after it, unless
+// it presses play itself or proves it can get ready, for this long. without that it rejoined
+// on its own and held up the next song for a minute again
+const SYNC_RECENT_DROP_MS = 5 * 60 * 1000;
+
+function clearSyncTimers(session) {
+  if (!session) return;
+  clearTimeout(session.timer);
+  clearTimeout(session.graceTimer);
+  session.timer = null;
+  session.graceTimer = null;
+}
+
+// does a start wait for this connection
+function isSyncParticipant(client, serverId) {
+  if (!client || client.serverId !== serverId) return false;
+  if (client.syncMode === 'yes') return true;
+  if (client.syncMode !== 'auto') return false;
+  return !(client.syncDroppedAt && Date.now() - client.syncDroppedAt < SYNC_RECENT_DROP_MS);
+}
 const syncSessions = new Map(); // serverId -> session
 let syncRevisionCounter = 0;
 
@@ -803,7 +829,7 @@ function getPlayModes(serverId) {
 function getSyncWaiting(serverId, session) {
   const seen = new Map();
   wsClients.forEach((client, clientId) => {
-    if (client.serverId !== serverId || (client.syncMode !== 'yes' && client.syncMode !== 'auto')) return;
+    if (!isSyncParticipant(client, serverId)) return;
     if (session.ready.has(clientId)) return;
     const status = client.syncStatus && client.syncStatus.revision === session.revision ? client.syncStatus : null;
     if (!seen.has(client.userId)) {
@@ -864,7 +890,7 @@ function persistSyncSession(serverId, session) {
 function getSyncParticipantIds(serverId) {
   const ids = [];
   wsClients.forEach((client, clientId) => {
-    if (client.serverId === serverId && (client.syncMode === 'yes' || client.syncMode === 'auto')) {
+    if (isSyncParticipant(client, serverId)) {
       ids.push(clientId);
     }
   });
@@ -883,8 +909,7 @@ function startSyncSession(serverId) {
   const session = syncSessions.get(serverId);
   if (!session || session.phase !== 'preparing') return;
 
-  clearTimeout(session.timer);
-  session.timer = null;
+  clearSyncTimers(session);
   session.phase = 'playing';
   session.startAtMs = Date.now() + SYNC_LEAD_MS;
   session.revision = newSyncRevision();
@@ -895,7 +920,7 @@ function startSyncSession(serverId) {
 
 // the guard timer of a start that has waited too long: whoever is still not ready
 // is taken out of the sync and told, then the room starts for everyone who is
-function dropSyncStragglers(serverId, revision) {
+function dropSyncStragglers(serverId, revision, when = `${SYNC_DROP_AFTER_MS}ms`) {
   const session = syncSessions.get(serverId);
   if (!session || session.phase !== 'preparing' || session.revision !== revision) return;
   getSyncParticipantIds(serverId).forEach((clientId) => {
@@ -903,10 +928,48 @@ function dropSyncStragglers(serverId, revision) {
     const client = wsClients.get(clientId);
     if (!client) return;
     client.syncMode = 'no';
+    client.syncDroppedAt = Date.now();
     sendWs(client.ws, { type: 'sync_dropped', serverId, reason: 'your player did not get ready in time, press play to join the room again' });
-    logToFile(`[SYNC] ${serverId} dropped ${client.username} after ${SYNC_DROP_AFTER_MS}ms: ${client.syncStatus ? client.syncStatus.reason : 'no status'}`);
+    logToFile(`[SYNC] ${serverId} dropped ${client.username} after ${when}: ${client.syncStatus ? client.syncStatus.reason : 'no status'}`);
   });
   startSyncSession(serverId);
+}
+
+// a connection that has gone silent (a phone that fell asleep, a page that was closed without
+// telling anyone) can never get ready. the room used to wait for it until the guard above ran
+// out, and for a whole minute again each time the song changed in the meantime. every player
+// in a start is pinged when the start begins: one that has not answered in a few seconds is
+// gone, not slow (a slow player still answers, the browser does that by itself), and it is
+// not waited for
+const SYNC_PING_GRACE_MS = 6000;
+function dropUnresponsiveParticipants(serverId, revision) {
+  const askedAt = Date.now();
+  getSyncParticipantIds(serverId).forEach((clientId) => {
+    const client = wsClients.get(clientId);
+    if (client && client.ws && client.ws.readyState === 1) {
+      try { client.ws.ping(); } catch { /* closing */ }
+    }
+  });
+  const timer = setTimeout(() => {
+    const session = syncSessions.get(serverId);
+    if (!session || session.phase !== 'preparing' || session.revision !== revision) return;
+    getSyncParticipantIds(serverId).forEach((clientId) => {
+      if (session.ready.has(clientId)) return;
+      const client = wsClients.get(clientId);
+      if (!client || !client.ws) return;
+      if ((client.ws.lastPongAt || 0) >= askedAt) return; // it answered, it is only slow
+      client.syncMode = 'no';
+      sendWs(client.ws, { type: 'sync_dropped', serverId, reason: 'your connection stopped answering, press play to join the room again' });
+      logToFile(`[SYNC] ${serverId} not waiting for ${client.username}: no answer to a ping in ${SYNC_PING_GRACE_MS}ms`);
+    });
+    const stillWaiting = getSyncWaiting(serverId, session);
+    if (stillWaiting.length) {
+      logToFile(`[SYNC] ${serverId} after ${SYNC_PING_GRACE_MS}ms still waiting on: ${stillWaiting.map((w) => `${w.username} (${w.reason})`).join(', ')}`);
+    }
+    scheduleWaitingBroadcast(serverId);
+    maybeStartSyncSession(serverId);
+  }, SYNC_PING_GRACE_MS);
+  if (timer.unref) timer.unref();
 }
 
 // a player's reason for not being ready yet changed: tell the room, at most a
@@ -939,7 +1002,15 @@ function handleSyncReady(serverId, clientId, revision) {
   const session = syncSessions.get(serverId);
   if (!session || session.phase !== 'preparing' || session.revision !== revision) return;
   session.ready.add(clientId);
+  // it can get ready, so it is waited for again
+  const readyClient = wsClients.get(clientId);
+  if (readyClient) readyClient.syncDroppedAt = 0;
   maybeStartSyncSession(serverId);
+  // the first player to be ready starts the clock for the others
+  if (session.phase === 'preparing' && !session.graceTimer) {
+    const graceRevision = session.revision;
+    session.graceTimer = setTimeout(() => dropSyncStragglers(serverId, graceRevision, `${SYNC_LATE_GRACE_MS}ms after the first player was ready`), SYNC_LATE_GRACE_MS);
+  }
 }
 
 // a play/pause/seek/skip request from a member. returns what happened
@@ -961,7 +1032,7 @@ function applySyncCommand(serverId, cmd) {
   const requestedTime = Number.isFinite(cmd.current_time) && cmd.current_time >= 0 ? cmd.current_time : livePosition;
 
   if (!cmd.is_playing) {
-    if (session && session.timer) clearTimeout(session.timer);
+    clearSyncTimers(session);
     const paused = {
       trackId,
       phase: 'paused',
@@ -988,7 +1059,7 @@ function applySyncCommand(serverId, cmd) {
     return { noop: true };
   }
 
-  if (session && session.timer) clearTimeout(session.timer);
+  clearSyncTimers(session);
   const preparing = {
     trackId,
     phase: 'preparing',
@@ -997,13 +1068,15 @@ function applySyncCommand(serverId, cmd) {
     startAtMs: null,
     revision: newSyncRevision(),
     ready: new Set(),
-    timer: null
+    timer: null,
+    graceTimer: null
   };
   preparing.timer = setTimeout(() => dropSyncStragglers(serverId, preparing.revision), SYNC_DROP_AFTER_MS);
   syncSessions.set(serverId, preparing);
   persistSyncSession(serverId, preparing);
   broadcastServerPlayerState(serverId);
   maybeStartSyncSession(serverId); // starts right away when nobody is connected to wait for
+  dropUnresponsiveParticipants(serverId, preparing.revision);
   return { phase: 'preparing' };
 }
 
@@ -1032,7 +1105,7 @@ function handleCurrentTrackRemoved(serverId, removedTrackId, queueBefore) {
 // nothing to play any more (the queue was cleared): the room's player is reset
 function resetRoomPlayback(serverId) {
   const session = syncSessions.get(serverId);
-  if (session && session.timer) clearTimeout(session.timer);
+  clearSyncTimers(session);
   syncSessions.delete(serverId);
   db.deleteServerPlayerState(serverId);
   broadcastServerPlayerState(serverId);
@@ -2661,6 +2734,37 @@ app.post('/api/update/apply', async (req, res) => {
   }
 });
 
+// ---- Discord rich presence (the desktop app only, see discord.js). what is playing shows on
+// the Discord running on this same computer. a hosted server never does this, and a web page
+// from somewhere else can not set what a person's profile says
+// SMP_DISCORD_CLIENT_ID and SMP_DISCORD_IPC replace the built in application id and the pipe, for testing
+const discordModule = require('./discord');
+const discordPresence = discordModule.createPresence({
+  clientId: process.env.SMP_DISCORD_CLIENT_ID || discordModule.DEFAULT_CLIENT_ID,
+  ipcPaths: process.env.SMP_DISCORD_IPC ? [process.env.SMP_DISCORD_IPC] : null,
+  log: (message) => logToFile(message)
+});
+function discordAllowedHere(req) {
+  if (process.env.DISABLE_MEDIA_ENDPOINTS === '1' || !validation.isLocalRequest(req)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const host = new URL(origin).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1';
+  } catch {
+    return false;
+  }
+}
+app.get('/api/discord/status', (req, res) => {
+  if (!discordAllowedHere(req)) return res.json({ available: false });
+  res.json(discordPresence.status());
+});
+app.post('/api/discord/activity', (req, res) => {
+  if (!discordAllowedHere(req) || !discordPresence.available) return res.status(403).json({ error: 'Not available here' });
+  const body = req.body || {};
+  res.json({ ok: body.clear ? discordPresence.clear() : discordPresence.update(body) });
+});
+
 // used to decide whether to show the first-run welcome dialog - a genuinely
 // fresh install has no registered users at all. NOT "have i shown this
 // before" (thats a client-side localStorage flag, since a guest who never
@@ -3632,6 +3736,32 @@ const server = http.createServer({
 
 const wss = createWebSocketServer(server, sessionMiddleware);
 globalWss = wss; // store global reference
+
+// keep every connection busy. something on the way from the apps to this server closes a
+// connection that has been quiet for 60 seconds (idle devices were dropping and coming back
+// every minute, which also flickered them offline for everyone else and made each phone
+// download its account again), and a ping now and then counts as traffic both ways. a
+// browser answers a ping by itself, no app code is involved. a connection that answers
+// nothing for two rounds in a row is really gone and is closed here
+const HEARTBEAT_MS = 40000;
+wss.on('connection', (ws) => {
+  ws.missedPings = 0;
+  ws.on('pong', () => {
+    ws.missedPings = 0;
+    ws.lastPongAt = Date.now();
+  });
+});
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.missedPings >= 2) {
+      try { ws.terminate(); } catch { /* already gone */ }
+      return;
+    }
+    ws.missedPings = (ws.missedPings || 0) + 1;
+    try { ws.ping(); } catch { /* closing */ }
+  });
+}, HEARTBEAT_MS);
+if (heartbeat.unref) heartbeat.unref();
 
 wss.on('connection', (ws, request) => {
   const clientId = require('crypto').randomBytes(8).toString('hex');

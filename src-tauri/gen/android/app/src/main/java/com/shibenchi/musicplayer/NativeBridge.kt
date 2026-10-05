@@ -160,6 +160,27 @@ class NativeBridge(private val context: Context) {
   @JavascriptInterface
   fun floatingStatus(): String = FloatingPlayer.status(context)
 
+  // ---- new screens without a new apk (see UiUpdater.kt)
+  // the signed list the server published, as an answer: can this phone take it, and is it newer
+  @JavascriptInterface
+  fun uiUpdateCheck(envelope: String): String = UiUpdater.check(context, envelope)
+
+  // downloads and switches to the new screens from that server address, returns at once
+  @JavascriptInterface
+  fun uiUpdateApply(envelope: String, base: String): Boolean = UiUpdater.apply(context, envelope, base)
+
+  // idle, working (done and total files), done or failed (error)
+  @JavascriptInterface
+  fun uiUpdateState(): String = UiUpdater.state()
+
+  // the page is up and works, the downloaded screens are kept
+  @JavascriptInterface
+  fun uiConfirm() = UiUpdater.confirm(context)
+
+  // the version of the screens on screen
+  @JavascriptInterface
+  fun uiVersion(): String = UiUpdater.activeVersion(context)
+
   @JavascriptInterface
   fun setFloatingEnabled(on: Boolean) {
     FloatingPlayer.setEnabled(context, on)

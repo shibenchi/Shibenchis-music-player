@@ -165,8 +165,10 @@ class PlaybackService : Service() {
     override fun run() {
       if (!NowPlaying.playing) return
       val power = getSystemService(android.os.PowerManager::class.java)
-      if (power.isInteractive) PlayerWidget.tick(this@PlaybackService)
-      main.postDelayed(this, 300)
+      val screenOn = power.isInteractive
+      if (screenOn) PlayerWidget.tick(this@PlaybackService)
+      // with the screen off nobody looks at the widget, a slow check is enough
+      main.postDelayed(this, if (screenOn) 300 else 2000)
     }
   }
 
