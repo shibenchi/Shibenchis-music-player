@@ -7313,6 +7313,26 @@ export default function App({
   // listener's player hits the end at about the same moment and each asks for
   // the next track, so the request names the track that ended and the server
   // only honors the first one
+  // under shuffle the song after this one is picked ahead of time instead of the moment this one
+  // ends, so it can be looked up (and on the phone downloaded) while this one plays and the change
+  // is instant. handleNext plays the same pick. picks are kept as long as the song they were
+  // made for is still the one playing and they are still in the queue
+  const shufflePlanRef = useRef({ anchor: '', picks: [] });
+  const planShuffleAhead = useCallback((list, anchorVideoId, count) => {
+    const plan = shufflePlanRef.current;
+    const picks = plan.anchor === anchorVideoId
+      ? plan.picks.filter((id) => list.some((track) => track.videoId === id))
+      : [];
+    const candidates = list.filter((track) => track.videoId && track.videoId !== anchorVideoId);
+    while (picks.length < count && candidates.length) {
+      const last = picks.length ? picks[picks.length - 1] : anchorVideoId;
+      const pool = candidates.length > 1 ? candidates.filter((track) => track.videoId !== last) : candidates;
+      picks.push(pool[Math.floor(Math.random() * pool.length)].videoId);
+    }
+    shufflePlanRef.current = { anchor: anchorVideoId, picks };
+    return picks.map((id) => list.find((track) => track.videoId === id)).filter(Boolean);
+  }, []);
+
   const handleNext = useCallback((opts) => {
     const currentIndex = playIndexRef.current;
     const activeList = playbackSourceRef.current === 'shared' ? channelQueue : queue;
@@ -7365,7 +7385,15 @@ export default function App({
     let nextIndex = currentIndex + 1;
 
     if (shuffle) {
-      nextIndex = Math.floor(Math.random() * list.length);
+      // the pick made ahead of time, which is also the one that was looked up already
+      const here = list[currentIndex]?.videoId || '';
+      const plan = shufflePlanRef.current;
+      let planned = -1;
+      if (plan.anchor === here && plan.picks.length) {
+        planned = list.findIndex((track) => track.videoId === plan.picks[0]);
+        if (planned >= 0) shufflePlanRef.current = { anchor: plan.picks[0], picks: plan.picks.slice(1) };
+      }
+      nextIndex = planned >= 0 ? planned : Math.floor(Math.random() * list.length);
     } else {
       if (nextIndex >= list.length) {
         if (repeatMode === 'all') {
@@ -7889,6 +7917,7 @@ export default function App({
           repeat: playerModesRef.current.repeat,
           volume: playerModesRef.current.volume,
           muted: playerModesRef.current.muted,
+          isBuffering: isBufferingRef.current,
           inRoom: playbackSourceRef.current === 'shared' && !!currentChannelRef.current
         }
       : {
@@ -7903,7 +7932,7 @@ export default function App({
 
   useEffect(() => {
     sendNowPlaying(buildNowPlayingPayload());
-  }, [currentTrack, isPlaying, trackProgress.current, trackProgress.duration, themeColor, shuffle, repeatMode, volume, isMuted, playbackSource, currentChannelId, buildNowPlayingPayload]);
+  }, [currentTrack, isPlaying, isBuffering, trackProgress.current, trackProgress.duration, themeColor, shuffle, repeatMode, volume, isMuted, playbackSource, currentChannelId, buildNowPlayingPayload]);
 
   // registered once and never torn down - the miniplayer can open at any
   // moment (auto-shows on blur/minimize), independent of any state above
@@ -7943,27 +7972,35 @@ export default function App({
   // fixes) - since listening is normally sequential through a queue, warm
   // that resolve for whatevers coming up next while the current track is
   // still playing, so by the time playback actually gets there its already
-  // cached server-side instead of resolving cold. skipped under shuffle
-  // (genuinely unpredictable - picked at random when next fires) and
-  // shared-channel playback (server dictates the queue, not us)
+  // cached server-side instead of resolving cold. skipped for
+  // shared-channel playback (server dictates the queue, not us). under shuffle
+  // the next picks are made ahead of time for this (see planShuffleAhead)
   useEffect(() => {
-    if (!currentTrack || shuffle || currentChannelId) return;
+    if (!currentTrack || currentChannelId) return;
     // what plays next, in order: the songs queued to play next, then the queue after this one
     const ahead = [...playNextQueue];
-    for (let i = playIndex + 1; ahead.length < 2 && i < queue.length; i += 1) ahead.push(queue[i]);
-    if (!ahead.length && repeatMode === 'all' && queue.length) ahead.push(queue[0]);
-    // the phone has the next two downloaded whole (on wifi, see the audio helper) so a change of
-    // network does not cut a song or the one after it. the computer only looks the next one up
+    if (shuffle) {
+      planShuffleAhead(queue, currentTrack.videoId, 2).forEach((track) => ahead.push(track));
+    } else {
+      for (let i = playIndex + 1; ahead.length < 2 && i < queue.length; i += 1) ahead.push(queue[i]);
+      // repeat all: after the last song the queue starts over
+      if (repeatMode === 'all') {
+        for (let i = 0; ahead.length < 2 && i < Math.min(playIndex, queue.length); i += 1) ahead.push(queue[i]);
+      }
+    }
+    // the phone has the next song downloaded whole whatever the network and the one after it on
+    // wifi (see the audio helper), so a change of network does not cut a song or the next one,
+    // and the next one starts at once. the computer only looks the next one up
     const wanted = ahead
       .slice(0, isAndroidApp() ? 2 : 1)
       .filter((track) => track?.videoId && track.videoId !== currentTrack.videoId);
     if (!wanted.length) return;
     wanted
-      .reduce((chain, track) => chain.then(() => resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(track.videoId)}${isAndroidApp() ? '&full=1' : ''}`).then((url) => fetch(url))), Promise.resolve())
+      .reduce((chain, track, index) => chain.then(() => resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(track.videoId)}${isAndroidApp() ? `&full=${index === 0 ? 1 : 2}` : ''}`).then((url) => fetch(url))), Promise.resolve())
       .catch(() => {
         // best-effort - /api/stream just resolves cold when actually played
       });
-  }, [currentTrack, queue, playIndex, shuffle, currentChannelId, playNextQueue, repeatMode]);
+  }, [currentTrack, queue, playIndex, shuffle, currentChannelId, playNextQueue, repeatMode, planShuffleAhead]);
 
   const stopAndResetPlayback = () => {
     logClient('stopAndResetPlayback', { playIndex: playIndexRef.current });

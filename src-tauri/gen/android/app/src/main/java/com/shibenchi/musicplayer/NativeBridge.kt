@@ -39,6 +39,11 @@ object NowPlaying {
   @Volatile var muted = false
   // this device is listening to a room (playing or paused): the room can still start it
   @Volatile var inRoom = false
+  // the page is busy getting a song ready (looking it up, loading it, buffering). between two
+  // songs this is true, and it is what keeps the service in the foreground
+  @Volatile var loading = false
+  // when it last played (SystemClock.elapsedRealtime), 0 if it has not since the app started
+  @Volatile var lastPlayingAt = 0L
 
   // when positionMs was true, so the position can be worked out between updates
   @Volatile var stamp = 0L
@@ -134,6 +139,9 @@ class NativeBridge(private val context: Context) {
       NowPlaying.volume = (o.optDouble("volume", 1.0) * 100).toInt().coerceIn(0, 100)
       NowPlaying.muted = o.optBoolean("muted", false)
       NowPlaying.inRoom = o.optBoolean("inRoom", false)
+      NowPlaying.loading = o.optBoolean("loading", false)
+      // the moment it stops is remembered too: a song that ended is a stop for a second or two
+      if (wasPlaying || NowPlaying.playing) NowPlaying.lastPlayingAt = SystemClock.elapsedRealtime()
       o.optJSONArray("accent")?.let { a ->
         if (a.length() == 3) NowPlaying.accent = 0xFF000000.toInt() or (a.optInt(0) shl 16) or (a.optInt(1) shl 8) or a.optInt(2)
       }
@@ -241,17 +249,10 @@ class NativeBridge(private val context: Context) {
         val gap = Math.min(raw, 360f - raw)
         if (gap < bestGap) { bestGap = gap; best = index }
       }
-      val prefs = context.getSharedPreferences("smp_icon", Context.MODE_PRIVATE)
-      if (prefs.getInt("preset", -1) != best) {
-        val manager = context.packageManager
-        fun entry(index: Int) = android.content.ComponentName(context, "com.shibenchi.musicplayer.Icon%02d".format(index))
-        // the new one first, so there is never a moment with none enabled
-        manager.setComponentEnabledSetting(entry(best), android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
-        ICON_HUES.indices.filter { it != best }.forEach {
-          manager.setComponentEnabledSetting(entry(it), android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
-        }
-        prefs.edit().putInt("preset", best).apply()
-      }
+      // switching the entry the app was opened from closes the app on the spot (android
+      // finishes the screen of a component that gets disabled), so it waits until the app
+      // is not on screen (see LauncherIcon)
+      LauncherIcon.request(context, best)
       best
     } catch (e: Exception) {
       Log.w("SmpBridge", "could not switch the launcher icon", e)

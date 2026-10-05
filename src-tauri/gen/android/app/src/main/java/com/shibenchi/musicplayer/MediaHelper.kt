@@ -557,9 +557,9 @@ class MediaHelper private constructor(private val context: Context) {
   // address (it does that every few minutes on some networks) every link stops working in the
   // middle of a song or right before the next one. a song that is already on the phone does not care
   private val prefetching = java.util.concurrent.Semaphore(1)
-  private fun startFullPrefetch(id: String) {
+  private fun startFullPrefetch(id: String, onlyUnmetered: Boolean) {
     if (isCompleteAudioFile(File(cacheDir, "$id.m4a")) || isCompleteAudioFile(File(offlineDir, "$id.m4a"))) return
-    if (inCooldown() || !onUnmeteredNetwork()) return
+    if (inCooldown() || (onlyUnmetered && !onUnmeteredNetwork())) return
     pool.execute {
       if (!prefetching.tryAcquire()) return@execute // one at a time, the next ask tries again
       try {
@@ -608,7 +608,12 @@ class MediaHelper private constructor(private val context: Context) {
     }
     try {
       resolveDirectUrl(id)
-      if (req.query["full"] == "1") startFullPrefetch(id)
+      // full=1: the next song, downloaded whole whatever the network (it is about to be streamed
+      // anyway). full=2: the one after that, only on a connection that is not metered
+      when (req.query["full"]) {
+        "1" -> startFullPrefetch(id, false)
+        "2" -> startFullPrefetch(id, true)
+      }
       sendJson(req, out, 200, JSONObject().put("ok", true))
     } catch (e: Failure) {
       // not fatal, the stream request just resolves again when the track plays

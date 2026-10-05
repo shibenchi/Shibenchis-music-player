@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 
@@ -28,6 +29,15 @@ class PlaybackService : Service() {
   companion object {
     private const val CHANNEL = "playback"
     private const val NOTIFICATION_ID = 4242
+
+    // how long the service stays in the foreground after music stops. a song that ends is a stop
+    // for a moment while the next one is looked up. android does not let an app promote a
+    // service to the foreground again once it is in the background (startForeground throws), so a
+    // service that dropped out between two songs with the screen off never got its network
+    // back and the next song hung for a minute. a real pause lets go after this
+    private const val PAUSE_GRACE_MS = 90_000L
+    // a song that is still loading after music stopped holds the service this long at most
+    private const val LOADING_HOLD_MS = 5 * 60_000L
 
     @Volatile private var instance: PlaybackService? = null
 
@@ -147,10 +157,13 @@ class PlaybackService : Service() {
   override fun onDestroy() {
     FloatingPlayer.hide()
     main.removeCallbacks(ticker)
+    main.removeCallbacks(graceCheck)
     instance = null
     session.isActive = false
     session.release()
     super.onDestroy()
+    // a new launcher icon color that waited for the music to stop
+    LauncherIcon.applyPending(applicationContext)
   }
 
   private fun startForegroundCompat(notification: Notification) {
@@ -160,6 +173,9 @@ class PlaybackService : Service() {
       startForeground(NOTIFICATION_ID, notification)
     }
   }
+
+  // runs once the grace after a stop is over, to let the service go if nothing started again
+  private val graceCheck = Runnable { refresh() }
 
   private val ticker = object : Runnable {
     override fun run() {
@@ -201,10 +217,27 @@ class PlaybackService : Service() {
     )
 
     val notification = buildNotification()
-    if (NowPlaying.playing || NowPlaying.inRoom || System.currentTimeMillis() < holdUntil) {
-      startForegroundCompat(notification)
+    main.removeCallbacks(graceCheck)
+    val sinceStopped = if (NowPlaying.lastPlayingAt > 0) SystemClock.elapsedRealtime() - NowPlaying.lastPlayingAt else Long.MAX_VALUE
+    val inGrace = sinceStopped < PAUSE_GRACE_MS
+    val stillLoading = NowPlaying.loading && sinceStopped < LOADING_HOLD_MS
+    val active = NowPlaying.playing || NowPlaying.inRoom
+    if (active || inGrace || stillLoading || System.currentTimeMillis() < holdUntil) {
+      try {
+        startForegroundCompat(notification)
+      } catch (e: Exception) {
+        // android refuses to promote a service from the background in a few cases. the music
+        // does not depend on this call, the notification just stays as it is
+        Log.w("SmpService", "could not bring the service to the foreground: ${e.message}")
+        try { getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification) } catch (n: Exception) { /* none */ }
+      }
+      if (!active && !stillLoading) {
+        // nothing is playing: look again when the grace is over
+        val wait = maxOf(PAUSE_GRACE_MS - sinceStopped, holdUntil - System.currentTimeMillis(), 0L)
+        main.postDelayed(graceCheck, wait + 500)
+      }
     } else {
-      // paused: the notification stays but can be swiped away
+      // paused for good: the notification stays but can be swiped away
       stopForeground(Service.STOP_FOREGROUND_DETACH)
       getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification)
     }

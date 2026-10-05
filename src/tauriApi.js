@@ -228,7 +228,7 @@ function reportToAndroid(state) {
   const hasTrack = !!(state && state.title);
   const position = (state && state.currentTime) || 0;
   const now = Date.now();
-  const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom].join('|');
+  const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom, !!state?.isBuffering].join('|');
   const expected = lastNativeReport.pos + (lastNativeReport.playing ? (now - lastNativeReport.at) / 1000 : 0);
   const jumped = Math.abs(position - expected) > 2.5;
   if (key === lastNativeReport.key && !jumped && now - lastNativeReport.at < 10000) return;
@@ -248,6 +248,9 @@ function reportToAndroid(state) {
       volume: typeof state?.volume === 'number' ? state.volume : 1,
       muted: !!state?.muted,
       inRoom: !!state?.inRoom,
+      // getting a song ready (between two songs the app is not playing but it is busy), the
+      // phone keeps the app in the foreground for as long as this is true
+      loading: !!state?.isBuffering,
       accent: color ? [color.r, color.g, color.b] : undefined
     }));
   } catch (err) {

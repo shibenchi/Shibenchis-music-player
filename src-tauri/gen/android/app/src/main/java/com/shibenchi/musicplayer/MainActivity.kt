@@ -55,11 +55,16 @@ class MainActivity : TauriActivity() {
   override fun onDestroy() {
     if (Playback.activity?.get() === this) Playback.activity = null
     super.onDestroy()
+    if (isFinishing) {
+      LauncherIcon.appVisible = false
+      LauncherIcon.applyPending(applicationContext)
+    }
   }
 
   // the app is on screen: the mini player goes away
   override fun onStart() {
     super.onStart()
+    LauncherIcon.appVisible = true
     FloatingPlayer.onAppShown()
   }
 
@@ -74,6 +79,9 @@ class MainActivity : TauriActivity() {
   override fun onStop() {
     super.onStop()
     keepPageRunning()
+    LauncherIcon.appVisible = false
+    // a new launcher icon color waits for this moment (see LauncherIcon)
+    LauncherIcon.applyLater(applicationContext)
     // leaving the app while music plays floats the mini player
     FloatingPlayer.onAppLeft(applicationContext)
   }

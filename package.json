@@ -1,8 +1,8 @@
 {
   "name": "shibenchi-music-player",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "smp": {
-    "minShell": "1.4.1"
+    "minShell": "1.4.3"
   },
   "description": "Shibenchi Music Player is a music player and downloader built for local listening, playlists, and queue management.",
   "proxy": "http://localhost:3001",
