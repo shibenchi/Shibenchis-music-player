@@ -24,6 +24,8 @@ class MainActivity : TauriActivity() {
     UiUpdater.startupCheck(applicationContext)
     super.onCreate(savedInstanceState)
     Playback.activity = WeakReference(this)
+    // opened by a button of the widget or the notification (the app was closed): it does what the button asked once it is up
+    handleControlIntent(intent)
 
     // the interface asks this for search results and audio, same as the desktop helper
     MediaHelper.start(this)
@@ -46,14 +48,43 @@ class MainActivity : TauriActivity() {
 
   // the page gets a window.SmpNative it uses to tell the notification, the
   // widget and the picture in picture window what is playing
+  private var myWebView: WebView? = null
+
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    myWebView = webView
     Playback.webView = webView
     webView.addJavascriptInterface(NativeBridge(applicationContext), "SmpNative")
   }
 
+  // the buttons of the widget and the notification need the page, with the app closed they open it
+  // with the command in the intent
+  private fun handleControlIntent(intent: android.content.Intent?) {
+    val command = intent?.getStringExtra("smp_command") ?: return
+    intent.removeExtra("smp_command")
+    Playback.commandWhenReady(command)
+  }
+
+  override fun onNewIntent(intent: android.content.Intent) {
+    super.onNewIntent(intent)
+    handleControlIntent(intent)
+  }
+
+  // the person touched the app themselves, so it stays on screen
+  override fun onUserInteraction() {
+    super.onUserInteraction()
+    Playback.minimizeUntil = 0L
+  }
+
   override fun onDestroy() {
     if (Playback.activity?.get() === this) Playback.activity = null
+    // no page any more: a button on the widget or the notification has to open the app again (they are
+    // drawn again here so they say so)
+    if (Playback.webView === myWebView) {
+      Playback.pageGone()
+      PlayerWidget.refresh(applicationContext)
+      PlaybackService.sync(applicationContext)
+    }
     super.onDestroy()
     if (isFinishing) {
       LauncherIcon.appVisible = false

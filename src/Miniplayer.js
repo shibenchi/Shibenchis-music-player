@@ -316,7 +316,7 @@ export default function Miniplayer() {
   return (
     <div
       ref={containerRef}
-      data-tauri-drag-region
+      data-tauri-drag-region="deep"
       style={{
         height: '100vh',
         width: '100vw',
@@ -345,7 +345,7 @@ export default function Miniplayer() {
           shrink together, cant ever get stretched weird since width and
           height literally cannot diverge from each other anymore */}
       <div
-        data-tauri-drag-region
+        data-tauri-drag-region="deep"
         style={{
           position: 'absolute',
           top: 0,
@@ -377,11 +377,11 @@ export default function Miniplayer() {
           <CloseIcon />
         </button>
 
-        <div data-tauri-drag-region style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
-          <div data-tauri-drag-region className={`vinyl-record ${isPlaying ? '' : 'paused'}`} style={{ width: 44, height: 44, flexShrink: 0, position: 'relative', margin: 0 }}>
+        <div data-tauri-drag-region="deep" style={{ display: 'flex', alignItems: 'center', gap: 11 }}>
+          <div data-tauri-drag-region="deep" className={`vinyl-record ${isPlaying ? '' : 'paused'}`} style={{ width: 44, height: 44, flexShrink: 0, position: 'relative', margin: 0 }}>
             {thumbTier < thumbSources.length && (
               <img
-                data-tauri-drag-region
+                data-tauri-drag-region="deep"
                 className="record-thumb"
                 src={thumbSources[thumbTier]}
                 alt="thumbnail"
@@ -389,7 +389,7 @@ export default function Miniplayer() {
               />
             )}
           </div>
-          <div data-tauri-drag-region style={{ flex: 1, minWidth: 0, paddingRight: 14 }}>
+          <div data-tauri-drag-region="deep" style={{ flex: 1, minWidth: 0, paddingRight: 14 }}>
             <Marquee text={title} style={{ fontSize: 13, fontWeight: 600 }} />
             <Marquee text={author} style={{ fontSize: 11, opacity: 0.7, marginTop: 1 }} />
           </div>
@@ -398,6 +398,7 @@ export default function Miniplayer() {
         <div>
           <div
             ref={progressBarRef}
+            data-tauri-drag-region="false"
             onMouseDown={handleProgressPointerDown}
             style={{ padding: '5px 0', cursor: 'pointer' }}
           >

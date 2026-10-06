@@ -625,6 +625,37 @@ function formatListeningActivity(listening) {
   return listening.author ? `${listening.title} - ${listening.author}` : listening.title;
 }
 
+// the kind of device this copy of the app runs on, told to the server for the icons next to names
+function devicePlatform() {
+  if (isAndroidApp()) return 'mobile';
+  return /android|iphone|ipad|ipod|mobile/i.test((typeof navigator !== 'undefined' && navigator.userAgent) || '') ? 'mobile' : 'pc';
+}
+
+// a phone and a computer next to a name. each one is lit while that person has the app open on
+// that kind of device, so one lit, both lit or none lit is easy to see
+function PlatformIcons({ platforms }) {
+  const has = (kind) => Array.isArray(platforms) && platforms.includes(kind);
+  const lit = '#22c55e';
+  const dim = '#4b5563';
+  let title = 'not on a phone or a computer';
+  if (has('mobile') && has('pc')) title = 'on a phone and a computer';
+  else if (has('mobile')) title = 'on a phone';
+  else if (has('pc')) title = 'on a computer';
+  return (
+    <span title={title} style={{ display: 'inline-flex', gap: '5px', marginLeft: '7px', verticalAlign: 'middle' }}>
+      <svg width="11" height="14" viewBox="0 0 11 14" fill="none" stroke={has('mobile') ? lit : dim} strokeWidth="1.3" strokeLinecap="round">
+        <rect x="1.4" y="0.8" width="8.2" height="12.4" rx="1.7" />
+        <line x1="4.3" y1="11" x2="6.7" y2="11" />
+      </svg>
+      <svg width="16" height="14" viewBox="0 0 16 14" fill="none" stroke={has('pc') ? lit : dim} strokeWidth="1.3" strokeLinecap="round">
+        <rect x="0.9" y="1" width="14.2" height="8.8" rx="1.3" />
+        <line x1="8" y1="9.8" x2="8" y2="12.6" />
+        <line x1="4.8" y1="12.8" x2="11.2" y2="12.8" />
+      </svg>
+    </span>
+  );
+}
+
 function normalizeSocialUsers(users) {
   const seen = new Set();
   return (Array.isArray(users) ? users : [])
@@ -647,6 +678,7 @@ function normalizeSocialUsers(users) {
           is_online: entry.is_online === true,
           current_server_id: entry.current_server_id || null,
           listening_to: normalizeListeningActivity(entry.listening_to),
+          platforms: Array.isArray(entry.platforms) ? entry.platforms.filter((kind) => kind === 'mobile' || kind === 'pc') : [],
           last_seen: entry.last_seen ? Number(entry.last_seen) : null,
           created_at: entry.created_at ? Number(entry.created_at) : null
         };
@@ -1843,6 +1875,33 @@ export default function App({
   // opens the download page, 'reload' (the web version) just loads the page again
   const [updateKind, setUpdateKind] = useState('reload');
   const [updateBusy, setUpdateBusy] = useState(false);
+  // how far an installer download is ("42%"), shown on the update button
+  const [updateProgress, setUpdateProgress] = useState('');
+  // the version of the app itself (the installer), which can be older than the screens
+  const [shellVersion, setShellVersion] = useState('');
+  // the knob on the progress bar: the record (the default), the face that used to be there, or a
+  // picture the person picked. kept on this device
+  const [progressIconMode, setProgressIconMode] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem('music_progress_icon');
+      return saved === 'face' || saved === 'custom' ? saved : 'record';
+    } catch {
+      return 'record';
+    }
+  });
+  const [progressIconImage, setProgressIconImage] = useState(() => {
+    try { return window.localStorage.getItem('music_progress_icon_image') || ''; } catch { return ''; }
+  });
+  const progressIconInputRef = useRef(null);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('music_progress_icon', progressIconMode);
+      if (progressIconImage) window.localStorage.setItem('music_progress_icon_image', progressIconImage);
+      else window.localStorage.removeItem('music_progress_icon_image');
+    } catch {
+      // not remembered
+    }
+  }, [progressIconMode, progressIconImage]);
   // the signed list of the newest screens the phone was handed (see UiUpdater.kt)
   const updateEnvelopeRef = useRef('');
   // the banner stays away once closed, until an even newer version comes out
@@ -7069,6 +7128,11 @@ export default function App({
     if (isConnected) sendWsMessage({ type: 'sync_presence', mode });
   }, [activeTab, currentChannelId, currentTrack, isBuffering, isConnected, isPlaying, playbackSource, sendWsMessage]);
 
+  // which kind of device this is, for the icons next to people's names
+  useEffect(() => {
+    if (isConnected) sendWsMessage({ type: 'client_info', platform: devicePlatform() });
+  }, [isConnected, sendWsMessage]);
+
   // === shared player sync - kicks in once the client's switched to shared playback ===
   useEffect(() => {
     const audio = audioRef.current;
@@ -7587,10 +7651,13 @@ export default function App({
   // tauri miniplayer bridge - no-ops entirely outside tauri (browser/pwa),
   // see src/tauriApi.js
   const [isTauriDesktop, setIsTauriDesktop] = useState(false);
+  // false until the answer to "is this the desktop app" is in, the update check waits for it
+  const [tauriKnown, setTauriKnown] = useState(false);
   useEffect(() => {
     isTauriApp().then((v) => {
       frontendLog('main', `isTauriApp() resolved: ${v}`);
       setIsTauriDesktop(v);
+      setTauriKnown(true);
     });
   }, []);
 
@@ -7674,6 +7741,8 @@ export default function App({
   // looks for a newer version on the server the app belongs to: now, every ten
   // minutes, and when the window comes back into view
   useEffect(() => {
+    // not before it is known what kind of app this is, the answer is different for each
+    if (!tauriKnown) return undefined;
     let stopped = false;
 
     const runningVersion = async () => {
@@ -7707,8 +7776,10 @@ export default function App({
         setCurrentVersion(running);
         setLatestVersion(latest);
         const newer = isNewerVersion(latest, running);
-        setVersionMismatch(newer);
-        if (!newer) return;
+        if (!newer) {
+          setVersionMismatch(false);
+          return;
+        }
 
         let kind = 'reload';
         if (isAndroidApp()) {
@@ -7723,6 +7794,10 @@ export default function App({
                 const verdict = JSON.parse(window.SmpNative.uiUpdateCheck(envelopeText));
                 if (verdict.ok && verdict.canApply && verdict.newer) {
                   kind = 'live';
+                  updateEnvelopeRef.current = envelopeText;
+                } else if (verdict.ok && verdict.installer && typeof window.SmpNative.appInstallStart === 'function' && isNewerVersion(verdict.latest, window.SmpNative.appVersion())) {
+                  // needs a new apk: the app downloads it from the github release and hands it to android
+                  kind = 'install';
                   updateEnvelopeRef.current = envelopeText;
                 }
               }
@@ -7741,12 +7816,17 @@ export default function App({
             if (response.ok && type.includes('application/json')) {
               const status = await response.json();
               if (status.canApply && status.newer) kind = 'live';
+              else if (status.installer && status.canInstall && status.installerNewer) kind = 'install';
             }
           } catch {
             // stays on the download page
           }
         }
-        if (!stopped) setUpdateKind(kind);
+        // the bar appears with what its button will do, not with a guess that changes a moment later
+        if (!stopped) {
+          setUpdateKind(kind);
+          setVersionMismatch(true);
+        }
       } catch (err) {
         console.log('Version check error:', err);
       }
@@ -7761,6 +7841,25 @@ export default function App({
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisible);
     };
+  }, [isTauriDesktop, tauriKnown]);
+
+  // the version of the installer this app came with, for the settings
+  useEffect(() => {
+    try {
+      if (isAndroidApp() && typeof window.SmpNative.appVersion === 'function') {
+        setShellVersion(window.SmpNative.appVersion());
+        return undefined;
+      }
+    } catch {
+      // not known
+    }
+    if (!isTauriDesktop) return undefined;
+    let stopped = false;
+    fetch('/api/version')
+      .then((response) => (response.ok && (response.headers.get('content-type') || '').includes('json') ? response.json() : null))
+      .then((body) => { if (!stopped && body && body.version) setShellVersion(String(body.version)); })
+      .catch(() => {});
+    return () => { stopped = true; };
   }, [isTauriDesktop]);
 
   // screens that were downloaded for the app are kept once this page has run for a few seconds
@@ -7773,10 +7872,128 @@ export default function App({
     return () => clearTimeout(timer);
   }, []);
 
+  // a picture for the knob: cut to the middle square and shrunk, so what is kept on this device is small
+  const handleProgressIconFile = useCallback((event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!/^image\//.test(file.type || '')) {
+      showNotification('that is not a picture', 'warning');
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const size = 128;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const side = Math.min(image.naturalWidth, image.naturalHeight);
+        canvas.getContext('2d').drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, 0, 0, size, size);
+        setProgressIconImage(canvas.toDataURL('image/png'));
+        setProgressIconMode('custom');
+      } catch {
+        showNotification('could not use that picture', 'warning');
+      }
+      URL.revokeObjectURL(url);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      showNotification('could not use that picture', 'warning');
+    };
+    image.src = url;
+  }, [showNotification]);
+
+  const cycleProgressIcon = useCallback(() => {
+    const next = progressIconMode === 'record' ? 'face' : progressIconMode === 'face' ? 'custom' : 'record';
+    setProgressIconMode(next);
+    // no picture picked yet: ask for one right away
+    if (next === 'custom' && !progressIconImage && progressIconInputRef.current) progressIconInputRef.current.click();
+  }, [progressIconMode, progressIconImage]);
+
   const applyUpdate = useCallback(async () => {
     if (updateBusy) return;
     if (updateKind === 'installer') {
       openExternalUrl(RELEASES_URL);
+      return;
+    }
+    if (updateKind === 'install') {
+      setUpdateBusy(true);
+      setUpdateProgress('');
+      const giveUp = (text) => {
+        setUpdateBusy(false);
+        setUpdateProgress('');
+        showNotification(text, 'error');
+      };
+      const began = Date.now();
+      if (isAndroidApp()) {
+        // android's installer does the replacing and asks once more, this only waits and shows how far it is
+        let started = false;
+        try {
+          started = window.SmpNative.appInstallStart(updateEnvelopeRef.current);
+        } catch {
+          started = false;
+        }
+        if (!started) {
+          giveUp('could not update, try again in a bit');
+          return;
+        }
+        const poll = setInterval(() => {
+          let progress = {};
+          try { progress = JSON.parse(window.SmpNative.appInstallState()); } catch { /* look again */ }
+          if (progress.state === 'working' && progress.total > 0) {
+            setUpdateProgress(`${Math.floor((progress.done * 100) / progress.total)}%`);
+          } else if (progress.state === 'confirm') {
+            setUpdateProgress('installing');
+          } else if (progress.state === 'needs_permission') {
+            clearInterval(poll);
+            setUpdateBusy(false);
+            setUpdateProgress('');
+            showNotification('allow installs from this app on the screen that just opened, then press update again', 'info');
+          } else if (progress.state === 'failed') {
+            clearInterval(poll);
+            giveUp(`could not update: ${progress.error || 'try again in a bit'}`);
+          } else if (progress.state === 'done') {
+            clearInterval(poll);
+          } else if (Date.now() - began > 15 * 60 * 1000) {
+            clearInterval(poll);
+            giveUp('could not update, try again in a bit');
+          }
+        }, 600);
+        return;
+      }
+      try {
+        const response = await fetch('/api/update/install', { method: 'POST' });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) {
+          giveUp('could not update, try again in a bit');
+          return;
+        }
+      } catch {
+        giveUp('could not update, try again in a bit');
+        return;
+      }
+      // the app closes by itself once the installer is on its way
+      const poll = setInterval(async () => {
+        try {
+          const state = await (await fetch('/api/update/install-state', { cache: 'no-store' })).json();
+          if (state.state === 'downloading' && state.total > 0) {
+            setUpdateProgress(`${Math.floor((state.done * 100) / state.total)}%`);
+          } else if (state.state === 'installing') {
+            setUpdateProgress('installing');
+          } else if (state.state === 'failed') {
+            clearInterval(poll);
+            giveUp(`could not update: ${state.error || 'try again in a bit'}`);
+          }
+        } catch {
+          // the app is closing
+        }
+        if (Date.now() - began > 15 * 60 * 1000) {
+          clearInterval(poll);
+          giveUp('could not update, try again in a bit');
+        }
+      }, 700);
       return;
     }
     if (updateKind !== 'live') {
@@ -9328,6 +9545,7 @@ export default function App({
         ...member,
         is_online: member.user_id === currentUserId ? isConnected : match?.is_online === true,
         listening_to: match?.listening_to || null,
+        platforms: member.user_id === currentUserId ? (isConnected ? [devicePlatform()] : []) : (match?.platforms || []),
         current_server_id: member.user_id === currentUserId
           ? currentChannelId || null
           : (match?.current_server_id || null)
@@ -9806,7 +10024,7 @@ export default function App({
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
                   <div>
-                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold' }}>{entry.username}</div>
+                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
                         ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
@@ -10020,6 +10238,7 @@ export default function App({
                     >
                       {entry.username}
                     </button>
+                    <PlatformIcons platforms={entry.platforms} />
                     <div style={{ color: entry.is_online ? '#22c55e' : '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.is_online
                         ? (entry.listening_to
@@ -10236,22 +10455,41 @@ export default function App({
                           background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`
                         }}
                       />
-                      <div
-                        className="position-absolute"
-                        style={{
-                          top: '50%',
-                          left: `${(model.progress.current / model.progress.duration) * 100}%`,
-                          transform: 'translate(-50%, -50%)',
-                          width: '52px',
-                          height: '52px',
-                          borderRadius: '50%',
-                          backgroundImage: 'url(/download.png)',
-                          backgroundSize: 'contain',
-                          backgroundRepeat: 'no-repeat',
-                          cursor: 'grab',
-                          pointerEvents: 'none'
-                        }}
-                      />
+                      {(() => {
+                        // the record unless the face or a picked picture was chosen (and exists)
+                        const knob = progressIconMode === 'face' ? 'face' : (progressIconMode === 'custom' && progressIconImage ? 'custom' : 'record');
+                        const accentColor = `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`;
+                        const knobSize = knob === 'record' ? '34px' : '52px';
+                        return (
+                          <div
+                            className="position-absolute"
+                            data-knob={knob}
+                            style={{
+                              top: '50%',
+                              left: `${(model.progress.current / model.progress.duration) * 100}%`,
+                              transform: 'translate(-50%, -50%)',
+                              width: knobSize,
+                              height: knobSize,
+                              borderRadius: '50%',
+                              backgroundImage: knob === 'face' ? 'url(/download.png)' : (knob === 'custom' ? `url(${progressIconImage})` : 'none'),
+                              backgroundSize: knob === 'custom' ? 'cover' : 'contain',
+                              backgroundPosition: 'center',
+                              backgroundRepeat: 'no-repeat',
+                              cursor: 'grab',
+                              pointerEvents: 'none'
+                            }}
+                          >
+                            {knob === 'record' && (
+                              <svg viewBox="0 0 52 52" width="100%" height="100%" style={{ display: 'block' }}>
+                                <circle cx="26" cy="26" r="24" fill="#000" stroke={accentColor} strokeWidth="2" />
+                                <circle cx="26" cy="26" r="17" fill="none" stroke={accentColor} strokeOpacity="0.25" strokeWidth="1" />
+                                <circle cx="26" cy="26" r="11" fill="none" stroke={accentColor} strokeOpacity="0.2" strokeWidth="1" />
+                                <circle cx="26" cy="26" r="6" fill={accentColor} />
+                              </svg>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
                     <div className="d-flex justify-content-between mt-1">
                       <span className="text-muted small" style={{ fontSize: '11px' }}>
@@ -10637,6 +10875,7 @@ export default function App({
                 <div style={{ minWidth: 0 }}>
                   <div style={{ color: nameColorFor(member.user_id, member.user_id === currentUserId || Boolean(member.is_online)), fontSize: '11px', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {member.username} {member.user_id === currentUserId ? '(you)' : ''}
+                    <PlatformIcons platforms={member.platforms} />
                   </div>
                   <div style={{ color: member.is_online ? '#22c55e' : '#9ca3af', fontSize: '9px', marginTop: '2px' }}>
                     {member.is_online ? 'online' : 'offline'} {member.is_admin ? '| admin' : ''}
@@ -10776,7 +11015,7 @@ export default function App({
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
                   <div>
-                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold' }}>{entry.username}</div>
+                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
                         ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
@@ -11410,6 +11649,7 @@ export default function App({
       username: chatUserPopup.username,
       joinedAt,
       status,
+      platforms: isOnline ? (member?.platforms || allUser?.platforms || []) : [],
       listeningTo: listeningActivity
         ? {
             label: formatListeningActivity(listeningActivity),
@@ -12040,7 +12280,7 @@ export default function App({
               e.currentTarget.style.color = `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`;
             }}
           >
-            {updateBusy ? 'updating...' : updateKind === 'installer' ? 'download' : updateKind === 'live' ? 'update' : 'refresh'}
+            {updateBusy ? (updateProgress ? `updating ${updateProgress}` : 'updating...') : updateKind === 'installer' ? 'download' : updateKind === 'live' || updateKind === 'install' ? 'update' : 'refresh'}
           </button>
           <button
             onClick={() => setDismissedVersion(latestVersion)}
@@ -12790,6 +13030,61 @@ export default function App({
             </div>
           )}
 
+          <div style={{ marginBottom: '15px' }}>
+            <button
+              onClick={cycleProgressIcon}
+              style={{
+                width: '100%',
+                padding: '12px',
+                background: 'transparent',
+                border: `1px solid ${dimBorderColor(themeColor)}`,
+                borderRadius: '6px',
+                color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                cursor: 'pointer',
+                fontSize: '14px'
+              }}
+            >
+              progress icon: {progressIconMode === 'custom' ? 'picture' : progressIconMode}
+            </button>
+            {progressIconMode === 'custom' && (
+              <button
+                onClick={() => progressIconInputRef.current && progressIconInputRef.current.click()}
+                style={{
+                  width: '100%',
+                  marginTop: '8px',
+                  padding: '12px',
+                  background: 'transparent',
+                  border: `1px solid ${dimBorderColor(themeColor)}`,
+                  borderRadius: '6px',
+                  color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                  cursor: 'pointer',
+                  fontSize: '14px'
+                }}
+              >
+                choose picture
+              </button>
+            )}
+            <input ref={progressIconInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleProgressIconFile} />
+          </div>
+
+          {currentVersion && (
+            <div style={{ marginBottom: '15px' }}>
+              <div
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  border: `1px solid ${dimBorderColor(themeColor)}`,
+                  borderRadius: '6px',
+                  color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                  fontSize: '14px',
+                  textAlign: 'center'
+                }}
+              >
+                version {currentVersion}{shellVersion && shellVersion !== currentVersion ? ` (app ${shellVersion})` : ''}
+              </div>
+            </div>
+          )}
+
           {versionMismatch && (
             <div style={{ marginBottom: '15px' }}>
               <button
@@ -12806,7 +13101,7 @@ export default function App({
                   fontSize: '14px'
                 }}
               >
-                {updateBusy ? 'updating...' : updateKind === 'installer' ? `download ${latestVersion}` : `update to ${latestVersion}`}
+                {updateBusy ? (updateProgress ? `updating ${updateProgress}` : 'updating...') : updateKind === 'installer' ? `download ${latestVersion}` : `update to ${latestVersion}`}
               </button>
             </div>
           )}
@@ -13063,6 +13358,7 @@ export default function App({
         >
           <div style={{ color: '#fff', fontSize: '14px', fontWeight: 'bold', marginBottom: '8px' }}>
             {chatPopupUserData.username}
+            <PlatformIcons platforms={chatPopupUserData.platforms} />
           </div>
           <div style={{ fontSize: '11px', color: '#ccc', lineHeight: '1.6' }}>
             <div><span style={{ color: '#9ca3af' }}>status:</span> <span style={{ color: chatPopupUserData.status === 'offline' ? '#9ca3af' : '#22c55e' }}>{chatPopupUserData.status}</span></div>

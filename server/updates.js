@@ -139,7 +139,11 @@ function createUpdater({ appDataDir, bundledDir, shellVersion, log = () => {}, b
       ui: uiVersion(),
       latest: manifest.version,
       newer: compareVersions(manifest.version, uiVersion()) > 0,
-      canApply: compareVersions(shellVersion, manifest.minShell || manifest.version) >= 0
+      canApply: compareVersions(shellVersion, manifest.minShell || manifest.version) >= 0,
+      // this version has an installer the app can download and run itself (see installer.js)
+      installer: Boolean(manifest.installers && manifest.installers.windows),
+      // newer than the installer this app came with, which is what an installer is compared to
+      installerNewer: compareVersions(manifest.version, shellVersion) > 0
     };
     cachedCheck = { at: Date.now(), result };
     return result;
@@ -225,7 +229,12 @@ function createUpdater({ appDataDir, bundledDir, shellVersion, log = () => {}, b
     }
   }
 
-  return { activeDir, uiVersion, check, apply, sources };
+  // the verified manifest, for the installer
+  async function manifest() {
+    return (await fetchManifest()).manifest;
+  }
+
+  return { activeDir, uiVersion, check, apply, manifest, sources };
 }
 
 module.exports = { createUpdater, compareVersions, readSignedManifest, safeRelativePath };

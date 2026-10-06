@@ -123,16 +123,16 @@ class PlaybackService : Service() {
       setCallback(object : MediaSession.Callback() {
         override fun onPlay() {
           beforePlay(this@PlaybackService)
-          Playback.command("play")
+          Playback.press(this@PlaybackService, "play")
         }
         override fun onPause() = Playback.command("pause")
         override fun onSkipToNext() {
           beforePlay(this@PlaybackService)
-          Playback.command("next")
+          Playback.press(this@PlaybackService, "next")
         }
         override fun onSkipToPrevious() {
           beforePlay(this@PlaybackService)
-          Playback.command("previous")
+          Playback.press(this@PlaybackService, "previous")
         }
         override fun onSeekTo(pos: Long) {
           val duration = NowPlaying.durationMs
@@ -257,6 +257,15 @@ class PlaybackService : Service() {
     }.start()
   }
 
+  // the notification's buttons that need the page: with the app closed they open it with the command (see PlayerWidget.control)
+  private fun control(code: Int, action: String, command: String): PendingIntent {
+    if (Playback.webView != null && Playback.pageReady) return broadcast(code, action)
+    return PendingIntent.getActivity(
+      this, 200 + code, launchIntent(this).putExtra("smp_command", command),
+      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+  }
+
   private fun broadcast(code: Int, action: String): PendingIntent = PendingIntent.getBroadcast(
     this, code,
     Intent(this, MediaActionReceiver::class.java).setAction(action).setPackage(packageName),
@@ -284,12 +293,12 @@ class PlaybackService : Service() {
       .setShowWhen(false)
       .setOngoing(NowPlaying.playing)
       .setColor(NowPlaying.accent)
-      .addAction(action(R.drawable.ic_prev, "previous", broadcast(1, MediaActionReceiver.ACTION_PREV)))
+      .addAction(action(R.drawable.ic_prev, "previous", control(1, MediaActionReceiver.ACTION_PREV, "previous")))
       .addAction(
-        if (NowPlaying.playing) action(R.drawable.ic_pause, "pause", broadcast(2, MediaActionReceiver.ACTION_TOGGLE))
-        else action(R.drawable.ic_play, "play", broadcast(2, MediaActionReceiver.ACTION_TOGGLE))
+        if (NowPlaying.playing) action(R.drawable.ic_pause, "pause", control(2, MediaActionReceiver.ACTION_TOGGLE, "pause"))
+        else action(R.drawable.ic_play, "play", control(2, MediaActionReceiver.ACTION_TOGGLE, "play"))
       )
-      .addAction(action(R.drawable.ic_next, "next", broadcast(3, MediaActionReceiver.ACTION_NEXT)))
+      .addAction(action(R.drawable.ic_next, "next", control(3, MediaActionReceiver.ACTION_NEXT, "next")))
       .setStyle(Notification.MediaStyle().setMediaSession(session.sessionToken).setShowActionsInCompactView(0, 1, 2))
     ArtLoader.cached(NowPlaying.thumbnail)?.let { builder.setLargeIcon(it) }
     return builder.build()

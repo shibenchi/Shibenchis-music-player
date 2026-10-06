@@ -161,6 +161,18 @@ class PlayerWidget : AppWidgetProvider() {
       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
     )
 
+    // a button that needs the page. with the page there it is answered at once, in the background.
+    // with the app closed there is no page, so the button opens the app with the command in it, and
+    // the app answers it as soon as it is up and goes back out of sight once the music plays. the
+    // widget is drawn again whenever the page comes or goes, so this is always the right kind
+    private fun control(context: Context, code: Int, action: String, command: String): PendingIntent {
+      if (Playback.webView != null && Playback.pageReady) return broadcast(context, code, action)
+      return PendingIntent.getActivity(
+        context, 200 + code, launchIntent(context).putExtra("smp_command", command),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+      )
+    }
+
     private fun build(context: Context): RemoteViews {
       NowPlaying.restore(context)
       val accent = NowPlaying.accent
@@ -203,9 +215,9 @@ class PlayerWidget : AppWidgetProvider() {
       views.setTextColor(R.id.widget_volume, if (NowPlaying.muted) OFF else 0xFFFEF3E2.toInt())
 
       views.setOnClickPendingIntent(R.id.widget_shuffle, broadcast(context, 10, MediaActionReceiver.ACTION_SHUFFLE))
-      views.setOnClickPendingIntent(R.id.widget_prev, broadcast(context, 11, MediaActionReceiver.ACTION_PREV))
-      views.setOnClickPendingIntent(R.id.widget_toggle, broadcast(context, 12, MediaActionReceiver.ACTION_TOGGLE))
-      views.setOnClickPendingIntent(R.id.widget_next, broadcast(context, 13, MediaActionReceiver.ACTION_NEXT))
+      views.setOnClickPendingIntent(R.id.widget_prev, control(context, 11, MediaActionReceiver.ACTION_PREV, "previous"))
+      views.setOnClickPendingIntent(R.id.widget_toggle, control(context, 12, MediaActionReceiver.ACTION_TOGGLE, if (NowPlaying.playing) "pause" else "play"))
+      views.setOnClickPendingIntent(R.id.widget_next, control(context, 13, MediaActionReceiver.ACTION_NEXT, "next"))
       views.setOnClickPendingIntent(R.id.widget_repeat, broadcast(context, 14, MediaActionReceiver.ACTION_REPEAT))
       views.setOnClickPendingIntent(R.id.widget_mute, broadcast(context, 15, MediaActionReceiver.ACTION_MUTE))
       views.setOnClickPendingIntent(R.id.widget_vol_down, broadcast(context, 16, MediaActionReceiver.ACTION_VOL_DOWN))

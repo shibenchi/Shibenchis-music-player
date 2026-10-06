@@ -715,6 +715,9 @@ function getConnectedUsers() {
     if (!client.userId || !client.username) return;
 
     const existing = connectedUsers.get(client.userId);
+    // the kinds of device (phone, computer) the person has the app open on, from every connection
+    const platforms = new Set(existing?.platforms || []);
+    if (client.platform === 'mobile' || client.platform === 'pc') platforms.add(client.platform);
     const listeningState = isListeningHidden(client.userId) ? null : (client.listeningState || existing?.listening_to || null);
     const currentServerId = client.serverId || existing?.current_server_id || null;
 
@@ -722,7 +725,8 @@ function getConnectedUsers() {
       id: client.userId,
       username: client.username,
       current_server_id: currentServerId,
-      listening_to: listeningState
+      listening_to: listeningState,
+      platforms: Array.from(platforms)
     });
   });
 
@@ -2717,10 +2721,53 @@ function updateAllowedHere(req) {
 app.get('/api/update/status', async (req, res) => {
   if (!updateAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
   try {
-    res.json({ ok: true, ...(await uiUpdater.check(req.query.force === '1')) });
+    res.json({ ok: true, ...(await uiUpdater.check(req.query.force === '1')), canInstall: Boolean(updateInstaller && updateInstaller.available) });
   } catch (error) {
     res.status(502).json({ error: error.message || 'Could not reach the update server' });
   }
+});
+// the installed app can also download a newer installer, check it against the signed manifest and
+// run it (see installer.js). only from a page on this computer: the window of the app, never
+// another website that happens to reach this port
+const updateInstallers = require('./installer');
+const updateInstaller = uiUpdater
+  ? updateInstallers.createInstaller({
+    dataDir: APP_DATA_DIR,
+    installDir: path.dirname(process.execPath),
+    appPid: process.ppid,
+    shellVersion: installerVersion,
+    getManifest: () => uiUpdater.manifest(),
+    log: (message, isError) => logToFile(message, isError),
+    // SMP_INSTALLER_URL_PREFIX and SMP_UPDATE_DRY_RUN are for testing: another address to accept
+    // the installer from, and downloading it without closing the app
+    prefixes: process.env.SMP_INSTALLER_URL_PREFIX ? process.env.SMP_INSTALLER_URL_PREFIX.split(',').map((p) => p.trim()).filter(Boolean) : undefined,
+    dryRun: process.env.SMP_UPDATE_DRY_RUN === '1'
+  })
+  : null;
+function installAllowedHere(req) {
+  if (!updateInstaller || !updateAllowedHere(req)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const host = new URL(origin).hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]' || host === '::1' || host === 'tauri.localhost';
+  } catch {
+    return false;
+  }
+}
+app.post('/api/update/install', (req, res) => {
+  if (!installAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
+  try {
+    updateInstaller.start();
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(error.code === 'busy' || error.code === 'not_installed' ? 409 : 500).json({ ok: false, code: error.code || 'failed', error: error.message || 'Could not start' });
+  }
+});
+app.get('/api/update/install-state', (req, res) => {
+  if (!installAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, ...updateInstaller.status() });
 });
 app.post('/api/update/apply', async (req, res) => {
   if (!updateAllowedHere(req)) return res.status(403).json({ error: 'Not available here' });
@@ -2881,6 +2928,7 @@ app.get('/api/users', requireAuth, (req, res) => {
         current_server_id: livePresence?.current_server_id || onlineStatus?.current_server_id || null,
         last_seen: onlineStatus?.last_seen || null,
         listening_to: livePresence?.listening_to || null,
+        platforms: livePresence?.platforms || [],
         theme_color: userThemeColors[u.id] || { r: 255, g: 89, b: 0 }
       };
     });
@@ -3915,6 +3963,16 @@ wss.on('connection', (ws, request) => {
             maybeStartSyncSession(previousServerId);
           }
           broadcastPresence();
+          break;
+        }
+
+        case 'client_info': {
+          // the kind of device this connection is on, for the icons next to the person's name
+          const platform = data.platform === 'mobile' || data.platform === 'pc' ? data.platform : null;
+          if (platform && client.platform !== platform) {
+            client.platform = platform;
+            broadcastPresence();
+          }
           break;
         }
 

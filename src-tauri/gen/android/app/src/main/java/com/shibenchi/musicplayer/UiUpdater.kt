@@ -92,7 +92,7 @@ object UiUpdater {
   }
 
   // the manifest if its signature is the maker's, null if not
-  private fun verified(envelope: String): JSONObject? {
+  fun verified(envelope: String): JSONObject? {
     val env = JSONObject(envelope)
     val text = env.getString("manifest")
     val signature = Base64.decode(env.getString("signature"), Base64.DEFAULT)
@@ -115,6 +115,8 @@ object UiUpdater {
         .put("latest", version)
         .put("newer", compareVersions(version, activeVersion(context)) > 0)
         .put("canApply", compareVersions(BuildConfig.VERSION_NAME, minShell) >= 0)
+        // this version has an apk the app can download and install itself (see AppInstaller)
+        .put("installer", manifest.optJSONObject("installers")?.optJSONObject("android") != null)
         .toString()
     } catch (e: java.security.NoSuchAlgorithmException) {
       JSONObject().put("ok", false).put("error", "this Android can not check the signature").toString()

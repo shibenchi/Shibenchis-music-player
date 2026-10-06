@@ -217,13 +217,14 @@ export function isAndroidApp() {
   return typeof window !== 'undefined' && !!window.SmpNative;
 }
 
-let lastNativeReport = { key: '', pos: 0, at: 0, playing: false };
+let lastNativeReport = { key: '', pos: 0, at: 0, playing: false, colorKey: '' };
+let colorTimer = null;
 
 // tells the native side what is playing. sendNowPlaying runs several times a
 // second while music plays, so this only passes it on when something real
 // changed (track, play or pause), when the position jumped (a seek), or every
 // ten seconds so the notification's progress bar cannot drift
-function reportToAndroid(state) {
+function reportToAndroid(state, colorSettled = false) {
   if (!isAndroidApp() || !window.SmpNative.updateState) return;
   const hasTrack = !!(state && state.title);
   const position = (state && state.currentTime) || 0;
@@ -231,9 +232,20 @@ function reportToAndroid(state) {
   const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom, !!state?.isBuffering].join('|');
   const expected = lastNativeReport.pos + (lastNativeReport.playing ? (now - lastNativeReport.at) / 1000 : 0);
   const jumped = Math.abs(position - expected) > 2.5;
-  if (key === lastNativeReport.key && !jumped && now - lastNativeReport.at < 10000) return;
-  lastNativeReport = { key, pos: position, at: now, playing: !!state?.isPlaying };
   const color = state?.themeColor;
+  const colorKey = color ? `${color.r},${color.g},${color.b}` : '';
+  if (key === lastNativeReport.key && !jumped && now - lastNativeReport.at < 10000) {
+    if (colorKey === lastNativeReport.colorKey) return;
+    if (!colorSettled) {
+      // only the theme color moved (a slider drag sends dozens of them): one report once it stops,
+      // so the widget and the notification follow the color without redrawing for every step
+      clearTimeout(colorTimer);
+      colorTimer = setTimeout(() => reportToAndroid(state, true), 300);
+      return;
+    }
+  }
+  clearTimeout(colorTimer);
+  lastNativeReport = { key, pos: position, at: now, playing: !!state?.isPlaying, colorKey };
   try {
     window.SmpNative.updateState(JSON.stringify({
       hasTrack,

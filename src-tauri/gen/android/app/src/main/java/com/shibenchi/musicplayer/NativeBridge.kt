@@ -90,15 +90,77 @@ object Playback {
   @Volatile var activity: WeakReference<MainActivity>? = null
   @Volatile var inPip = false
 
+  // the page has loaded and reported a track, so it can answer a command. false while the app is closed
+  @Volatile var pageReady = false
+  // a button was pressed while there was no page to answer it (the app was closed). the command waits
+  // here until the page has loaded its last track, and the app goes back out of sight once the music
+  // plays (unless the person touched the app in the meantime)
+  @Volatile private var pending: String? = null
+  @Volatile private var pendingUntil = 0L
+  // until when the app goes back out of sight by itself once the music plays, 0 when it should not
+  @Volatile var minimizeUntil = 0L
+  private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
   fun js(code: String) {
     val view = webView ?: return
-    view.post { view.evaluateJavascript(code, null) }
+    // a page whose screen is hidden is paused by android and runs nothing, so a button on the widget or
+    // the notification did nothing until the app was opened. it is woken for the command
+    view.post {
+      view.onResume()
+      view.resumeTimers()
+      view.evaluateJavascript(code, null)
+    }
   }
 
   // name is previous, next, play, pause or seek (arg is 0..1 of the track)
   fun command(name: String, arg: Double? = null) {
     val extra = if (arg != null) ",$arg" else ""
     js("window.__smpNativeCommand&&window.__smpNativeCommand('$name'$extra)")
+  }
+
+  // the command is run as soon as the page can answer it
+  fun commandWhenReady(name: String) {
+    if (webView != null && pageReady) {
+      command(name)
+      return
+    }
+    pending = name
+    pendingUntil = SystemClock.elapsedRealtime() + 30_000
+    minimizeUntil = SystemClock.elapsedRealtime() + 40_000
+    Log.i("SmpBridge", "no page yet, $name waits for it")
+  }
+
+  // called with every report of the page. the first one that has a track in it means the page is up
+  fun onPageReport(hasTrack: Boolean) {
+    if (!hasTrack) return
+    pageReady = true
+    val name = pending ?: return
+    pending = null
+    if (SystemClock.elapsedRealtime() > pendingUntil) return
+    Log.i("SmpBridge", "the page is up, running $name")
+    // a moment for the page to finish setting the track up
+    main.postDelayed({ command(name) }, 500)
+  }
+
+  // a button from outside the page (widget, notification, lock screen): answered by the page when it
+  // is there, otherwise the app is opened and answers it as soon as it is up
+  fun press(context: Context, name: String) {
+    if (webView != null && pageReady) {
+      command(name)
+      return
+    }
+    commandWhenReady(name)
+    try {
+      context.startActivity(launchIntent(context))
+    } catch (e: Exception) {
+      Log.w("SmpBridge", "could not open the app for a button: ${e.message}")
+    }
+  }
+
+  // the app screen is gone (closed, or replaced): there is no page any more
+  fun pageGone() {
+    webView = null
+    pageReady = false
   }
 }
 
@@ -145,10 +207,20 @@ class NativeBridge(private val context: Context) {
       o.optJSONArray("accent")?.let { a ->
         if (a.length() == 3) NowPlaying.accent = 0xFF000000.toInt() or (a.optInt(0) shl 16) or (a.optInt(1) shl 8) or a.optInt(2)
       }
+      // first, so the widget and the notification drawn below already know the page is up (a command
+      // that waited for it is run here too)
+      Playback.onPageReport(NowPlaying.hasTrack)
       NowPlaying.save(context)
       PlaybackService.sync(context)
       PlayerWidget.refresh(context)
       FloatingPlayer.sync(context)
+      // the app going back out of sight when a button on the widget or the notification had to open it
+      // to start the music
+      if (NowPlaying.playing && !wasPlaying && SystemClock.elapsedRealtime() < Playback.minimizeUntil) {
+        Playback.minimizeUntil = 0L
+        Log.i("SmpBridge", "the music started from a button, the app goes back out of sight (screen: ${Playback.activity?.get() != null})")
+        Playback.activity?.get()?.let { screen -> screen.runOnUiThread { screen.moveTaskToBack(true) } }
+      }
       Playback.activity?.get()?.let { activity ->
         // asked once, the first time something plays, so the media controls can show
         if (NowPlaying.playing && !wasPlaying && !askedForNotifications) {
@@ -188,6 +260,19 @@ class NativeBridge(private val context: Context) {
   // the version of the screens on screen
   @JavascriptInterface
   fun uiVersion(): String = UiUpdater.activeVersion(context)
+
+  // the version of the app itself (the apk), which can be older than the screens
+  @JavascriptInterface
+  fun appVersion(): String = BuildConfig.VERSION_NAME
+
+  // downloads the apk of the newest version (the signed list says where it is and what its hash
+  // is) and hands it to android's installer, returns at once
+  @JavascriptInterface
+  fun appInstallStart(envelope: String): Boolean = AppInstaller.start(context, envelope)
+
+  // idle, working (done and total bytes), needs_permission, confirm, done or failed (error)
+  @JavascriptInterface
+  fun appInstallState(): String = AppInstaller.state()
 
   @JavascriptInterface
   fun setFloatingEnabled(on: Boolean) {
@@ -314,7 +399,7 @@ class MediaActionReceiver : BroadcastReceiver() {
     PlayerWidget.refresh(context)
   }
 
-  private fun pageIsThere() = Playback.webView != null
+  private fun pageIsThere() = Playback.webView != null && Playback.pageReady
 
   override fun onReceive(context: Context, intent: Intent) {
     when (intent.action) {
@@ -390,11 +475,7 @@ class MediaActionReceiver : BroadcastReceiver() {
 
   // with no page to answer (the app was closed) the best a button can do is open it
   private fun send(context: Context, command: String) {
-    if (Playback.webView != null) {
-      Playback.command(command)
-      return
-    }
-    context.startActivity(launchIntent(context))
+    Playback.press(context, command)
   }
 }
 
