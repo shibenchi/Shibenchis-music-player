@@ -250,8 +250,28 @@ function createPresence({ clientId = DEFAULT_CLIENT_ID, log = () => {}, ipcPaths
     if (flushTimer.unref) flushTimer.unref();
   }
 
+  // one update at a time. two updates in a row (the page sends "clear" and then what plays within a few
+  // milliseconds of each other when it opens) started two of these while Discord was still being connected to,
+  // the first one sent both, the second found nothing left to send and crashed the whole server on it
+  let flushing = false;
   async function flush() {
     flushTimer = null;
+    if (flushing) { schedule(50); return; }
+    if (pending === undefined) return;
+    flushing = true;
+    try {
+      await flushOnce();
+    } catch (error) {
+      // whatever goes wrong here must never take the server down with it
+      lastError = String((error && error.message) || error);
+      log(`[DISCORD] update failed: ${lastError}`);
+      if (pending !== undefined) schedule(retryMs);
+    } finally {
+      flushing = false;
+    }
+  }
+
+  async function flushOnce() {
     if (pending === undefined) return;
     const wait = lastSentAt + minGapMs - Date.now();
     if (wait > 0) { schedule(wait); return; }
@@ -260,6 +280,8 @@ function createPresence({ clientId = DEFAULT_CLIENT_ID, log = () => {}, ipcPaths
       if (pending !== undefined) schedule(retryMs);
       return;
     }
+    // what was to be shown may have been sent by then
+    if (pending === undefined) return;
     const sending = pending;
     pending = undefined;
     lastSentAt = Date.now();

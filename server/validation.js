@@ -258,9 +258,13 @@ function createAuthTokenStore(getStorage = null) {
 }
 
 // keys whose values never go into a log file
+// what the request log never writes down: logins, and what people write to each other (a direct message or
+// a channel message is in the body of its request as "message" or "text")
 const SECRET_KEYS = new Set([
   'password', 'newpassword', 'currentpassword', 'confirmpassword',
-  'token', 'authtoken', 'sid', 'sessionid', 'secret', 'apikey'
+  'token', 'authtoken', 'sid', 'sessionid', 'secret', 'apikey',
+  'message', 'text', 'content', 'wrapped_private',
+  'code', 'state', 'access_token', 'refresh_token'
 ]);
 
 function redactForLog(value, depth = 0) {

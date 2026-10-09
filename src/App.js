@@ -7,6 +7,8 @@ import PipPlayer from './PipPlayer';
 import Marquee from './Marquee';
 import { applyAppIconColor } from './appIcon';
 import { isAndroidApp, onPictureInPicture, isTauriApp, sendNowPlaying, sendVisualizerFrame, onMiniplayerControl, onMiniplayerReady, saveFileWithDialog, getDefaultDownloadsDir, chooseDownloadsFolder, saveFileToFolder, applyShortcutPrefs, frontendLog, openExternalUrl, pickTextFile, setMiniplayerEnabled } from './tauriApi';
+import { createE2e, e2eSupported, isEnvelope } from './e2e';
+import { pickWithRecencyPenalty, recordPlayed } from './shuffle';
 import {
   buildSharedPlayerUpdate,
   getSharedResumeTime,
@@ -204,6 +206,15 @@ const SVGIcons = {
     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <line x1="5" y1="12" x2="19" y2="12" />
       <polyline points="12 5 19 12 12 19" />
+    </svg>
+  ),
+  queueAdd: (
+    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="3" y1="6" x2="15" y2="6" />
+      <line x1="3" y1="12" x2="11" y2="12" />
+      <line x1="3" y1="18" x2="11" y2="18" />
+      <line x1="18" y1="12" x2="18" y2="20" />
+      <line x1="14" y1="16" x2="22" y2="16" />
     </svg>
   ),
   settings: (
@@ -546,8 +557,9 @@ function parseCsvText(text) {
 }
 
 const CSV_HEADER_ALIASES = {
-  title: ['title', 'song', 'track', 'name', 'track name', 'song name'],
-  author: ['artist', 'author', 'channel', 'artists'],
+  // the names that other tools use (Exportify, TuneMyMusic, Soundiiz) are in too
+  title: ['title', 'song', 'track', 'name', 'track name', 'song name', 'track title', 'track_name'],
+  author: ['artist', 'author', 'channel', 'artists', 'artist name', 'artist names', 'artist name(s)', 'artist(s)', 'artist_name'],
   videoId: ['videoid', 'video id', 'youtube id', 'youtubeid', 'id'],
   url: ['url', 'link', 'youtube url', 'youtube link'],
   durationMs: ['duration', 'duration (sec)', 'duration_sec', 'length', 'duration (ms)']
@@ -733,6 +745,28 @@ function formatLastActive(timestamp, isOnline = false) {
   return `active ${date.toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
 }
 
+// "offline since 3h ago", the exact time is on the line as a tooltip. only an admin is ever told when others were last seen
+// 3725 -> "1h 2m"
+function formatListenTime(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours >= 100) return hours + 'h';
+  if (hours > 0) return hours + 'h ' + minutes + 'm';
+  if (minutes > 0) return minutes + 'm';
+  return total + 's';
+}
+
+function formatOfflineSince(timestamp) {
+  if (!timestamp) return 'offline, never seen';
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - Number(timestamp));
+  if (seconds < 60) return 'offline since just now';
+  if (seconds < 3600) return `offline since ${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `offline since ${Math.floor(seconds / 3600)}h ago`;
+  if (seconds < 604800) return `offline since ${Math.floor(seconds / 86400)}d ago`;
+  return `offline since ${new Date(Number(timestamp) * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' })}`;
+}
+
 function toIsoTimestamp(value) {
   const numericTimestamp = Number(value);
   if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
@@ -742,6 +776,10 @@ function toIsoTimestamp(value) {
   const timestampMs = numericTimestamp < 1e12 ? numericTimestamp * 1000 : numericTimestamp;
   return new Date(timestampMs).toISOString();
 }
+
+const E2E_LOCKED_NOTE = '[private message, unlock your messages to read it]';
+const E2E_UNREADABLE_NOTE = '[private message that can not be opened]';
+const E2E_CHANGED_NOTE = '[private message, their security key changed]';
 
 function normalizeDirectMessageRecord(message) {
   if (!message || typeof message !== 'object') return null;
@@ -918,6 +956,22 @@ async function probeLocalHelper(force = false) {
   return _localHelperProbe;
 }
 
+// is this video still on YouTube? the page asks YouTube itself: 'gone' when it says there is no such video, 'there' for
+// any other answer, 'offline' when nothing answers (a bad connection is not taken for a missing song)
+async function probeYoutube(videoId) {
+  if (!/^[\w-]{11}$/.test(String(videoId || ''))) return 'there';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId), { signal: controller.signal, cache: 'no-store' });
+    return response.status === 404 ? 'gone' : 'there';
+  } catch {
+    return 'offline';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function resolveApiTarget(url) {
   if (isMediaEndpoint(url) && await probeLocalHelper()) {
     return {
@@ -985,7 +1039,8 @@ async function fetchJson(url, options = {}) {
   }
   if (target.isSocial) {
     fetchOptions.credentials = 'include';
-    fetchOptions.headers = { ...(fetchOptions.headers || {}), 'X-Client-Id': CLIENT_ID };
+    // X-SMP-E2E: this app can open private (end to end encrypted) messages, an older one is sent a note instead
+    fetchOptions.headers = { ...(fetchOptions.headers || {}), 'X-Client-Id': CLIENT_ID, ...(e2eSupported() ? { 'X-SMP-E2E': '1' } : {}) };
     const authToken = typeof window !== 'undefined' ? window.localStorage.getItem('music_auth_token') : null;
     if (authToken) {
       fetchOptions.headers = {
@@ -1050,8 +1105,10 @@ function readStoredJson(storageKey, fallback) {
 
 const SOCIAL_LAYOUT_DEFAULTS = {
   online: 'left',
+  friends: 'left',
   messages: 'right',
-  requests: 'left'
+  requests: 'left',
+  allUsers: 'left'
 };
 
 // the home tab's panels and which column each starts in
@@ -1066,7 +1123,7 @@ const MAIN_LAYOUT_DEFAULTS = {
 // this is the order down the page
 const DEFAULT_PANEL_ORDERS = {
   main: ['search', 'queue', 'player', 'playlists'],
-  social: ['online', 'messages', 'requests'],
+  social: ['online', 'friends', 'messages', 'requests'],
   collab: ['setup', 'queue', 'chat', 'player', 'collabplaylists']
 };
 
@@ -1081,7 +1138,9 @@ const PANEL_LABELS = {
   social: {
     online: ['online', 'who is online'],
     messages: ['messages', 'your conversations'],
-    requests: ['requests', 'friend requests']
+    friends: ['friends', 'your friends, when they were last on, and adding people'],
+    requests: ['requests', 'friend requests and invites to rooms'],
+    allUsers: ['offline', 'who is offline and since when (admins only)']
   },
   collab: {
     setup: ['channels', 'create or join a channel, and its members'],
@@ -1229,21 +1288,29 @@ function ResizableListGroup({ storageKey, defaultHeight, minHeight = 120, childr
     const startHeight = Math.max(minHeight, listRef.current ? listRef.current.getBoundingClientRect().height : height);
     let latest = startHeight;
 
-    const onMove = (moveEvent) => {
-      latest = Math.max(minHeight, Math.min(2400, startHeight + (moveEvent.clientY - startY)));
-      setHeight(latest);
-    };
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
+    // the height is written as it changes, so it is the one that was left even when the release is never seen
+    // (the pointer let go outside of the window, or the browser cancelled the drag)
+    const remember = () => {
       try {
         localStorage.setItem(`music_list_height:${storageKey}`, String(Math.round(latest)));
       } catch {
         // not being able to remember it is fine
       }
     };
+    const onMove = (moveEvent) => {
+      latest = Math.max(minHeight, Math.min(2400, startHeight + (moveEvent.clientY - startY)));
+      setHeight(latest);
+      remember();
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+      remember();
+    };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   return (
@@ -1415,6 +1482,7 @@ const PlaylistTrackRow = React.memo(function PlaylistTrackRow({
   offlineMode = false,
   offline = false,
   onToggleOffline = null,
+  onAddToQueue = null,
   dimmed = false
 }) {
   return (
@@ -1495,6 +1563,33 @@ const PlaylistTrackRow = React.memo(function PlaylistTrackRow({
           </div>
         </div>
       </div>
+      {onAddToQueue && (
+        <div className="btn-group" style={{ position: 'relative', zIndex: 10, marginLeft: '12px', flexShrink: 0 }}>
+          <Button
+            variant="outline-light"
+            size="sm"
+            type="button"
+            className="btn"
+            data-tooltip="add to queue"
+            title="add to queue"
+            onClick={(e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              onAddToQueue(track);
+            }}
+            style={{
+              borderRadius: '6px',
+              color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+              border: `1px solid ${dimBorderColor(themeColor)}`,
+              background: 'transparent',
+              transition: 'none',
+              padding: '4px 8px'
+            }}
+          >
+            {SVGIcons.queueAdd}
+          </Button>
+        </div>
+      )}
     </ListGroup.Item>
   );
 });
@@ -1700,6 +1795,9 @@ export default function App({
   const [playIndex, setPlayIndex] = useState(() => readLocalJSON(`music_queue_state:${user?.id || 'guest'}`, {}).playIndex ?? -1);
   const playIndexRef = useRef(playIndex);
   const queueRef = useRef(queue);
+  // what was played lately (ids in the order they were played), so a shuffle does not bring back what was just heard
+  const soloHistoryRef = useRef([]);
+  const roomHistoryRef = useRef([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [shuffle, setShuffle] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).shuffle ?? false);
   const [repeatMode, setRepeatMode] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).repeatMode ?? 'off');
@@ -1746,6 +1844,27 @@ export default function App({
   const [editingPlaylistId, setEditingPlaylistId] = useState(null);
   const [playlistImport, setPlaylistImport] = useState(null); // { total, done, label } while running
   const importCancelRef = useRef(false);
+  // the connected YouTube account (playlists can be sent to it), an export that is running or just ended, the Spotify link box
+  const [integrations, setIntegrations] = useState({});
+  const [playlistExportJob, setPlaylistExportJob] = useState(null); // { provider, done, total } while it runs
+  const [playlistExportDone, setPlaylistExportDone] = useState(null); // { provider, url, line } after it
+  // the import panel under the playlist ('spotify' or 'youtube'), what is typed in it, and the person's own playlists at the service
+  const [importPanel, setImportPanel] = useState(null);
+  const [spotifyUrl, setSpotifyUrl] = useState('');
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [importLists, setImportLists] = useState({}); // { spotify: { state: 'loading' | 'ok' | 'error', items, code, message } }
+  // Shibby asks before an account is connected for the first time (and once more after a no)
+  const [shibbyConnect, setShibbyConnect] = useState(null); // { provider, kind: 'first' | 'again' }
+  const shibbyConnectResolveRef = useRef(null);
+  // Shibby saying something that is not about a song or a first connection: { key, text, buttons: [{ label, value }], narrow }
+  const [shibbyTalk, setShibbyTalk] = useState(null);
+  const shibbyTalkResolveRef = useRef(null);
+  const [playlistNotice, setPlaylistNotice] = useState(null); // { kind: 'working' | 'ok' | 'error', text } for an import
+  // Shibby: a song in the queue that can not be played, and what to do about it. { videoId, title, author, state: 'ask' | 'searching' | 'nothing' }
+  const [shibby, setShibby] = useState(null);
+  const shibbyRef = useRef(null);
+  const shibbyOpenRef = useRef(() => false);
+  const unavailableIdsRef = useRef(new Set());
 
   
   const [suggestions, setSuggestions] = useState([]);
@@ -2002,6 +2121,13 @@ export default function App({
   const [allUsers, setAllUsers] = useState([]);
   const [friendsList, setFriendsList] = useState([]);
   const [pendingFriendRequests, setPendingFriendRequests] = useState([]);
+  const [sentFriendRequests, setSentFriendRequests] = useState([]);
+  const [roomInvites, setRoomInvites] = useState([]);
+  const [statsRange, setStatsRange] = useState('week');
+  const [statsData, setStatsData] = useState(null);
+  const [statsBoard, setStatsBoard] = useState([]);
+  const [statsFailed, setStatsFailed] = useState(false);
+  const [statsRetry, setStatsRetry] = useState(0);
   const [friendRequestActionIds, setFriendRequestActionIds] = useState([]);
   const [conversationList, setConversationList] = useState(() => {
     const stored = localStorage.getItem(`music_conversation_list:${user?.id || 'guest'}`);
@@ -2466,9 +2592,12 @@ export default function App({
     cursor: 'pointer'
   };
 
+  // one timer for the toast on screen: an older toast's timer used to take a newer toast away early
+  const toastTimerRef = useRef(null);
   const showNotification = useCallback((message, variant = 'info') => {
     setShowToast({ message, variant });
-    setTimeout(() => setShowToast(null), 3000);
+    clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setShowToast(null), 3000);
     addDebugLog('ui', `toast: ${variant}`, { message }, variant === 'error');
   }, [addDebugLog]);
 
@@ -2567,6 +2696,112 @@ export default function App({
     return () => clearInterval(timer);
   }, [isConnected, user, currentTrack, isPlaying, playbackSource, deviceInfo]);
 
+  // ---- private (end to end encrypted) direct messages, see e2e.js
+  // off: not signed in, or this app can not do it. locked: this device does not have the account's key yet, the
+  // password brings it. ready: messages are locked and opened here
+  const [e2eState, setE2eState] = useState('off');
+  const [e2eEpoch, setE2eEpoch] = useState(0);
+  const [e2ePassword, setE2ePassword] = useState('');
+  const [e2eBusy, setE2eBusy] = useState(false);
+  const e2eRef = useRef(null);
+  useEffect(() => {
+    // signing in set the key up in the background
+    const again = () => setE2eEpoch((n) => n + 1);
+    window.addEventListener('smp-e2e-changed', again);
+    return () => window.removeEventListener('smp-e2e-changed', again);
+  }, []);
+  useEffect(() => {
+    if (!currentUserId || !e2eSupported()) {
+      e2eRef.current = null;
+      setE2eState('off');
+      return undefined;
+    }
+    let cancelled = false;
+    const e2e = createE2e({
+      userId: currentUserId,
+      api: {
+        get: (path) => fetchJson(path),
+        put: (path, body) => fetchJson(path, { method: 'PUT', body: JSON.stringify(body) })
+      }
+    });
+    e2eRef.current = e2e;
+    if (!e2e.ready) {
+      setE2eState('locked');
+      return () => { cancelled = true; };
+    }
+    e2e.check()
+      .then((ok) => { if (!cancelled) setE2eState(ok ? 'ready' : 'locked'); })
+      // no connection: the device keeps working with the key it has
+      .catch(() => { if (!cancelled) setE2eState('ready'); });
+    return () => { cancelled = true; };
+  }, [currentUserId, e2eEpoch]);
+
+  // the stats tab: the person's own numbers and the friends list, again every half minute while it is open
+  useEffect(() => {
+    if (activeTab !== 'stats' || !currentUserId) return undefined;
+    let cancelled = false;
+    const tz = -new Date().getTimezoneOffset();
+    const load = async () => {
+      fetchJson('/api/stats/friends?range=' + statsRange + '&tz=' + tz)
+        .then((friends) => { if (!cancelled) setStatsBoard(Array.isArray(friends.board) ? friends.board : []); })
+        .catch(() => { /* the board on screen stays */ });
+      try {
+        const mine = await fetchJson('/api/stats?range=' + statsRange + '&tz=' + tz);
+        if (cancelled) return;
+        setStatsData(mine.stats || null);
+        setStatsFailed(!mine.stats);
+      } catch (error) {
+        // the numbers on screen stay, and when there are none yet the page says so
+        if (!cancelled) setStatsFailed(true);
+      }
+    };
+    load();
+    const timer = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [activeTab, currentUserId, statsRange, statsRetry]);
+
+  // signing out: the opened copies of the messages go from this device together with the key
+  const hadUserRef = useRef(false);
+  useEffect(() => {
+    if (currentUserId) {
+      hadUserRef.current = true;
+      return;
+    }
+    if (!hadUserRef.current) return;
+    hadUserRef.current = false;
+    setDmMessages({});
+    setConversationList([]);
+    setSelectedConversationId('');
+  }, [currentUserId]);
+
+  // a message as the server has it -> the same message with its text opened (or a note saying why not)
+  const openDirectRecord = useCallback(async (record) => {
+    if (!record || !isEnvelope(record.message)) return record;
+    const e2e = e2eRef.current;
+    if (!e2e || !e2e.ready) return { ...record, message: E2E_LOCKED_NOTE };
+    try {
+      return { ...record, message: await e2e.decrypt(record.message, record.sender_id, record.receiver_id) };
+    } catch (error) {
+      return { ...record, message: error && error.code === 'key_changed' ? E2E_CHANGED_NOTE : E2E_UNREADABLE_NOTE };
+    }
+  }, []);
+  const openDirectRecordRef = useRef(openDirectRecord);
+  openDirectRecordRef.current = openDirectRecord;
+
+  const unlockPrivateMessages = useCallback(async () => {
+    const e2e = e2eRef.current;
+    if (!e2e || !e2ePassword || e2eBusy) return;
+    setE2eBusy(true);
+    try {
+      await e2e.setup(e2ePassword);
+      setE2ePassword('');
+      setE2eState('ready');
+    } catch (error) {
+      showNotification(/wrong password/.test((error && error.message) || '') ? 'wrong password' : 'could not unlock, try again in a bit', 'warning');
+    }
+    setE2eBusy(false);
+  }, [e2eBusy, e2ePassword, showNotification]);
+
   const pushDirectMessage = useCallback((rawMessage, options = {}) => {
     const message = normalizeDirectMessageRecord(rawMessage);
     if (!message) return null;
@@ -2614,10 +2849,18 @@ export default function App({
     }
   }, [currentUserId]);
 
+  // a list that is asked for twice in a row can be answered out of order, and the older answer must not
+  // replace the newer one (a request that came in a moment ago was shown as nothing)
+  const friendsAskedRef = useRef(0);
+  const requestsAskedRef = useRef(0);
+  const invitesAskedRef = useRef(0);
+
   const refreshFriends = useCallback(async () => {
     if (!currentUserId) return;
+    const asked = ++friendsAskedRef.current;
     try {
       const data = await fetchJson('/api/friends');
+      if (asked !== friendsAskedRef.current) return;
       const next = Array.isArray(data.friends) ? data.friends : [];
       if (next.length > 0 || data.friends) setFriendsList(next);
     } catch (error) {
@@ -2627,28 +2870,60 @@ export default function App({
 
   const refreshPendingFriendRequests = useCallback(async () => {
     if (!currentUserId) return;
+    const asked = ++requestsAskedRef.current;
     try {
       const data = await fetchJson('/api/friends/requests');
+      if (asked !== requestsAskedRef.current) return;
       const next = Array.isArray(data.requests) ? data.requests : [];
       if (next.length > 0 || data.requests) setPendingFriendRequests(next);
+      if (Array.isArray(data.sent)) {
+        setSentFriendRequests(data.sent);
+        // what the server lists is the truth: a request that was answered or taken back is not "requested" any more
+        setPendingFriendTargetIds((prev) => prev.filter((id) => data.sent.some((request) => request.receiver_id === id)));
+      }
     } catch (error) {
       // silent fail
     }
   }, [currentUserId]);
 
+  const refreshInvites = useCallback(async () => {
+    if (!currentUserId) return;
+    const asked = ++invitesAskedRef.current;
+    try {
+      const data = await fetchJson('/api/invites');
+      if (asked !== invitesAskedRef.current) return;
+      if (Array.isArray(data.invites)) setRoomInvites(data.invites);
+    } catch (error) {
+      // silent fail
+    }
+  }, [currentUserId]);
+
+  // which requests are being answered right now. kept in a ref: the answer to "can this start" has to be known at
+  // once, and a state updater is not guaranteed to run before the next line (accept did nothing when it did not)
+  const friendActionsRef = useRef(new Set());
+  const refreshIntegrations = useCallback(async () => {
+    if (!currentUserId) {
+      setIntegrations({});
+      return {};
+    }
+    try {
+      const data = await fetchJson('/api/integrations');
+      setIntegrations(data.providers || {});
+      return data.providers || {};
+    } catch (error) {
+      return {};
+    }
+  }, [currentUserId]);
+
   const beginFriendRequestAction = useCallback((requestId) => {
-    let started = false;
-    setFriendRequestActionIds((prev) => {
-      if (prev.includes(requestId)) {
-        return prev;
-      }
-      started = true;
-      return [...prev, requestId];
-    });
-    return started;
+    if (friendActionsRef.current.has(requestId)) return false;
+    friendActionsRef.current.add(requestId);
+    setFriendRequestActionIds((prev) => (prev.includes(requestId) ? prev : [...prev, requestId]));
+    return true;
   }, []);
 
   const finishFriendRequestAction = useCallback((requestId) => {
+    friendActionsRef.current.delete(requestId);
     setFriendRequestActionIds((prev) => prev.filter((id) => id !== requestId));
   }, []);
 
@@ -2659,7 +2934,18 @@ export default function App({
 
     try {
       const data = await fetchJson('/api/messages/conversations');
-      const next = Array.isArray(data?.conversations) ? data.conversations : [];
+      const rows = Array.isArray(data?.conversations) ? data.conversations : [];
+      // the last message of a chat is shown in the list, opened like the rest
+      const next = await Promise.all(rows.map(async (entry) => {
+        if (!isEnvelope(entry.last_message)) return entry;
+        const senderId = entry.last_sender_id;
+        const opened = await openDirectRecordRef.current({
+          message: entry.last_message,
+          sender_id: senderId,
+          receiver_id: senderId === currentUserId ? entry.user_id : currentUserId
+        });
+        return { ...entry, last_message: opened.message };
+      }));
       setConversationList((prev) => {
         const merged = normalizeConversationList(next, prev);
         // a chat that was just opened has no messages yet, so the server does not list it.
@@ -2702,13 +2988,15 @@ export default function App({
     try {
       addDebugLog('api', 'loading conversation messages', { targetUserId }, true);
       const data = await fetchJson(`/api/messages/${encodeURIComponent(targetUserId)}`);
-      const nextMessages = (Array.isArray(data?.messages) ? data.messages : [])
+      const opened = await Promise.all((Array.isArray(data?.messages) ? data.messages : []).map((row) => openDirectRecordRef.current(row)));
+      const nextMessages = opened
         .map(normalizeDirectMessageRecord)
         .filter(Boolean);
 
       setDmMessages((prev) => {
         const existing = prev[targetUserId] || [];
-        if (existing.length === nextMessages.length && existing.every((message, index) => message.id === nextMessages[index]?.id)) {
+        // same ids is not enough: a message that was shown as locked is the same message once it is opened
+        if (existing.length === nextMessages.length && existing.every((message, index) => message.id === nextMessages[index]?.id && message.message === nextMessages[index]?.message)) {
           return prev;
         }
         return { ...prev, [targetUserId]: nextMessages };
@@ -2803,6 +3091,17 @@ export default function App({
       });
     }
     await loadConversationMessages(targetUserId, options);
+    // on a phone the chat sits below the list that this button is in, out of sight, so nothing seemed to
+    // happen. it is brought into view (nothing moves when it is already there, as on a computer)
+    if (options.notify) {
+      setTimeout(() => {
+        const panel = document.querySelector('[data-panel="social-messages"]');
+        if (!panel) return;
+        const top = panel.getBoundingClientRect().top;
+        if (top >= 0 && top < (window.innerHeight || 0) * 0.5) return;
+        panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 150);
+    }
   }, [loadConversationMessages]);
 
   const openUserProfileCard = useCallback((event, targetUser) => {
@@ -2849,6 +3148,9 @@ export default function App({
 
     addDebugLog('social', 'sending friend request over http', { targetUserId, targetUsername }, true);
 
+    // the button says "requested" at once, and goes back if the server says no
+    setPendingFriendTargetIds((prev) => (prev.includes(targetUserId) ? prev : [...prev, targetUserId]));
+
     try {
       await fetchJson('/api/friends/request', {
         method: 'POST',
@@ -2873,6 +3175,7 @@ export default function App({
       });
       addDebugLog('error', 'friend request failed', { targetUserId, error: error.message || String(error) }, true);
       showNotification(error.message || 'failed to send friend request', 'warning');
+      setPendingFriendTargetIds((prev) => prev.filter((id) => id !== targetUserId));
       await refreshPendingFriendRequests();
       await refreshFriends();
     }
@@ -2941,6 +3244,41 @@ export default function App({
     }
   }, [addDebugLog, beginFriendRequestAction, finishFriendRequestAction, refreshPendingFriendRequests, showNotification]);
 
+  // taking back a request that was sent
+  const cancelFriendRequest = useCallback(async (requestId) => {
+    if (!requestId) return;
+    try {
+      await fetchJson('/api/friends/requests/' + encodeURIComponent(requestId), { method: 'DELETE' });
+    } catch (error) {
+      showNotification(error.message || 'could not take the request back', 'warning');
+    }
+    await refreshPendingFriendRequests();
+  }, [refreshPendingFriendRequests, showNotification]);
+
+  // a friend is asked to come to the room that is open
+  const inviteFriendToRoom = useCallback(async (friend) => {
+    if (!currentChannelId || !friend?.id) return;
+    try {
+      await fetchJson('/api/servers/' + encodeURIComponent(currentChannelId) + '/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: friend.id })
+      });
+      showNotification('invited ' + (friend.username || 'your friend'), 'success');
+    } catch (error) {
+      showNotification(error.message || 'could not send the invite', 'warning');
+    }
+  }, [currentChannelId, showNotification]);
+
+  const declineRoomInvite = useCallback(async (inviteId) => {
+    setRoomInvites((prev) => prev.filter((invite) => invite.id !== inviteId));
+    try {
+      await fetchJson('/api/invites/' + encodeURIComponent(inviteId) + '/decline', { method: 'POST' });
+    } catch (error) {
+      refreshInvites();
+    }
+  }, [refreshInvites]);
+
   const sendDmMessage = useCallback(async () => {
     const text = dmText.trim();
     if (!selectedConversationId || !text) return;
@@ -2957,6 +3295,23 @@ export default function App({
 
     if (!targetUsername) {
       showNotification('could not find user', 'warning');
+      return;
+    }
+
+    // locked here with a key only the two people have. what goes to the server is ciphertext
+    const e2e = e2eRef.current;
+    let outgoing = text;
+    if (e2e && e2e.ready) {
+      try {
+        outgoing = await e2e.encrypt(selectedConversationId, text, currentUserId, selectedConversationId);
+      } catch (error) {
+        if (error && error.code === 'peer_no_key') showNotification(`${targetUsername} has to update the app before private messages work`, 'warning');
+        else if (error && error.code === 'key_changed') showNotification(`the security key of ${targetUsername} changed, the message was not sent`, 'warning');
+        else showNotification('could not lock the message, try again', 'warning');
+        return;
+      }
+    } else if (e2eState === 'locked') {
+      showNotification('enter your password under the messages to unlock private messages', 'warning');
       return;
     }
 
@@ -2984,8 +3339,7 @@ export default function App({
     addDebugLog('social', 'sending dm over http', {
       conversationId: selectedConversationId,
       targetUsername,
-      clientMessageId,
-      text
+      clientMessageId
     }, true);
 
     try {
@@ -2994,9 +3348,10 @@ export default function App({
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ text, sender_theme_color: { r: themeColor.r, g: themeColor.g, b: themeColor.b } })
+        body: JSON.stringify({ text: outgoing, sender_theme_color: { r: themeColor.r, g: themeColor.g, b: themeColor.b } })
       });
-      const deliveredMessage = normalizeDirectMessageRecord(data.message);
+      // what the server sends back is the envelope, the text is known here
+      const deliveredMessage = normalizeDirectMessageRecord(outgoing === text ? data.message : { ...data.message, message: text });
       if (deliveredMessage) {
         pushDirectMessage(deliveredMessage, { clientMessageId });
       }
@@ -3011,7 +3366,14 @@ export default function App({
       }
       showNotification(error.message || 'failed to send message', 'warning');
     }
-  }, [addDebugLog, allUsers, currentUserId, currentUsername, dmText, pushDirectMessage, selectedConversationId, showNotification, upsertConversationPreview]);
+  }, [addDebugLog, allUsers, currentUserId, currentUsername, dmText, e2eState, pushDirectMessage, selectedConversationId, showNotification, upsertConversationPreview]);
+
+  // once the key is on this device, chats that were shown as locked are fetched and opened again
+  useEffect(() => {
+    if (e2eState !== 'ready' || !currentUserId) return;
+    refreshConversations();
+    if (selectedConversationRef.current) loadConversationMessages(selectedConversationRef.current);
+  }, [e2eState, currentUserId]);
 
   const joinChannel = useCallback(async (channel, code = '', options = {}) => {
     const targetChannel = typeof channel === 'string'
@@ -3057,10 +3419,20 @@ export default function App({
 
       await refreshChannels();
       await refreshUsers();
+      return true;
     } catch (error) {
       showNotification(error.message || 'failed to join channel', 'warning');
+      return false;
     }
   }, [channels, currentUserId, loadChannelState, markChannelRead, refreshChannels, refreshUsers, sendWsMessage, showNotification]);
+
+  // an invite is answered by joining: it is what lets a person into a private room without its code
+  const acceptRoomInvite = useCallback(async (invite) => {
+    if (!invite?.server_id) return;
+    const joined = await joinChannel({ id: invite.server_id, name: invite.server_name }, '');
+    await refreshInvites();
+    if (joined) setActiveTab('collab');
+  }, [joinChannel, refreshInvites]);
 
   // once the channels are known after opening the app: back into the one that was open
   const autoRejoinTriedRef = useRef(false);
@@ -3782,7 +4154,7 @@ export default function App({
   // (sliders, the seek bar, text boxes, lists that scroll sideways) or near the
   // screen edge where the phone's own back gesture lives
   useEffect(() => {
-    const order = ['main', 'social', 'collab'];
+    const order = ['main', 'social', 'collab', 'stats'];
     const ease = 'transform 240ms cubic-bezier(0.22, 0.61, 0.36, 1)';
     let start = null;
     let settling = false;
@@ -3963,6 +4335,8 @@ export default function App({
     // so conversations/messages are ready when user switches to social tab
     refreshFriends();
     refreshPendingFriendRequests();
+    refreshInvites();
+    refreshIntegrations();
     refreshConversations();
     if (selectedConversationRef.current) {
       loadConversationMessages(selectedConversationRef.current);
@@ -3981,6 +4355,8 @@ export default function App({
     refreshChannels,
     refreshConversations,
     refreshFriends,
+    refreshIntegrations,
+    refreshInvites,
     refreshPendingFriendRequests,
     refreshUsers
   ]);
@@ -4232,20 +4608,22 @@ export default function App({
               break;
 
             case 'direct_message': {
-              const delivered = pushDirectMessage(data.message);
-              if (
-                delivered
-                && delivered.message.sender_id !== currentUserId
-                && delivered.message.unread
-              ) {
-                showNotification(`new DM from ${delivered.message.sender_username}`, 'info');
-                playNotifSound();
-              }
+              openDirectRecordRef.current(data.message).then((opened) => {
+                const delivered = pushDirectMessage(opened);
+                if (
+                  delivered
+                  && delivered.message.sender_id !== currentUserId
+                  && delivered.message.unread
+                ) {
+                  showNotification(`new DM from ${delivered.message.sender_username}`, 'info');
+                  playNotifSound();
+                }
+              });
               break;
             }
 
             case 'direct_message_ack':
-              pushDirectMessage(data.message, { clientMessageId: data.clientMessageId });
+              openDirectRecordRef.current(data.message).then((opened) => pushDirectMessage(opened, { clientMessageId: data.clientMessageId }));
               break;
 
             case 'server_created':
@@ -4548,7 +4926,27 @@ export default function App({
             case 'friend_accepted':
               showNotification(`${data.from} accepted your friend request`, 'success');
               refreshFriends();
+              refreshPendingFriendRequests();
               refreshUsers();
+              break;
+
+            case 'friend_request_cancelled':
+              refreshPendingFriendRequests();
+              break;
+
+            case 'friend_removed':
+              refreshFriends();
+              refreshUsers();
+              break;
+
+            case 'room_invite':
+              if (data.invite && data.invite.id) {
+                // a list that was asked for before this arrived must not replace it
+                invitesAskedRef.current += 1;
+                setRoomInvites((prev) => [data.invite, ...prev.filter((invite) => invite.id !== data.invite.id)]);
+                showNotification((data.invite.from_username || 'a friend') + ' invited you to ' + (data.invite.server_name || 'a room'), 'info');
+                playNotifSound();
+              }
               break;
 
             case 'friend_declined':
@@ -5020,6 +5418,8 @@ export default function App({
 
   const playTrackAtIndex = useCallback(async (index, trackList = null, options = {}) => {
     console.log('[PLAYTRACK] playTrackAtIndex called', { index, trackList: !!trackList, options });
+    shibbyRef.current = null;
+    setShibby(null);
     const nextSource = options.source || (trackList === channelQueueRef.current ? 'shared' : 'personal');
     const shouldAutoplay = options.autoplay !== false;
     const shouldNotify = options.notify !== false;
@@ -5063,6 +5463,7 @@ export default function App({
 
     const rawItem = list[index];
     const track = normalizeTrack(rawItem);
+    if (nextSource !== 'shared') recordPlayed(soloHistoryRef.current, track.videoId);
     const rawVideoId = rawItem?.videoId || rawItem?.video_id || rawItem?.id || '(none)';
     
     const audio = audioRef.current;
@@ -5219,26 +5620,65 @@ export default function App({
           }, delayMs);
         } else {
           addDebugLog('error', `stream timeout: failed to load ${track.title} after ${MAX_STREAM_RETRIES} retries`, { videoId: track.videoId, readyState: audio.readyState }, true);
-          showNotification(`failed to load: ${track.title}`, 'error');
           setIsPlaying(false);
           setIsBuffering(false);
 
-          audio._consecutiveFailures = (audio._consecutiveFailures || 0) + 1;
-          if (audio._consecutiveFailures >= 3) {
-            audio._consecutiveFailures = 0;
-            showNotification('stopped: 3 songs in a row would not load. check your connection', 'error');
-            return;
+          const giveUp = () => {
+            showNotification(`failed to load: ${track.title}`, 'error');
+            audio._consecutiveFailures = (audio._consecutiveFailures || 0) + 1;
+            if (audio._consecutiveFailures >= 3) {
+              audio._consecutiveFailures = 0;
+              showNotification('stopped: 3 songs in a row would not load. check your connection', 'error');
+              return;
+            }
+            // only skip if nothing else was started in the meantime, or this
+            // jumps past a track the user just picked
+            setTimeout(() => {
+              if (requestSerial !== playRequestSerialRef.current) return;
+              handleNextRef.current();
+            }, 1000);
+          };
+          // online, Shibby asks what to do with a song that will not load. with no connection (or in a room) it is the plain way
+          if (nextSource !== 'shared') {
+            probeYoutube(track.videoId).then((state) => {
+              if (requestSerial !== playRequestSerialRef.current) return;
+              if (state !== 'offline' && shibbyOpenRef.current(track)) {
+                audio.pause();
+                audio.removeAttribute('src');
+                delete audio.dataset.lastSrc;
+                audio.load();
+                audio._consecutiveFailures = 0;
+                return;
+              }
+              giveUp();
+            });
+          } else {
+            giveUp();
           }
-
-          // only skip if nothing else was started in the meantime, or this
-          // jumps past a track the user just picked
-          setTimeout(() => {
-            if (requestSerial !== playRequestSerialRef.current) return;
-            handleNextRef.current();
-          }, 1000);
         }
       }
     }, 15000);
+
+    // a song that YouTube itself says does not exist is not worth waiting out the retries for
+    if (nextSource !== 'shared') {
+      setTimeout(async () => {
+        // only while this very song is still what the element is trying to load (an error, a stop or a delete took the source away)
+        if (requestSerial !== playRequestSerialRef.current || audio.readyState > 0 || !audio.getAttribute('src') || document.hidden) return;
+        if ((await probeYoutube(track.videoId)) !== 'gone') return;
+        if (requestSerial !== playRequestSerialRef.current || audio.readyState > 0 || !audio.getAttribute('src')) return;
+        if (audio._loadTimeout) {
+          clearTimeout(audio._loadTimeout);
+          audio._loadTimeout = null;
+        }
+        audio.pause();
+        audio.removeAttribute('src');
+        delete audio.dataset.lastSrc;
+        audio.load();
+        setIsPlaying(false);
+        setIsBuffering(false);
+        shibbyOpenRef.current(track);
+      }, 6000);
+    }
 
     const resumeAudioContext = async () => {
       initAudioContext();
@@ -5404,6 +5844,8 @@ export default function App({
       setIsPlaying(true);
       setIsBuffering(false);
       setBufferStage('');
+      // the phone is told the sound really runs (see buildNowPlayingPayload)
+      window.dispatchEvent(new Event('smp-audio-state'));
       // the retry budget is for one bad stretch, not for a whole song. it only
       // got reset when a new track started, so a few unrelated hiccups spread
       // over a long song used up all the retries and then skipped the track.
@@ -5430,6 +5872,7 @@ export default function App({
     };
 
     const onPause = () => {
+      window.dispatchEvent(new Event('smp-audio-state'));
       // save the solo spot on pause no matter what caused it
       if (audio.currentTime > 0 && !audio.ended && Number.isFinite(audio.currentTime)) {
         personalPlayerStateRef.current = {
@@ -5608,9 +6051,30 @@ export default function App({
         return;
       }
 
+      const failedSerial = playRequestSerialRef.current;
+
+      // a song that never got going and was refused (not on YouTube any more, private, blocked where this computer
+      // is) is not "a slow connection": Shibby asks what to do with it. with no connection at all, or when nobody
+      // can see a popup, it is the plain way: say so, and move on
+      if (errorCode === 4 && playedSeconds < 1) {
+        const refused = currentTrack;
+        probeYoutube(refused && refused.videoId).then((state) => {
+          if (failedSerial !== playRequestSerialRef.current) return;
+          if (state !== 'offline' && shibbyOpenRef.current(refused)) {
+            audio._consecutiveFailures = 0;
+            return;
+          }
+          showNotification(`"${refused?.title || 'that song'}" is not available on youtube, skipping it`, 'warning');
+          setTimeout(() => {
+            if (failedSerial !== playRequestSerialRef.current) return;
+            handleNextRef.current();
+          }, 1000);
+        });
+        return;
+      }
+
       // personal mode - skip to next track after a short delay, unless the
       // user (or a second error) already started something else
-      const failedSerial = playRequestSerialRef.current;
       setTimeout(() => {
         if (failedSerial !== playRequestSerialRef.current) return;
         handleNextRef.current();
@@ -6938,9 +7402,8 @@ export default function App({
     if (auto && repeat === 'one' && current >= 0) return { track: list[current] };
     if (state?.shuffle && direction > 0) {
       if (list.length === 1) return { track: list[0] };
-      let pick = Math.floor(Math.random() * list.length);
-      if (pick === current) pick = (pick + 1) % list.length;
-      return { track: list[pick] };
+      const pick = pickWithRecencyPenalty(list, (track) => track.id, roomHistoryRef.current, state?.current_track_id);
+      return { track: list[pick >= 0 ? pick : 0] };
     }
     let next = current >= 0 ? current + direction : 0;
     if (next >= list.length) {
@@ -6950,6 +7413,15 @@ export default function App({
     if (next < 0) next = list.length - 1;
     return { track: list[next] };
   }, []);
+
+  // the room's history of what was played: every device sees the same current song, so every device has the same list
+  const roomCurrentTrackId = channelPlayerState ? channelPlayerState.current_track_id : null;
+  useEffect(() => {
+    roomHistoryRef.current = [];
+  }, [currentChannelId]);
+  useEffect(() => {
+    if (roomCurrentTrackId) recordPlayed(roomHistoryRef.current, roomCurrentTrackId);
+  }, [roomCurrentTrackId]);
 
   const stepSharedPlayback = useCallback(async (direction) => {
     if (!currentChannelId || !channelQueue.length) return;
@@ -7130,7 +7602,7 @@ export default function App({
 
   // which kind of device this is, for the icons next to people's names
   useEffect(() => {
-    if (isConnected) sendWsMessage({ type: 'client_info', platform: devicePlatform() });
+    if (isConnected) sendWsMessage({ type: 'client_info', platform: devicePlatform(), e2e: e2eSupported() });
   }, [isConnected, sendWsMessage]);
 
   // === shared player sync - kicks in once the client's switched to shared playback ===
@@ -7391,7 +7863,9 @@ export default function App({
     while (picks.length < count && candidates.length) {
       const last = picks.length ? picks[picks.length - 1] : anchorVideoId;
       const pool = candidates.length > 1 ? candidates.filter((track) => track.videoId !== last) : candidates;
-      picks.push(pool[Math.floor(Math.random() * pool.length)].videoId);
+      // the picks made ahead count as played, so they are not picked again at once either
+      const at = pickWithRecencyPenalty(pool, (track) => track.videoId, [...soloHistoryRef.current, ...picks], last);
+      picks.push(pool[Math.max(0, at)].videoId);
     }
     shufflePlanRef.current = { anchor: anchorVideoId, picks };
     return picks.map((id) => list.find((track) => track.videoId === id)).filter(Boolean);
@@ -7457,7 +7931,7 @@ export default function App({
         planned = list.findIndex((track) => track.videoId === plan.picks[0]);
         if (planned >= 0) shufflePlanRef.current = { anchor: plan.picks[0], picks: plan.picks.slice(1) };
       }
-      nextIndex = planned >= 0 ? planned : Math.floor(Math.random() * list.length);
+      nextIndex = planned >= 0 ? planned : Math.max(0, pickWithRecencyPenalty(list, (track) => track.videoId, soloHistoryRef.current, here));
     } else {
       if (nextIndex >= list.length) {
         if (repeatMode === 'all') {
@@ -7685,13 +8159,33 @@ export default function App({
   // plays (the same relay that shows it in the app), so that is shown when nothing plays here
   const discordRemoteRef = useRef(null);
   discordRemoteRef.current = remoteNow;
+  const discordQueueRef = useRef({ last: 0, timer: null, body: null });
   useEffect(() => {
     if (!discordAvailable) return undefined;
-    const post = (body) => fetch('/api/discord/activity', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    }).catch(() => {});
+    // updates are spaced, and only the newest of a burst is sent. the local server of the installers up to 1.4.4
+    // crashed when two updates came within the moment it took to connect to Discord (the page sends "clear"
+    // and, as soon as it knows what the phone plays, the song, a few milliseconds apart), and with it went
+    // everything else that server does
+    const post = (body) => {
+      const queue = discordQueueRef.current;
+      queue.body = body;
+      if (queue.timer) return;
+      const sendNewest = () => {
+        queue.timer = null;
+        const next = queue.body;
+        queue.body = null;
+        if (!next) return;
+        queue.last = Date.now();
+        fetch('/api/discord/activity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(next)
+        }).catch(() => {});
+      };
+      const wait = queue.last ? Math.max(0, queue.last + 2500 - Date.now()) : 0;
+      if (wait === 0) sendNewest();
+      else queue.timer = setTimeout(sendNewest, wait);
+    };
     const ownPlaying = Boolean(currentTrack && currentTrack.title && isPlaying);
     const remotePlayingNow = !ownPlaying && Boolean(remotePlaying && discordRemoteRef.current && discordRemoteRef.current.track && discordRemoteRef.current.track.title);
     const ownPaused = Boolean(currentTrack && currentTrack.title) && !ownPlaying && !remotePlayingNow;
@@ -8127,6 +8621,9 @@ export default function App({
           thumbnail: getTrackThumbnail(track),
           videoId: track.videoId || '',
           isPlaying: isPlayingRef.current,
+          // the page says "playing" the moment play is pressed, this is the sound actually running. the
+          // phone's widget uses it to know a play press that the page could not carry out
+          running: Boolean(audioRef.current && audioRef.current.src && !audioRef.current.paused && !audioRef.current.ended),
           currentTime: trackProgressRef.current.current,
           duration: trackProgressRef.current.duration,
           themeColor: themeColorRef.current,
@@ -8160,10 +8657,34 @@ export default function App({
     return onMiniplayerReady(() => sendNowPlaying(buildNowPlayingPayload()));
   }, [buildNowPlayingPayload]);
 
+  // the sound started or stopped (the audio element says so, the page's idea of "playing" can be ahead of it)
+  useEffect(() => {
+    const send = () => sendNowPlaying(buildNowPlayingPayload());
+    window.addEventListener('smp-audio-state', send);
+    return () => window.removeEventListener('smp-audio-state', send);
+  }, [buildNowPlayingPayload]);
+
   useEffect(() => {
     return onMiniplayerControl((action) => {
       if (action === 'toggle') togglePlayPause();
-      else if (action === 'play') { if (!isPlayingRef.current) togglePlayPause(); }
+      else if (action === 'play') {
+        if (!isPlayingRef.current) togglePlayPause();
+        // a play from outside the page (the widget, the notification) that the sound does not follow is asked
+        // again, and when the system still refuses it the page says "paused" instead of showing "playing"
+        // over silence
+        setTimeout(() => {
+          const audio = audioRef.current;
+          if (!audio || !audio.src || !audio.paused || audio.ended || playbackSourceRef.current === 'shared') return;
+          audio.play().catch(() => {});
+          setTimeout(() => {
+            const again = audioRef.current;
+            if (again && again.paused && !again.ended && isPlayingRef.current && playbackSourceRef.current !== 'shared') {
+              setIsPlaying(false);
+              window.dispatchEvent(new Event('smp-audio-state'));
+            }
+          }, 2000);
+        }, 1200);
+      }
       else if (action === 'pause') { if (isPlayingRef.current) togglePlayPause(); }
       else if (action === 'next') handleNext();
       else if (action === 'previous') handlePrevious();
@@ -8537,6 +9058,173 @@ export default function App({
     }
   };
 
+  // ---- the YouTube account (the server does the talking to it, see server/integrations.js)
+  // the sign in page opens in the browser, the server hears back from it, and this waits to see the account connected
+  const connectConsentKey = (provider) => `smp_connect_ok:${currentUserId || 'guest'}:${provider}`;
+  const askBeforeConnecting = (provider) => new Promise((resolve) => {
+    let saved = null;
+    try { saved = localStorage.getItem(connectConsentKey(provider)); } catch { saved = null; }
+    if (saved === 'yes') {
+      resolve(true);
+      return;
+    }
+    if (shibbyConnectResolveRef.current) shibbyConnectResolveRef.current(false);
+    shibbyConnectResolveRef.current = resolve;
+    playNotifSound();
+    setShibbyConnect({ provider, kind: saved === 'no' ? 'again' : 'first' });
+  });
+  const answerShibbyConnect = (yes) => {
+    const note = shibbyConnect;
+    const resolve = shibbyConnectResolveRef.current;
+    shibbyConnectResolveRef.current = null;
+    setShibbyConnect(null);
+    if (note) {
+      try { localStorage.setItem(connectConsentKey(note.provider), yes ? 'yes' : 'no'); } catch { /* asked again next time */ }
+    }
+    if (resolve) resolve(yes);
+  };
+
+  // Shibby says something and waits for a button: resolves with the value of the button (null when something else was said)
+  const shibbyTalkAsk = (content) => new Promise((resolve) => {
+    if (shibbyTalkResolveRef.current) shibbyTalkResolveRef.current(null);
+    shibbyTalkResolveRef.current = resolve;
+    playNotifSound();
+    setShibbyTalk(content);
+  });
+  const answerShibbyTalk = (value) => {
+    const resolve = shibbyTalkResolveRef.current;
+    shibbyTalkResolveRef.current = null;
+    setShibbyTalk(null);
+    if (resolve) resolve(value);
+  };
+  const shibbySay = (text, key = 'info') => shibbyTalkAsk({ key, text, buttons: [{ label: 'ok', value: true }] });
+
+  // the sign in is done in the browser: wait for the account to show as connected. a problem that the server heard about ends
+  // the wait with Shibby saying so. when nothing is heard for a minute Shibby asks: a Google account that is not on the list
+  // of test users is stopped on Google's own page and never comes back here
+  const connectProvider = async (provider) => {
+    if (!(await askBeforeConnecting(provider))) return false;
+    try {
+      const data = await fetchJson('/api/integrations/' + provider + '/connect', { method: 'POST' });
+      await openExternalUrl(data.url);
+    } catch (error) {
+      showNotification(error.message || 'could not start the sign in', 'warning');
+      return false;
+    }
+    showNotification('finish signing in in your browser', 'info');
+    const askAfter = Math.max(1, Math.round((Number(typeof window !== 'undefined' && window.__smpSignInAskSeconds) || 60) / 2));
+    let asked = false;
+    for (let i = 0; i < 90; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const now = await refreshIntegrations();
+      if (now[provider] && now[provider].connected) {
+        showNotification('connected to ' + provider, 'success');
+        return true;
+      }
+      const problem = now[provider] && now[provider].problem;
+      if (problem === 'cancelled') {
+        showNotification('cancelled, nothing was connected', 'info');
+        return false;
+      }
+      if (problem) {
+        shibbySay('yo bro, google did not accept the sign in. try again in a minute', 'sign-in-failed');
+        return false;
+      }
+      if (!asked && i + 1 >= askAfter) {
+        asked = true;
+        const keep = await shibbyTalkAsk({
+          key: 'sign-in-waiting',
+          text: 'still waiting for the sign in. if google says "access blocked", this app is still in testing and your google account is not on the list yet. ask shibenchi to add your google email as a test user, then try again. if you are just taking your time, keep waiting',
+          buttons: [{ label: 'keep waiting', value: true }, { label: 'stop waiting', value: false }]
+        });
+        if (keep === false) return false;
+      }
+    }
+    showNotification('the sign in did not finish', 'warning');
+    return false;
+  };
+
+  const disconnectProvider = async (provider) => {
+    try {
+      await fetchJson('/api/integrations/' + provider, { method: 'DELETE' });
+    } catch (error) {
+      showNotification(error.message || 'could not disconnect', 'warning');
+    }
+    await refreshIntegrations();
+  };
+
+  // the open playlist becomes a playlist in the person's own YouTube account
+  const exportPlaylistToService = async (provider) => {
+    const playlist = activePlaylists.find((item) => item.id === currentPlaylistId);
+    if (!playlist || !currentTracks.length) {
+      showNotification('playlist is empty, nothing to export', 'warning');
+      return;
+    }
+    if (!currentUserId) {
+      showNotification('sign in first', 'warning');
+      return;
+    }
+    if (playlistExportJob) return;
+    const info = integrations[provider];
+    if (!info || !info.connected) {
+      const connected = await connectProvider(provider);
+      if (!connected) return;
+    }
+    setPlaylistExportDone(null);
+    setPlaylistExportJob({ provider, done: 0, total: currentTracks.length });
+    try {
+      const started = await fetchJson('/api/export/' + provider, {
+        method: 'POST',
+        body: JSON.stringify({ name: playlist.name, tracks: currentTracks.map((track) => ({ title: track.title, author: track.author, videoId: track.videoId })) })
+      });
+      let job = null;
+      for (let i = 0; i < 1200; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const data = await fetchJson('/api/export/jobs/' + started.jobId);
+        job = data.job;
+        setPlaylistExportJob({ provider, done: job.done, total: job.total });
+        if (job.state !== 'running') break;
+      }
+      if (!job || job.state === 'running') throw new Error('it is taking too long, look on ' + provider + ' later');
+      if (job.state === 'failed') {
+        if (job.code === 'not_connected') refreshIntegrations();
+        throw Object.assign(new Error(job.error || 'the export did not work'), { code: job.code });
+      }
+      const result = job.result;
+      const notFound = Array.isArray(result.missing) ? result.missing.length : (result.skipped || 0) + (result.failed || 0);
+      const line = result.added + ' of ' + result.total + ' songs added' + (notFound ? ', ' + notFound + ' not found' : '') + (result.quota ? ", i've run out of youtube quota for the day, i'm sorry" : '');
+      setPlaylistExportDone({ provider, url: result.url, line });
+      addDebugLog('playlist', 'exported "' + playlist.name + '" to ' + provider, { added: result.added, total: result.total }, true);
+      showNotification(line, result.added ? (notFound || result.quota ? 'warning' : 'success') : 'error');
+    } catch (error) {
+      const message = (error && error.message) || 'the export did not work';
+      // the message stays on the page (a toast is gone after three seconds)
+      setPlaylistExportDone({ provider, url: '', line: message, error: true });
+      showNotification(message, 'error');
+    } finally {
+      setPlaylistExportJob(null);
+    }
+  };
+
+  // no account needed: YouTube opens the first 50 songs as a list that can be saved there
+  const openPlaylistOnYoutube = () => {
+    const ids = [...new Set(currentTracks.map((track) => track.videoId).filter((id) => /^[\w-]{11}$/.test(id)))];
+    if (!ids.length) {
+      showNotification('nothing in this playlist is on youtube', 'warning');
+      return;
+    }
+    // youtube takes 50 songs in one link: every 50 songs is a list, and each can be saved as a playlist on youtube
+    const lists = [];
+    for (let i = 0; i < ids.length; i += 50) lists.push(ids.slice(i, i + 50));
+    const shown = lists.slice(0, 8);
+    shown.forEach((list, index) => {
+      setTimeout(() => openExternalUrl('https://www.youtube.com/watch_videos?video_ids=' + list.join(',')), index * 400);
+    });
+    if (lists.length > 1) {
+      showNotification(shown.length < lists.length ? `opened ${shown.length} lists of 50 songs, the playlist has more than that` : `opened ${shown.length} lists of up to 50 songs, save each one as a playlist on youtube`, 'info');
+    }
+  };
+
   // csv rows rarely carry a videoId, so most imported entries need an
   // actual youtube search to resolve - this runs those sequentially
   // (not in parallel) so a 300-track csv doesn't just fire 300 requests
@@ -8545,6 +9233,7 @@ export default function App({
   const resolvePendingTracks = async (pending, onProgress) => {
     const resolved = [];
     const unmatched = [];
+    let failed = 0; // looking it up did not work at all (not "found nothing")
     for (let i = 0; i < pending.length; i++) {
       if (importCancelRef.current) break;
       const entry = pending[i];
@@ -8571,10 +9260,11 @@ export default function App({
           unmatched.push(entry);
         }
       } catch {
+        failed += 1;
         unmatched.push(entry);
       }
     }
-    return { resolved, unmatched };
+    return { resolved, unmatched, failed };
   };
 
   const importPlaylistFromFile = async () => {
@@ -8637,10 +9327,27 @@ export default function App({
     }
 
     addDebugLog('playlist', `importing ${pending.length} tracks from ${file.name}`, { exactCount, needsSearch: pending.length - exactCount }, true);
+    await runPendingImport(pending, playlist, file.name);
+  };
+
+  // a playlist of its own, selected, with a name that no other playlist has
+  const createPlaylistNamed = (wanted) => {
+    const base = String(wanted || '').trim().toLowerCase().slice(0, 100) || 'spotify playlist';
+    const taken = new Set(playlists.map((item) => String(item.name).toLowerCase()));
+    let name = base;
+    for (let n = 2; taken.has(name) && n < 1000; n += 1) name = base + ' ' + n;
+    const created = { id: generateId(), name, tracks: [] };
+    setPlaylists((prev) => [...prev, created]);
+    setCurrentPlaylistId(created.id);
+    return created;
+  };
+
+  // the songs of a file or of a Spotify playlist are looked up (one by one) and added to the playlist
+  const runPendingImport = async (pending, playlist, sourceLabel, note = '') => {
     importCancelRef.current = false;
     setPlaylistImport({ total: pending.length, done: 0, label: 'starting...' });
 
-    const { resolved, unmatched } = await resolvePendingTracks(pending, (done, label) => {
+    const { resolved, unmatched, failed } = await resolvePendingTracks(pending, (done, label) => {
       setPlaylistImport({ total: pending.length, done, label });
     });
 
@@ -8654,17 +9361,155 @@ export default function App({
       ));
     }
 
-    addDebugLog('playlist', `import finished: ${resolved.length} added, ${unmatched.length} unmatched`, {
+    addDebugLog('playlist', `import from ${sourceLabel} finished: ${resolved.length} added, ${unmatched.length} unmatched`, {
       unmatchedTitles: unmatched.slice(0, 20).map((u) => u.title || u.videoId)
     }, true);
 
-    if (unmatched.length) {
-      showNotification(`imported ${resolved.length}/${pending.length} tracks, ${unmatched.length} couldn't be matched`, resolved.length ? 'warning' : 'error');
+    const cancelled = importCancelRef.current;
+    let summary;
+    if (cancelled) {
+      summary = `stopped, ${resolved.length} of ${pending.length} songs are in "${playlist.name}"`;
+      showNotification(summary, 'warning');
+    } else if (!resolved.length) {
+      summary = failed === pending.length
+        ? `could not look any of the ${pending.length} songs up, is the app's helper running? "${playlist.name}" is empty`
+        : `none of the ${pending.length} ${pending.length === 1 ? 'song' : 'songs'} could be matched, "${playlist.name}" is empty`;
+      showNotification(summary, 'error');
+    } else if (unmatched.length) {
+      summary = `"${playlist.name}" has ${resolved.length} of ${pending.length} songs, ${unmatched.length} couldn't be matched${note ? ', ' + note : ''}`;
+      showNotification(`imported ${resolved.length}/${pending.length} tracks, ${unmatched.length} couldn't be matched${note ? ', ' + note : ''}`, resolved.length ? 'warning' : 'error');
     } else {
-      showNotification(`imported ${resolved.length} tracks into "${playlist.name}"`, 'success');
+      summary = `"${playlist.name}" has all ${resolved.length} songs${note ? ', ' + note : ''}`;
+      showNotification(`imported ${resolved.length} tracks into "${playlist.name}"${note ? ', ' + note : ''}`, note ? 'warning' : 'success');
     }
+    setPlaylistNotice({ kind: resolved.length ? 'ok' : 'error', text: summary });
   };
 
+
+  // a Spotify playlist opens as a playlist of its own, and every step says what it is doing
+  const importSpotifyPlaylist = async (picked) => {
+    const url = (typeof picked === 'string' ? picked : spotifyUrl).trim();
+    if (!url || playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
+    if (!currentUserId) {
+      showNotification('sign in first', 'warning');
+      return;
+    }
+    setPlaylistNotice({ kind: 'working', text: 'reading the spotify playlist' });
+    let data = null;
+    try {
+      data = await fetchJson('/api/import/spotify', { method: 'POST', body: JSON.stringify({ url }) });
+    } catch (error) {
+      const message = (error && error.message) || 'could not read that playlist';
+      setPlaylistNotice({ kind: 'error', text: message });
+      showNotification(message, 'error');
+      return;
+    }
+    if (!data || !Array.isArray(data.tracks) || !data.tracks.length) {
+      setPlaylistNotice({ kind: 'error', text: 'there are no songs in that playlist that could be read' });
+      return;
+    }
+    setImportPanel(null);
+    setSpotifyUrl('');
+    const pending = data.tracks.map((track) => ({ title: track.title, author: track.author, videoId: '', durationMs: track.durationMs || 0 }));
+    const playlist = createPlaylistNamed(data.name || 'spotify playlist');
+    setPlaylistNotice({ kind: 'working', text: 'found ' + pending.length + (pending.length === 1 ? ' song' : ' songs') + ', looking them up for "' + playlist.name + '"' });
+    await runPendingImport(pending, playlist, 'spotify', data.partial ? 'only the first ' + data.tracks.length + ' songs could be read' : '');
+  };
+
+  // a playlist of the person's own YouTube account: the video ids are known, so nothing has to be looked up
+  const importYoutubeFromAccount = async (item) => {
+    if (playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
+    setPlaylistNotice({ kind: 'working', text: `reading "${item.name}" from youtube` });
+    let data = null;
+    try {
+      data = await fetchJson('/api/import/youtube', { method: 'POST', body: JSON.stringify({ playlistId: item.id }) });
+    } catch (error) {
+      const message = (error && error.message) || 'could not read that playlist';
+      if (error && error.responseData && error.responseData.code === 'not_connected') refreshIntegrations();
+      setPlaylistNotice({ kind: 'error', text: message });
+      showNotification(message, 'error');
+      return;
+    }
+    setImportPanel(null);
+    const pending = data.tracks.map((track) => ({ title: track.title, author: track.author, videoId: track.videoId, durationMs: 0 }));
+    const playlist = createPlaylistNamed(data.name || item.name);
+    const notes = [];
+    if (data.skipped) notes.push(`${data.skipped} deleted or private ${data.skipped === 1 ? 'song was' : 'songs were'} left out`);
+    if (data.partial) notes.push(`only the first ${data.tracks.length} songs were read`);
+    setPlaylistNotice({ kind: 'working', text: `adding ${pending.length} ${pending.length === 1 ? 'song' : 'songs'} to "${playlist.name}"` });
+    await runPendingImport(pending, playlist, 'youtube', notes.join(', '));
+  };
+
+  // a YouTube playlist link, for the person who has not connected an account (the helper of the computer reads it)
+  const importYoutubeLink = async () => {
+    if (playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
+    const listId = extractYouTubePlaylistId(youtubeUrl);
+    if (!listId) {
+      setPlaylistNotice({ kind: 'error', text: 'that is not a link to a youtube playlist' });
+      return;
+    }
+    setPlaylistNotice({ kind: 'working', text: 'reading the youtube playlist' });
+    let data = null;
+    try {
+      data = await fetchJson(`/api/playlist?list=${encodeURIComponent(listId)}`);
+    } catch (error) {
+      const message = (error && error.message) || 'could not read that playlist';
+      setPlaylistNotice({ kind: 'error', text: message });
+      showNotification(message, 'error');
+      return;
+    }
+    const items = Array.isArray(data && data.items) ? data.items : [];
+    if (!items.length) {
+      setPlaylistNotice({ kind: 'error', text: 'there are no songs in that playlist that could be read' });
+      return;
+    }
+    setImportPanel(null);
+    setYoutubeUrl('');
+    const pending = items.map((track) => ({ title: track.title, author: track.author, videoId: track.videoId, durationMs: 0 }));
+    const playlist = createPlaylistNamed(data.title || 'youtube playlist');
+    setPlaylistNotice({ kind: 'working', text: `adding ${pending.length} ${pending.length === 1 ? 'song' : 'songs'} to "${playlist.name}"` });
+    await runPendingImport(pending, playlist, 'youtube');
+  };
+
+  const loadImportList = useCallback(async (provider) => {
+    setImportLists((prev) => ({ ...prev, [provider]: { state: 'loading', items: [] } }));
+    try {
+      const data = await fetchJson(`/api/import/${provider}/playlists`);
+      setImportLists((prev) => ({ ...prev, [provider]: { state: 'ok', items: Array.isArray(data.playlists) ? data.playlists : [] } }));
+    } catch (error) {
+      const code = error && error.responseData && error.responseData.code;
+      if (code === 'not_connected') refreshIntegrations();
+      setImportLists((prev) => ({ ...prev, [provider]: { state: 'error', items: [], code, message: (error && error.message) || 'could not load your playlists' } }));
+    }
+  }, [refreshIntegrations]);
+
+  // the list loads when the panel opens on an account that is connected
+  const importPanelConnected = importPanel ? Boolean(integrations[importPanel] && integrations[importPanel].configured && integrations[importPanel].connected) : false;
+  useEffect(() => {
+    if (importPanel && importPanelConnected) loadImportList(importPanel);
+  }, [importPanel, importPanelConnected, loadImportList]);
+
+  // the person's own playlists need the account: connect first (Shibby explains), then the list shows by itself
+  const connectForImport = async (provider) => {
+    const connected = await connectProvider(provider);
+    if (connected) loadImportList(provider);
+  };
+
+  const importFromList = (provider, item) => {
+    importYoutubeFromAccount(item);
+  };
+
+  const addTrackToQueue = (track) => {
+    const normalized = normalizeTrack(track);
+    if (!normalized.videoId) return;
+    if (offlineModeActive && !offlineIdsRef.current.has(normalized.videoId)) {
+      showNotification('that song is not saved on this phone', 'warning');
+      return;
+    }
+    setQueue((prev) => [...prev, normalized]);
+    showNotification('added to queue', 'info');
+    logClient('addTrackToQueue', { videoId: normalized.videoId, title: normalized.title });
+  };
 
   const handleDragStart = (e, index) => {
     setDraggedTrack(index);
@@ -9022,6 +9867,92 @@ export default function App({
     }
 
     showNotification('removed from queue', 'info');
+  };
+
+  // a song of the queue that can not be played: Shibby says so and asks what to do with it. false when there is nobody
+  // to look at a popup (the window is hidden) or the song is in a room, and the player carries on by itself
+  const reportUnavailable = (track) => {
+    if (!track || !track.videoId || playbackSourceRef.current === 'shared' || (typeof document !== 'undefined' && document.hidden)) return false;
+    unavailableIdsRef.current.add(track.videoId);
+    const note = { videoId: track.videoId, title: track.title || 'this song', author: track.author || '', state: 'ask' };
+    shibbyRef.current = note;
+    setShibby(note);
+    playNotifSound();
+    addDebugLog('playback', 'song is not available, asking what to do', { videoId: track.videoId, title: track.title }, true);
+    return true;
+  };
+  shibbyOpenRef.current = reportUnavailable;
+
+  const closeShibby = () => {
+    shibbyRef.current = null;
+    setShibby(null);
+  };
+
+  // looks for the same title (and artist) and puts the first other song it finds in its place, then plays it
+  const shibbyReplace = async () => {
+    const note = shibbyRef.current;
+    if (!note || note.state === 'searching') return;
+    const searching = { ...note, state: 'searching' };
+    shibbyRef.current = searching;
+    setShibby(searching);
+    let match = null;
+    try {
+      const withArtist = note.author && !note.title.toLowerCase().includes(note.author.toLowerCase());
+      const results = await searchTracks(withArtist ? note.title + ' ' + note.author : note.title);
+      match = (Array.isArray(results) ? results : []).find((item) => item && item.videoId && !unavailableIdsRef.current.has(item.videoId)) || null;
+    } catch {
+      match = null;
+    }
+    // something else was pressed while it searched
+    if (shibbyRef.current !== searching) return;
+    const list = queueRef.current;
+    const at = list.findIndex((item) => normalizeTrack(item).videoId === note.videoId);
+    if (at < 0) {
+      closeShibby();
+      return;
+    }
+    if (!match) {
+      const nothing = { ...note, state: 'nothing' };
+      shibbyRef.current = nothing;
+      setShibby(nothing);
+      return;
+    }
+    const replacement = normalizeTrack(match);
+    const next = list.map((item) => (normalizeTrack(item).videoId === note.videoId ? { ...replacement } : item));
+    setQueue(next);
+    addDebugLog('playback', 'replaced an unavailable song', { from: note.videoId, to: replacement.videoId, title: replacement.title }, true);
+    showNotification(`replaced with "${replacement.title}"`, 'success');
+    playTrackAtIndex(at, next, { source: 'personal', notify: false });
+  };
+
+  // takes the song out of the queue and goes on with the one that was behind it
+  const shibbyDelete = () => {
+    const note = shibbyRef.current;
+    if (!note || note.state === 'searching') return;
+    closeShibby();
+    const list = queueRef.current;
+    const next = list.filter((item) => normalizeTrack(item).videoId !== note.videoId);
+    if (next.length === list.length) return;
+    let at = Math.max(0, list.findIndex((item) => normalizeTrack(item).videoId === note.videoId));
+    setQueue(next);
+    showNotification('removed from queue', 'info');
+    if (!next.length) {
+      stopPersonalPlayback();
+      return;
+    }
+    if (at >= next.length) {
+      if (repeatMode !== 'all') {
+        stopAndResetPlayback();
+        return;
+      }
+      at = 0;
+    }
+    playTrackAtIndex(at, next, { source: 'personal', notify: false });
+  };
+
+  const shibbySkip = () => {
+    closeShibby();
+    handleNextRef.current();
   };
 
   const clearQueue = () => {
@@ -9693,30 +10624,33 @@ export default function App({
   };
   const primaryButtonStyle = {
     padding: '8px 12px',
-    borderRadius: 0,
+    borderRadius: '6px',
     border: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
     background: 'transparent',
-    color: '#fff',
+    color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
     fontSize: '11px',
-    cursor: 'pointer'
+    cursor: 'pointer',
+    transition: 'none'
   };
   const outlineButtonStyle = {
     padding: '8px 12px',
-    borderRadius: 0,
+    borderRadius: '6px',
     border: `1px solid ${dimBorderColor(themeColor)}`,
     background: 'transparent',
-    color: '#fff',
+    color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
     fontSize: '11px',
-    cursor: 'pointer'
+    cursor: 'pointer',
+    transition: 'none'
   };
   const dangerButtonStyle = {
     padding: '8px 12px',
-    borderRadius: 0,
+    borderRadius: '6px',
     border: '1px solid #ef4444',
     background: 'transparent',
     color: '#ef4444',
     fontSize: '11px',
-    cursor: 'pointer'
+    cursor: 'pointer',
+    transition: 'none'
   };
   const itemShellStyle = {
     padding: '10px 0',
@@ -9792,6 +10726,11 @@ export default function App({
   const friendLookupUsers = (friendSearch.trim() ? searchedUsers.filter((entry) => entry.is_online) : onlineMembers)
     .filter((entry) => entry.username !== currentUsername)
     .slice(0, 8);
+  const offlineMembers = allUsers
+    .filter((entry) => entry.username !== currentUsername && !entry.is_online)
+    .slice()
+    .sort((a, b) => Number(b.last_seen || 0) - Number(a.last_seen || 0) || a.username.localeCompare(b.username));
+
   const allUsersByLastActive = allUsers
     .filter((entry) => entry.username !== currentUsername)
     .slice()
@@ -9826,7 +10765,8 @@ export default function App({
   ));
   const currentShareCandidate = currentTrack || queue[playIndex] || queue[0] || null;
   const currentListeningActivity = useMemo(() => {
-    if (!currentTrack || hideListening) {
+    // sent even when it is kept private: the server is what keeps it from others, and it is counted in the stats
+    if (!currentTrack) {
       return null;
     }
 
@@ -9849,7 +10789,6 @@ export default function App({
     channelPlayerState?.is_playing,
     currentChannelId,
     currentTrack,
-    hideListening,
     isPlaying,
     playbackSource
   ]);
@@ -9931,7 +10870,8 @@ export default function App({
   };
   // the saved order of a tab, with any panel it does not know about added at the end
   const panelOrderFor = (scope) => {
-    const base = DEFAULT_PANEL_ORDERS[scope];
+    // an admin also has the list of who is offline
+    const base = scope === 'social' && user?.is_admin ? [...DEFAULT_PANEL_ORDERS[scope], 'allUsers'] : DEFAULT_PANEL_ORDERS[scope];
     const saved = panelOrders[scope];
     if (!Array.isArray(saved)) return base;
     return [...saved.filter((id) => base.includes(id)), ...base.filter((id) => !saved.includes(id))];
@@ -10014,6 +10954,66 @@ export default function App({
       </div>
     );
   };
+  // settings: the title above a control, and what an "on" control looks like (the rest is in index.css)
+  const settingsTitleStyle = { color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' };
+  const settingsOnStyle = { background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, color: '#fff' };
+
+  // ---- what is shown next to a person: message, and add friend / accept / requested, or invite for a friend
+  const friendIdSet = new Set([...friendsList.map((friend) => friend.friend_id), ...allUsers.filter((entry) => entry.is_friend).map((entry) => entry.id)]);
+  const incomingRequestFrom = new Map(pendingFriendRequests.map((request) => [request.sender_id, request]));
+  const sentRequestTo = new Map(sentFriendRequests.map((request) => [request.receiver_id, request]));
+  const roomMemberIds = new Set(channelMembers.map((member) => member.user_id));
+  const renderPersonButtons = (entry, options = {}) => (
+    <div style={{ display: 'flex', gap: '6px', flexShrink: 0 }}>
+      {options.noMessage ? null : (
+        <button className="btn btn-outline-light btn-sm" onClick={() => openConversation(entry, { notify: true })} style={{ ...outlineButtonStyle, flexShrink: 0 }}>message</button>
+      )}
+      {friendIdSet.has(entry.id) ? (
+        currentChannelId && !roomMemberIds.has(entry.id)
+          ? <button className="btn btn-outline-light btn-sm" onClick={() => inviteFriendToRoom(entry)} style={{ ...outlineButtonStyle, flexShrink: 0 }}>invite</button>
+          : null
+      ) : incomingRequestFrom.has(entry.id) ? (
+        <button className="btn btn-outline-light btn-sm" onClick={() => acceptFriendRequest(incomingRequestFrom.get(entry.id).id, entry.username)} style={{ ...outlineButtonStyle, flexShrink: 0 }}>accept</button>
+      ) : sentRequestTo.has(entry.id) || pendingFriendTargetSet.has(entry.id) ? (
+        <button className="btn btn-outline-light btn-sm" disabled style={{ ...outlineButtonStyle, flexShrink: 0, opacity: 0.55, cursor: 'default' }}>requested</button>
+      ) : (
+        <button className="btn btn-outline-light btn-sm" onClick={() => sendFriendRequest(entry.id, entry.username)} style={{ ...outlineButtonStyle, flexShrink: 0 }}>add friend</button>
+      )}
+    </div>
+  );
+  // the friends, online ones first, then the one who was on most recently
+  const friendRows = friendsList
+    .map((friend) => {
+      const match = allUsers.find((entry) => entry.id === friend.friend_id) || {};
+      return {
+        id: friend.friend_id,
+        username: friend.username,
+        is_online: match.is_online === true,
+        last_seen: match.last_seen || null,
+        listening_to: match.listening_to || null,
+        platforms: match.platforms || [],
+        current_server_id: match.current_server_id || null
+      };
+    })
+    .sort((a, b) => Number(b.is_online) - Number(a.is_online) || Number(b.last_seen || 0) - Number(a.last_seen || 0) || a.username.localeCompare(b.username));
+  const renderPersonLine = (entry) => (
+    <div key={entry.id} style={wireRowStyle(false)}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ color: nameColorFor(entry.id, entry.is_online), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
+          <div style={{ color: entry.is_online ? '#22c55e' : '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {entry.is_online
+              ? (entry.listening_to
+                ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
+                : (entry.current_server_id ? 'inside a channel' : 'online'))
+              : (friendIdSet.has(entry.id) ? formatOfflineSince(entry.last_seen) : 'offline')}
+          </div>
+        </div>
+        {renderPersonButtons(entry)}
+      </div>
+    </div>
+  );
+
   const socialPanels = {
     online: renderPanelCard('social', 'online', 'online', (
         <div style={sectionStackStyle}>
@@ -10023,7 +11023,7 @@ export default function App({
             ) : onlineMembers.map((entry) => (
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
-                  <div>
+                  <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
@@ -10031,7 +11031,7 @@ export default function App({
                         : (entry.current_server_id ? 'inside a channel' : 'online')}
                     </div>
                   </div>
-                  <button onClick={() => openConversation(entry, { notify: true })} style={outlineButtonStyle}>message</button>
+                  {renderPersonButtons(entry)}
                 </div>
               </div>
             ))}
@@ -10180,6 +11180,32 @@ export default function App({
                 );
               })}
             </div>
+            {e2eState === 'locked' && selectedConversation ? (
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={e2ePassword}
+                  onChange={(e) => setE2ePassword(e.target.value)}
+                  placeholder="password"
+                  style={{ ...inputStyle, flex: 1 }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') unlockPrivateMessages();
+                  }}
+                />
+                <button className="btn btn-outline-light btn-sm"
+                  onClick={unlockPrivateMessages}
+                  disabled={e2eBusy || !e2ePassword}
+                  style={{
+                    ...primaryButtonStyle,
+                    opacity: !e2eBusy && e2ePassword ? 1 : 0.5,
+                    cursor: !e2eBusy && e2ePassword ? 'pointer' : 'not-allowed'
+                  }}
+                >
+                  unlock
+                </button>
+              </div>
+            ) : (
             <div style={{ display: 'flex', gap: '10px' }}>
               <input
                 value={dmText}
@@ -10193,7 +11219,7 @@ export default function App({
                   }
                 }}
               />
-              <button
+              <button className="btn btn-outline-light btn-sm"
                 onClick={sendDmMessage}
                 disabled={!selectedConversation || !dmText.trim()}
                 style={{
@@ -10205,94 +11231,102 @@ export default function App({
                 send
               </button>
             </div>
+            )}
           </div>
         </div>
       )),
-    allUsers: (
-      <div key="social-all-users" className="wire-panel" style={wirePanelStyle}>
-        {renderPanelHandle('social', 'allUsers')}
-        <div style={{ ...sectionStackStyle, maxHeight: '620px', overflowY: 'auto' }}>
-          {allUsersByLastActive.length === 0 ? (
-            <div style={wireEmptyStyle}>no other accounts yet</div>
-          ) : allUsersByLastActive.map((entry) => {
-            const isFriend = friendsList.some((friend) => friend.friend_id === entry.id);
-            const hasPendingRequest = pendingFriendTargetSet.has(entry.id);
-
-            return (
-              <div key={entry.id} style={wireRowStyle(false)}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
-                  <div style={{ minWidth: 0, flex: 1 }}>
+    allUsers: renderPanelCard('social', 'allUsers', 'offline', (
+        <div style={{ ...sectionStackStyle, maxHeight: '420px', overflowY: 'auto' }}>
+          {offlineMembers.length === 0 ? (
+            <div style={wireEmptyStyle}>nobody is offline</div>
+          ) : offlineMembers.map((entry) => (
+            <div key={entry.id} style={wireRowStyle(false)}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ color: nameColorFor(entry.id, false), fontSize: '12px', fontWeight: 'bold' }}>
                     <button
                       type="button"
                       onClick={(event) => openUserProfileCard(event, entry)}
-                      style={{
-                        background: 'transparent',
-                        border: 'none',
-                        color: '#fff',
-                        fontSize: '12px',
-                        fontWeight: 'bold',
-                        padding: 0,
-                        textAlign: 'left',
-                        cursor: 'pointer'
-                      }}
+                      style={{ background: 'transparent', border: 'none', color: 'inherit', fontSize: 'inherit', fontWeight: 'inherit', padding: 0, textAlign: 'left', cursor: 'pointer' }}
                     >
                       {entry.username}
                     </button>
-                    <PlatformIcons platforms={entry.platforms} />
-                    <div style={{ color: entry.is_online ? '#22c55e' : '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {entry.is_online
-                        ? (entry.listening_to
-                          ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
-                          : (entry.current_server_id ? 'online in a channel' : 'online'))
-                        : formatLastActive(entry.last_seen || entry.created_at, entry.is_online)}
-                    </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    <button onClick={() => openConversation(entry, { notify: true })} style={outlineButtonStyle}>message</button>
-                    {!isFriend && !hasPendingRequest && (
-                      <button
-                        onClick={() => sendFriendRequest(entry.id, entry.username)}
-                        style={primaryButtonStyle}
-                      >
-                        add
-                      </button>
-                    )}
-                    {isFriend && (
-                      <div style={{ ...outlineButtonStyle, cursor: 'default', opacity: 0.75 }}>friend</div>
-                    )}
-                    {hasPendingRequest && (
-                      <div style={{ ...outlineButtonStyle, cursor: 'default', opacity: 0.75 }}>pending</div>
-                    )}
+                  <div
+                    title={entry.last_seen ? new Date(Number(entry.last_seen) * 1000).toLocaleString() : ''}
+                    style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                  >
+                    {formatOfflineSince(entry.last_seen)}
                   </div>
                 </div>
+                {renderPersonButtons(entry)}
               </div>
-            );
-          })}
+            </div>
+          ))}
         </div>
-      </div>
-    ),
+    )),
+    friends: renderPanelCard('social', 'friends', 'friends', (
+        <div style={sectionStackStyle}>
+          <input
+            value={friendSearch}
+            onChange={(e) => setFriendSearch(e.target.value)}
+            placeholder="find someone by name"
+            style={inputStyle}
+          />
+          <div style={{ ...sectionStackStyle, maxHeight: '320px', overflowY: 'auto' }}>
+            {friendSearch.trim() ? (
+              searchedUsers.length === 0
+                ? <div style={wireEmptyStyle}>nobody with that name</div>
+                : searchedUsers.map((entry) => renderPersonLine(entry))
+            ) : friendRows.length === 0 ? (
+              <div style={wireEmptyStyle}>no friends yet</div>
+            ) : friendRows.map((entry) => renderPersonLine(entry))}
+          </div>
+        </div>
+      )),
     requests: renderPanelCard('social', 'requests', 'requests', (
         <div style={{ ...sectionStackStyle, maxHeight: '320px', overflowY: 'auto' }}>
-          {pendingFriendRequests.length === 0 ? (
+          {pendingFriendRequests.length === 0 && sentFriendRequests.length === 0 && roomInvites.length === 0 ? (
             <div style={wireEmptyStyle}>theres nothing</div>
-          ) : pendingFriendRequests.map((request) => (
+          ) : null}
+          {roomInvites.map((invite) => (
+            <div key={invite.id} style={{ ...wireRowStyle(false), background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.24)' }}>
+              <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{invite.from_username}</div>
+              <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px', overflowWrap: 'anywhere' }}>invited you to {invite.server_name}</div>
+              <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
+                <button className="btn btn-sm btn-go" onClick={() => acceptRoomInvite(invite)} style={primaryButtonStyle}>join</button>
+                <button className="btn btn-outline-danger btn-sm" onClick={() => declineRoomInvite(invite.id)} style={dangerButtonStyle}>decline</button>
+              </div>
+            </div>
+          ))}
+          {sentFriendRequests.map((request) => (
+            <div key={request.id} style={wireRowStyle(false)}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{request.receiver_username}</div>
+                  <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>waiting for an answer</div>
+                </div>
+                <button className="btn btn-outline-light btn-sm" onClick={() => cancelFriendRequest(request.id)} style={{ ...outlineButtonStyle, flexShrink: 0 }}>cancel</button>
+              </div>
+            </div>
+          ))}
+          {pendingFriendRequests.map((request) => (
             <div key={request.id} style={{ ...wireRowStyle(false), background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.24)' }}>
               <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{request.sender_username}</div>
               <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>sent you a request</div>
               <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
-                <button
+                <button className="btn btn-sm btn-go"
                   onClick={() => acceptFriendRequest(request.id, request.sender_username)}
                   disabled={friendRequestActionIds.includes(request.id)}
                   style={{
                     ...primaryButtonStyle,
-                    background: '#22c55e',
                     opacity: friendRequestActionIds.includes(request.id) ? 0.65 : 1,
                     cursor: friendRequestActionIds.includes(request.id) ? 'wait' : 'pointer'
                   }}
                 >
                   {friendRequestActionIds.includes(request.id) ? 'working...' : 'accept'}
                 </button>
-                <button
+                <button className="btn btn-outline-danger btn-sm"
                   onClick={() => declineFriendRequest(request.id)}
                   disabled={friendRequestActionIds.includes(request.id)}
                   style={{
@@ -10775,6 +11809,218 @@ export default function App({
     </>
   );
 
+  // ---- the stats tab: what the person listens to, as it happens (nothing waits for the end of the year)
+  const accentRgb = 'rgb(' + themeColor.r + ', ' + themeColor.g + ', ' + themeColor.b + ')';
+  const statsBars = (bars, labelOf, titleOf, height = 120) => {
+    const max = Math.max(1, ...bars.map((bar) => bar.seconds));
+    return (
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: bars.length > 24 ? '2px' : '4px', height: height + 'px' }}>
+        {bars.map((bar, index) => (
+          <div key={index} title={titleOf(bar, index)} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', height: '100%' }}>
+            <div data-bar={bar.seconds} style={{ height: Math.max(bar.seconds ? 3 : 1, Math.round((bar.seconds / max) * (height - 16))) + 'px', background: bar.seconds ? accentRgb : dimBorderColor(themeColor) }} />
+            <div style={{ color: '#6b7280', fontSize: '9px', height: '14px', lineHeight: '14px', display: 'flex', justifyContent: 'center' }}><span style={{ whiteSpace: 'nowrap' }}>{labelOf(bar, index)}</span></div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+  const statsCard = (title, content) => (
+    <Card className="glass card-hover shadow-sm border-0">
+      <Card.Body className="card-body" style={panelCardBodyStyle}>
+        <div style={{ color: '#9ca3af', fontSize: '11px', marginBottom: '12px' }}>{title}</div>
+        {content}
+      </Card.Body>
+    </Card>
+  );
+  const statsTotals = statsData ? statsData.totals : null;
+  const statsDayPart = (hour) => (hour < 5 ? 'late at night' : hour < 12 ? 'in the morning' : hour < 17 ? 'in the afternoon' : hour < 22 ? 'in the evening' : 'at night');
+  const statsHour = (hour) => (hour % 12 === 0 ? 12 : hour % 12) + (hour < 12 ? 'am' : 'pm');
+  const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const statsShare = (seconds) => (statsTotals && statsTotals.seconds ? Math.round((seconds / statsTotals.seconds) * 100) : 0);
+  const statsHours = (seconds) => (seconds / 3600).toFixed(1) + ' hours';
+  const statsDate = (day) => new Date(day + 'T00:00:00Z').toLocaleDateString([], { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const statsChange = () => {
+    const before = statsTotals ? statsTotals.previous_seconds : null;
+    if (before === null || before === undefined) return null;
+    if (before === 0) return statsTotals.seconds > 0 ? { text: 'new', up: true } : null;
+    const change = Math.round(((statsTotals.seconds - before) / before) * 100);
+    return { text: (change > 0 ? '+' : '') + change + '% on the period before', up: change >= 0 };
+  };
+  // the four numbers at the top, the same size and the same distance from each other
+  const statsMetricCard = (label, value, line, tone) => (
+    <Card data-card={label} className="glass card-hover shadow-sm border-0" style={{ minWidth: 0 }}>
+      <Card.Body className="card-body" style={{ ...panelCardBodyStyle, padding: '16px' }}>
+        <div style={{ color: '#9ca3af', fontSize: '11px' }}>{label}</div>
+        <div title={value} style={{ color: accentRgb, fontSize: '22px', fontWeight: 'bold', marginTop: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</div>
+        <div title={line} style={{ color: tone || '#9ca3af', fontSize: '11px', marginTop: '4px', minHeight: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{line}</div>
+      </Card.Body>
+    </Card>
+  );
+  // a table of rows: song or artist, plays, time and the share of all the listening
+  const statsRankColumns = '26px minmax(0, 1fr) 44px 72px 40px';
+  const statsRankTable = (rows, kind) => (
+    rows.length === 0 ? <div style={wireEmptyStyle}>nothing yet</div> : (
+      <div style={{ maxHeight: '640px', overflowY: 'auto' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: statsRankColumns, gap: '8px', color: '#6b7280', fontSize: '10px', padding: '0 4px 6px', borderBottom: '1px solid ' + dimBorderColor(themeColor) }}>
+          <span style={{ textAlign: 'right' }}>#</span>
+          <span>{kind === 'song' ? 'song' : 'artist'}</span>
+          <span style={{ textAlign: 'right' }}>plays</span>
+          <span style={{ textAlign: 'right' }}>time</span>
+          <span style={{ textAlign: 'right' }}>share</span>
+        </div>
+        {rows.map((row, index) => (
+          <div key={index} style={{ display: 'grid', gridTemplateColumns: statsRankColumns, gap: '8px', alignItems: 'center', padding: '8px 4px', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
+            <span style={{ textAlign: 'right', color: index === 0 ? accentRgb : '#6b7280', fontWeight: 'bold', fontSize: '12px' }}>{index + 1}</span>
+            <span style={{ minWidth: 0 }}>
+              <div style={{ color: '#fff', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{kind === 'song' ? row.title : row.author}</div>
+              <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {kind === 'song' ? (row.author || 'unknown artist') : row.tracks + (row.tracks === 1 ? ' song' : ' songs')}
+              </div>
+              <div style={{ height: '2px', marginTop: '5px', background: dimBorderColor(themeColor) }}>
+                <div data-share={statsShare(row.seconds)} style={{ height: '100%', width: statsShare(row.seconds) + '%', background: accentRgb }} />
+              </div>
+            </span>
+            <span style={{ textAlign: 'right', color: '#fff', fontSize: '12px' }}>{row.plays}</span>
+            <span style={{ textAlign: 'right', color: accentRgb, fontSize: '12px' }}>{formatListenTime(row.seconds)}</span>
+            <span style={{ textAlign: 'right', color: '#9ca3af', fontSize: '11px' }}>{statsShare(row.seconds)}%</span>
+          </div>
+        ))}
+      </div>
+    )
+  );
+  // the details: label on the left, value on the right, in as many columns as fit
+  const statsDetailRows = () => {
+    const change = statsChange();
+    const any = statsTotals.seconds > 0;
+    const peakHour = statsData.hours.indexOf(Math.max(...statsData.hours));
+    const peakDay = statsData.weekdays.indexOf(Math.max(...statsData.weekdays));
+    const perDay = statsTotals.seconds / Math.max(1, statsData.days_in_range);
+    return [
+      ['total time', formatListenTime(statsTotals.seconds) + ' (' + statsHours(statsTotals.seconds) + ')'],
+      ['compared with the period before', change ? change.text : '-'],
+      ['today so far', formatListenTime(statsData.today_seconds)],
+      ['average per day', formatListenTime(perDay)],
+      ['best day', statsData.best_day ? statsDate(statsData.best_day.day) + ', ' + formatListenTime(statsData.best_day.seconds) : '-'],
+      ['longest single listen', statsData.longest ? statsData.longest.title + ' (' + formatListenTime(statsData.longest.seconds) + ')' : '-'],
+      ['days in a row', statsData.streak.current + ' (best ' + statsData.streak.best + ')'],
+      ['days with music', String(statsData.streak.active_days)],
+      ['songs played', String(statsTotals.plays)],
+      ['different songs', statsTotals.tracks + (statsTotals.new_tracks ? ', ' + statsTotals.new_tracks + ' new' : '')],
+      ['different artists', statsTotals.artists + (statsTotals.new_artists ? ', ' + statsTotals.new_artists + ' new' : '')],
+      ['most listening', any ? statsDayPart(peakHour) + ', around ' + statsHour(peakHour) : '-'],
+      ['favorite day', any ? WEEKDAY_NAMES[peakDay] : '-'],
+      ['listening since', statsData.since ? new Date(statsData.since * 1000).toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) : '-']
+    ];
+  };
+  const statsView = (
+    <div className="stats-view" style={{ display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '1100px', margin: '0 auto' }}>
+      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+        {[['week', '7 days'], ['month', '30 days'], ['year', 'year'], ['all', 'all time']].map(([key, label]) => (
+          <Button
+            key={key}
+            variant="outline-light"
+            size="sm"
+            data-range={key}
+            data-selected={statsRange === key ? 'yes' : 'no'}
+            onClick={() => setStatsRange(key)}
+            style={{ borderRadius: '6px', color: statsRange === key ? '#000' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, background: statsRange === key ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent', border: `1px solid ${dimBorderColor(themeColor)}` }}
+          >
+            {label}
+          </Button>
+        ))}
+      </div>
+      {!currentUserId ? (
+        <div style={wireEmptyStyle}>sign in to see your stats</div>
+      ) : !statsData ? (
+        statsFailed ? (
+          <div style={{ ...wireEmptyStyle, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px' }}>
+            <div style={{ color: '#fff', fontSize: '12px' }}>could not load your stats</div>
+            <button className="btn btn-outline-light btn-sm" onClick={() => { setStatsFailed(false); setStatsRetry((n) => n + 1); }} style={outlineButtonStyle}>try again</button>
+          </div>
+        ) : (
+          <div style={wireEmptyStyle}>loading</div>
+        )
+      ) : (
+        <>
+          <div className="stats-top">
+            {(() => {
+              const change = statsChange();
+              const topArtist = statsData.top_artists[0];
+              const topSong = statsData.top_tracks[0];
+              return (
+                <>
+                  {statsMetricCard('listening time', formatListenTime(statsTotals.seconds), statsHours(statsTotals.seconds) + (change ? ', ' + change.text : ''), change && !change.up ? '#ef4444' : undefined)}
+                  {statsMetricCard('songs played', String(statsTotals.plays), statsTotals.tracks + (statsTotals.tracks === 1 ? ' different song' : ' different songs'))}
+                  {statsMetricCard('top artist', topArtist ? topArtist.author : '-', topArtist ? formatListenTime(topArtist.seconds) + ', ' + topArtist.plays + (topArtist.plays === 1 ? ' play' : ' plays') : '')}
+                  {statsMetricCard('top song', topSong ? topSong.title : '-', topSong ? (topSong.author ? topSong.author + ', ' : '') + formatListenTime(topSong.seconds) : '')}
+                </>
+              );
+            })()}
+          </div>
+
+          {statsCard('details', (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', columnGap: '28px' }}>
+              {statsDetailRows().map(([label, value]) => (
+                <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', padding: '8px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)', fontSize: '12px' }}>
+                  <span style={{ color: '#9ca3af', flexShrink: 0 }}>{label}</span>
+                  <span style={{ color: '#fff', textAlign: 'right', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={value}>{value}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 340px), 1fr))', gap: '16px' }}>
+            {statsCard('listening time', statsBars(
+              statsRange === 'week' ? statsData.days.slice(-7) : statsRange === 'month' ? statsData.days : statsData.months,
+              (bar, index) => (statsRange === 'month' ? (index % 5 === 0 ? bar.day.slice(8) : '') : statsRange === 'week' ? WEEKDAY_NAMES[new Date(bar.day + 'T00:00:00Z').getUTCDay()].slice(0, 3) : new Date(bar.month + '-01T00:00:00Z').toLocaleDateString([], { month: 'short', timeZone: 'UTC' })),
+              (bar) => (bar.day || bar.month) + ': ' + formatListenTime(bar.seconds)
+            ))}
+            {statsCard('when you listen', (
+              <div style={sectionStackStyle}>
+                {statsBars(
+                  statsData.hours.map((seconds) => ({ seconds })),
+                  (bar, index) => (index % 6 === 0 ? statsHour(index) : ''),
+                  (bar, index) => statsHour(index) + ': ' + formatListenTime(bar.seconds),
+                  90
+                )}
+                {statsBars(
+                  statsData.weekdays.map((seconds) => ({ seconds })),
+                  (bar, index) => WEEKDAY_NAMES[index].slice(0, 3),
+                  (bar, index) => WEEKDAY_NAMES[index] + ': ' + formatListenTime(bar.seconds),
+                  70
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 340px), 1fr))', gap: '16px' }}>
+            {statsCard('top songs', statsRankTable(statsData.top_tracks, 'song'))}
+            {statsCard('top artists', statsRankTable(statsData.top_artists, 'artist'))}
+          </div>
+
+          {statsBoard.length > 1 ? statsCard('you and your friends', (() => {
+            const most = Math.max(1, ...statsBoard.map((row) => row.seconds));
+            return (
+              <div style={sectionStackStyle}>
+                {statsBoard.map((row) => (
+                  <div key={row.user_id} style={wireRowStyle(false)}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', fontSize: '12px' }}>
+                      <span style={{ color: row.me ? accentRgb : '#fff', fontWeight: row.me ? 'bold' : 'normal' }}>{row.me ? 'you' : row.username}</span>
+                      <span style={{ color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.top_artist ? row.top_artist + ' · ' : ''}{formatListenTime(row.seconds)}</span>
+                    </div>
+                    <div style={{ height: '4px', marginTop: '6px', background: dimBorderColor(themeColor) }}>
+                      <div style={{ height: '100%', width: Math.round((row.seconds / most) * 100) + '%', background: accentRgb }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()) : null}
+        </>
+      )}
+    </div>
+  );
+
   const socialView = (
     <div className={`social-flat${panelOrders.social ? ' custom-order' : ''}`} style={snapLayoutStyle}>
       {renderPanelColumn('social', 'left', socialLeftPanelIds, socialPanels)}
@@ -10799,7 +12045,7 @@ export default function App({
                   <span style={{ color: '#9ca3af' }}>private, code:</span>
                   <strong style={{ letterSpacing: '0.12em', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{currentChannel.join_code || '...'}</strong>
                   {currentChannel.join_code ? (
-                    <button
+                    <button className="btn btn-outline-light btn-sm"
                       onClick={async () => {
                         try {
                           await navigator.clipboard.writeText(currentChannel.join_code);
@@ -10816,7 +12062,7 @@ export default function App({
                 </div>
               ) : null}
               {currentChannel.host_id === currentUserId ? (
-                <button
+                <button className="btn btn-outline-danger btn-sm"
                   onClick={() => deleteChannel(currentChannel.id)}
                   style={{
                     ...dangerButtonStyle,
@@ -10839,7 +12085,7 @@ export default function App({
                 </button>
               ) : null}
               {/* everyone can leave, the host too: the channel stays and the host can come back to it */}
-                <button
+                <button className="btn btn-outline-danger btn-sm"
                   onClick={() => leaveChannel(currentChannel.id)}
                   style={{
                     ...dangerButtonStyle,
@@ -10883,7 +12129,7 @@ export default function App({
                 </div>
                 {canManageCurrentChannel && member.user_id !== currentUserId && (
                   <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
-                    <button
+                    <button className="btn btn-outline-light btn-sm"
                       onClick={() => updateChannelAdmin(member, !member.is_admin)}
                       style={{
                         ...outlineButtonStyle,
@@ -10900,7 +12146,7 @@ export default function App({
                         e.currentTarget.style.color = `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`;
                       }}
                     >{member.is_admin ? 'unadmin' : 'admin'}</button>
-                    <button
+                    <button className="btn btn-outline-danger btn-sm"
                       onClick={() => kickChannelMember(member)}
                       style={{
                         ...dangerButtonStyle,
@@ -10931,7 +12177,7 @@ export default function App({
               <input type="checkbox" checked={newChannelPrivate} onChange={(e) => setNewChannelPrivate(e.target.checked)} />
               private (people need a code to join)
             </label>
-            <button
+            <button className="btn btn-outline-light btn-sm"
               onClick={createChannel}
               disabled={!newChannelName.trim()}
               style={{ ...primaryButtonStyle, opacity: newChannelName.trim() ? 1 : 0.5, cursor: newChannelName.trim() ? 'pointer' : 'not-allowed' }}
@@ -10946,9 +12192,9 @@ export default function App({
               onKeyDown={(e) => { if (e.key === 'Enter') joinChannelByCode(joinCodeText); }}
               placeholder="have a code?"
               maxLength={12}
-              style={{ ...inputStyle, flex: 1, letterSpacing: '0.1em' }}
+              style={{ ...inputStyle, flex: 1, letterSpacing: joinCodeText ? '0.1em' : 'normal' }}
             />
-            <button
+            <button className="btn btn-outline-light btn-sm"
               onClick={() => joinChannelByCode(joinCodeText)}
               disabled={joinCodeText.trim().length < 6}
               style={{ ...outlineButtonStyle, opacity: joinCodeText.trim().length < 6 ? 0.5 : 1 }}
@@ -10979,16 +12225,16 @@ export default function App({
                   <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>host: {channel.host_username} | {(channel.members || []).length} members</div>
                   <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {channel.is_private && !joined && channel.host_id !== currentUserId ? (
-                      <button
+                      <button className="btn btn-outline-light btn-sm"
                         onClick={() => { setCodeEntryFor(codeEntryFor === channel.id ? '' : channel.id); setCodeEntryText(''); }}
                         style={primaryButtonStyle}
                       >
                         enter code
                       </button>
                     ) : (
-                      <button onClick={() => joinChannel(channel)} style={primaryButtonStyle}>{active ? 'open' : joined ? 'rejoin' : 'join'}</button>
+                      <button className="btn btn-outline-light btn-sm" onClick={() => joinChannel(channel)} style={primaryButtonStyle}>{active ? 'open' : joined ? 'rejoin' : 'join'}</button>
                     )}
-                    {joined && <button onClick={() => leaveChannel(channel.id)} style={dangerButtonStyle}>leave</button>}
+                    {joined && <button className="btn btn-outline-danger btn-sm" onClick={() => leaveChannel(channel.id)} style={dangerButtonStyle}>leave</button>}
                   </div>
                   {channel.is_private && !joined && codeEntryFor === channel.id && (
                     <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
@@ -10999,9 +12245,9 @@ export default function App({
                         onKeyDown={(e) => { if (e.key === 'Enter') joinChannel(channel, codeEntryText); }}
                         placeholder="code"
                         maxLength={12}
-                        style={{ ...inputStyle, flex: 1, letterSpacing: '0.1em' }}
+                        style={{ ...inputStyle, flex: 1, letterSpacing: codeEntryText ? '0.1em' : 'normal' }}
                       />
-                      <button onClick={() => joinChannel(channel, codeEntryText)} disabled={codeEntryText.trim().length < 6} style={{ ...outlineButtonStyle, opacity: codeEntryText.trim().length < 6 ? 0.5 : 1 }}>join</button>
+                      <button className="btn btn-outline-light btn-sm" onClick={() => joinChannel(channel, codeEntryText)} disabled={codeEntryText.trim().length < 6} style={{ ...outlineButtonStyle, opacity: codeEntryText.trim().length < 6 ? 0.5 : 1 }}>join</button>
                     </div>
                   )}
                 </div>
@@ -11014,7 +12260,7 @@ export default function App({
             ) : onlineMembers.map((entry) => (
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
-                  <div>
+                  <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
@@ -11022,7 +12268,7 @@ export default function App({
                         : (entry.current_server_id ? 'inside a channel' : 'online')}
                     </div>
                   </div>
-                  <button onClick={() => openConversation(entry, { notify: true })} style={outlineButtonStyle}>message</button>
+                  {renderPersonButtons(entry)}
                 </div>
               </div>
             ))}
@@ -11039,7 +12285,7 @@ export default function App({
             <div style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, fontSize: '11px', textTransform: 'lowercase', letterSpacing: '0.04em' }}>
               shared queue
             </div>
-            <button
+            <button className="btn btn-outline-light btn-sm"
               onClick={(event) => jumpToPlayingRow(event.currentTarget)}
               disabled={!activeSharedTrack}
               title="scroll the queue to the song that is playing"
@@ -11048,7 +12294,7 @@ export default function App({
               jump to playing
             </button>
           </div>
-          <ListGroup variant="flush" style={{ maxHeight: '240px', overflowY: 'auto' }}>
+          <ResizableListGroup storageKey="room-queue" defaultHeight={240}>
             {channelQueue.map((track) => (
               <ListGroup.Item
                 key={track.id}
@@ -11133,7 +12379,7 @@ export default function App({
                 </div>
               </ListGroup.Item>
             ))}
-          </ListGroup>
+          </ResizableListGroup>
           {channelQueue.length > 0 && (
             <div className="d-flex gap-2 mt-2">
               <Button
@@ -11191,7 +12437,7 @@ export default function App({
                 add from your queue
               </div>
               {queue.length > 0 && (
-                <button
+                <button className="btn btn-outline-light btn-sm"
                   onClick={addMyQueueToRoom}
                   disabled={!!roomAddProgress}
                   style={{ ...outlineButtonStyle, padding: '2px 10px', fontSize: '10px', opacity: roomAddProgress ? 0.6 : 1 }}
@@ -11311,7 +12557,7 @@ export default function App({
                   }
                 }}
               />
-              <button
+              <button className="btn btn-outline-light btn-sm"
                 onClick={sendChannelMessage}
                 disabled={!channelMessageText.trim()}
                 style={{ ...primaryButtonStyle, opacity: channelMessageText.trim() ? 1 : 0.5, cursor: channelMessageText.trim() ? 'pointer' : 'not-allowed' }}
@@ -11733,6 +12979,7 @@ export default function App({
   const stableQueueClear = useStableCallback(() => clearQueue());
   const stableRemovePlaylistTrack = useStableCallback((idx) => removeTrackFromPlaylist(idx));
   const stableToggleOffline = useStableCallback((track) => toggleOffline(track));
+  const stableAddToQueue = useStableCallback((track) => addTrackToQueue(track));
   const stableDragStart = useStableCallback((e, idx) => handleDragStart(e, idx));
   const stableDragOver = useStableCallback((e, idx) => handleDragOver(e, idx));
   const stableDrop = useStableCallback((e, idx) => handleDrop(e, idx));
@@ -12089,6 +13336,7 @@ export default function App({
                           offlineMode={isAndroidApp()}
                           offline={offlineIds.has(track.videoId)}
                           onToggleOffline={stableToggleOffline}
+                          onAddToQueue={stableAddToQueue}
                           dimmed={offlineModeActive && !offlineIds.has(track.videoId)}
                         />
                       ));
@@ -12100,10 +13348,10 @@ export default function App({
                   </div>
                 )}
 
-                {currentTracks.length > 0 && (
-                  <div className="d-flex justify-content-between align-items-center mt-3 flex-wrap gap-2">
-                    <span className="text-muted small">{currentTracks.length} tracks</span>
-                    <div className="d-flex gap-2 flex-wrap">
+                <div className="d-flex justify-content-between align-items-center mt-3 flex-wrap gap-2">
+                  <span className="text-muted small">{currentTracks.length > 0 ? `${currentTracks.length} tracks` : ''}</span>
+                  <div className="d-flex gap-2 flex-wrap">
+                    {currentTracks.length > 0 && (
                       <Button
                         variant="outline-light"
                         size="sm"
@@ -12112,18 +13360,36 @@ export default function App({
                       >
                         load to queue
                       </Button>
-                      {isAndroidApp() && (
-                        <Button
-                          variant="outline-light"
-                          size="sm"
-                          onClick={() => saveTracksOffline(currentTracks, 'playlist')}
-                          disabled={!!offlineProgress || offlineModeActive}
-                          style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
-                          title={offlineProgress ? `saving ${offlineProgress.done} of ${offlineProgress.total} songs for offline` : 'download every song in this playlist into the app so it plays without internet'}
-                        >
-                          {offlineProgress ? `saving ${offlineProgress.done}/${offlineProgress.total}` : 'save offline'}
-                        </Button>
-                      )}
+                    )}
+                    {currentTracks.length > 0 && isAndroidApp() && (
+                      <Button
+                        variant="outline-light"
+                        size="sm"
+                        onClick={() => saveTracksOffline(currentTracks, 'playlist')}
+                        disabled={!!offlineProgress || offlineModeActive}
+                        style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                        title={offlineProgress ? `saving ${offlineProgress.done} of ${offlineProgress.total} songs for offline` : 'download every song in this playlist into the app so it plays without internet'}
+                      >
+                        {offlineProgress ? `saving ${offlineProgress.done}/${offlineProgress.total}` : 'save offline'}
+                      </Button>
+                    )}
+                    <Dropdown>
+                      <Dropdown.Toggle
+                        as="button"
+                        type="button"
+                        className="btn btn-outline-light btn-sm"
+                        disabled={!!playlistImport}
+                        style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                      >
+                        import
+                      </Dropdown.Toggle>
+                      <Dropdown.Menu className="glass-dark">
+                        <Dropdown.Item onClick={() => setImportPanel((open) => (open === 'spotify' ? null : 'spotify'))}>from spotify</Dropdown.Item>
+                        <Dropdown.Item onClick={() => setImportPanel((open) => (open === 'youtube' ? null : 'youtube'))}>from youtube</Dropdown.Item>
+                        <Dropdown.Item onClick={() => { setImportPanel(null); importPlaylistFromFile(); }}>from file (json or csv)</Dropdown.Item>
+                      </Dropdown.Menu>
+                    </Dropdown>
+                    {currentTracks.length > 0 && (
                       <Dropdown>
                         <Dropdown.Toggle
                           as="button"
@@ -12140,8 +13406,14 @@ export default function App({
                           <Dropdown.Item onClick={() => exportPlaylist('csv')}>
                             as csv (spreadsheets, other playlist tools)
                           </Dropdown.Item>
+                          {integrations.youtube && integrations.youtube.configured ? (
+                            <Dropdown.Item onClick={() => exportPlaylistToService('youtube')}>to youtube</Dropdown.Item>
+                          ) : null}
+                          <Dropdown.Item onClick={openPlaylistOnYoutube}>open in youtube</Dropdown.Item>
                         </Dropdown.Menu>
                       </Dropdown>
+                    )}
+                    {currentTracks.length > 0 && (
                       <Button
                         variant="outline-danger"
                         size="sm"
@@ -12150,22 +13422,160 @@ export default function App({
                       >
                         clear playlist
                       </Button>
+                    )}
+                  </div>
+                </div>
+
+                {importPanel && !playlistImport ? (
+                  <div className="mt-2" data-import-panel={importPanel}>
+                    <div className="d-flex gap-2">
+                      <input
+                        autoFocus
+                        value={importPanel === 'spotify' ? spotifyUrl : youtubeUrl}
+                        onChange={(e) => (importPanel === 'spotify' ? setSpotifyUrl(e.target.value) : setYoutubeUrl(e.target.value))}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { if (importPanel === 'spotify') importSpotifyPlaylist(); else importYoutubeLink(); } }}
+                        placeholder={importPanel + ' playlist link'}
+                        style={{ ...inputStyle, flex: 1 }}
+                      />
+                      <Button
+                        variant="outline-light"
+                        size="sm"
+                        onClick={() => { if (importPanel === 'spotify') importSpotifyPlaylist(); else importYoutubeLink(); }}
+                        disabled={!(importPanel === 'spotify' ? spotifyUrl : youtubeUrl).trim() || !!(playlistNotice && playlistNotice.kind === 'working')}
+                        style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                      >
+                        import
+                      </Button>
+                    </div>
+                    {integrations[importPanel] && integrations[importPanel].configured ? (
+                      integrations[importPanel].connected ? (
+                        <div data-import-list={(importLists[importPanel] && importLists[importPanel].state) || 'loading'} style={{ marginTop: '8px', maxHeight: '220px', overflowY: 'auto' }}>
+                          {!importLists[importPanel] || importLists[importPanel].state === 'loading' ? (
+                            <div className="small text-muted">loading your playlists</div>
+                          ) : importLists[importPanel].state === 'error' ? (
+                            <div className="d-flex justify-content-between align-items-center gap-2 small">
+                              <span className="text-truncate" style={{ color: '#ef4444' }} title={importLists[importPanel].message}>{importLists[importPanel].message}</span>
+                              <Button
+                                variant="outline-light"
+                                size="sm"
+                                className="flex-shrink-0"
+                                onClick={() => (importLists[importPanel].code === 'needs_reconnect' ? connectForImport(importPanel) : loadImportList(importPanel))}
+                                style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                              >
+                                {importLists[importPanel].code === 'needs_reconnect' ? 'connect again' : 'try again'}
+                              </Button>
+                            </div>
+                          ) : importLists[importPanel].items.length === 0 ? (
+                            <div className="small text-muted">no playlists here</div>
+                          ) : importLists[importPanel].items.map((item) => (
+                            <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
+                              <span className="text-truncate" style={{ flex: 1, minWidth: 0, color: '#fff', fontSize: '12px' }} title={item.name}>{item.name}</span>
+                              {item.count !== null && item.count !== undefined ? <span style={{ color: '#9ca3af', fontSize: '11px', flexShrink: 0 }}>{item.count}</span> : null}
+                              <Button
+                                variant="outline-light"
+                                size="sm"
+                                className="flex-shrink-0"
+                                onClick={() => importFromList(importPanel, item)}
+                                disabled={!!(playlistNotice && playlistNotice.kind === 'working')}
+                                style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                              >
+                                import
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="mt-2">
+                          <Button
+                            variant="outline-light"
+                            size="sm"
+                            onClick={() => connectForImport(importPanel)}
+                            style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                          >
+                            your playlists
+                          </Button>
+                        </div>
+                      )
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {playlistNotice ? (
+                  <div className="d-flex justify-content-between align-items-center gap-2 mt-2 small" data-import-notice={playlistNotice.kind}>
+                    <span className="text-truncate" style={{ color: playlistNotice.kind === 'error' ? '#ef4444' : '#fff' }} title={playlistNotice.text}>{playlistNotice.text}</span>
+                    {playlistNotice.kind !== 'working' ? (
+                      <Button
+                        variant="outline-light"
+                        size="sm"
+                        className="flex-shrink-0"
+                        onClick={() => setPlaylistNotice(null)}
+                        style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                      >
+                        ok
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {playlistExportJob ? (
+                  <div className="mt-2">
+                    <div className="d-flex justify-content-between small text-muted mb-1">
+                      <span className="text-truncate" style={{ maxWidth: '70%' }}>sending to {playlistExportJob.provider}</span>
+                      <span>{playlistExportJob.done}/{playlistExportJob.total}</span>
+                    </div>
+                    <div style={{ height: '4px', background: 'rgba(255,255,255,0.1)', borderRadius: '2px', overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%',
+                        width: `${Math.round((playlistExportJob.done / Math.max(1, playlistExportJob.total)) * 100)}%`,
+                        background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                        transition: 'width 0.15s linear'
+                      }} />
                     </div>
                   </div>
-                )}
+                ) : null}
 
-                <div className="d-flex justify-content-end mt-2">
-                  <Button
-                    variant="outline-light"
-                    size="sm"
-                    onClick={importPlaylistFromFile}
-                    disabled={!!playlistImport}
-                    style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
-                    title="import a .json (from this app) or .csv (title/artist columns) playlist file"
-                  >
-                    import tracks from file
-                  </Button>
-                </div>
+                {playlistExportDone && !playlistExportJob ? (
+                  <div className="d-flex justify-content-between align-items-center gap-2 mt-2 small flex-wrap">
+                    <span className="text-truncate" style={{ color: playlistExportDone.error ? '#ef4444' : '#fff', minWidth: 0 }} title={playlistExportDone.line}>{playlistExportDone.line}</span>
+                    <span className="d-flex gap-2 flex-shrink-0">
+                      {playlistExportDone.url ? (
+                        <>
+                          <Button
+                            variant="outline-light"
+                            size="sm"
+                            onClick={() => openExternalUrl(playlistExportDone.url)}
+                            style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                          >
+                            open it
+                          </Button>
+                          <Button
+                            variant="outline-light"
+                            size="sm"
+                            onClick={async () => {
+                              try {
+                                await navigator.clipboard.writeText(playlistExportDone.url);
+                                showNotification('link copied', 'success');
+                              } catch {
+                                showNotification(playlistExportDone.url, 'info');
+                              }
+                            }}
+                            style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                          >
+                            copy link
+                          </Button>
+                        </>
+                      ) : null}
+                      <Button
+                        variant="outline-light"
+                        size="sm"
+                        onClick={() => setPlaylistExportDone(null)}
+                        style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                      >
+                        ok
+                      </Button>
+                    </span>
+                  </div>
+                ) : null}
 
                 {playlistImport && (
                   <div className="mt-2">
@@ -12388,7 +13798,7 @@ export default function App({
 
         {}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          {['main', 'social', 'collab'].map((tab) => {
+          {['main', 'social', 'collab', 'stats'].map((tab) => {
             const badgeCount = tab === 'social' ? unreadDmCount : tab === 'collab' ? unreadChannelCount : 0;
             return (
               <div key={tab} style={{ position: 'relative' }}>
@@ -12741,6 +14151,7 @@ export default function App({
 
           {}
           <button
+            className="smp-setting"
             onClick={() => handleThemeColorChange({ r: 255, g: 89, b: 0 })}
             style={{
               width: '100%',
@@ -12764,25 +14175,15 @@ export default function App({
               <Dropdown.Toggle
                 as="button"
                 type="button"
-                className="w-100 border-0"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  width: '100%',
-                  padding: '12px 14px',
-                  borderRadius: '8px',
-                  background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  color: '#fff',
-                  fontWeight: 'bold',
-                  fontSize: '14px'
-                }}
+                className="smp-setting"
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
               >
                 <span>{VISUALIZER_PRESETS.find((p) => p.key === visualizerPreset)?.label || visualizerPreset}</span>
               </Dropdown.Toggle>
               <Dropdown.Menu
+                align="end"
                 style={{
-                  width: '100%',
+                  minWidth: '120px',
                   maxHeight: '320px',
                   overflowY: 'auto',
                   background: '#0a0a0a',
@@ -12811,6 +14212,7 @@ export default function App({
           <div style={{ marginBottom: '30px' }}>
             <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>layout</h4>
             <button
+              className="smp-setting"
               onClick={openLayoutEditor}
               style={{
                 width: '100%',
@@ -12836,6 +14238,7 @@ export default function App({
                   const on = phone ? floatingStatus === 'ready' : miniPlayerOn;
                   return (
                     <button
+                      className="smp-setting"
                       onClick={() => {
                         if (!phone) { setMiniPlayerOn((value) => !value); return; }
                         try {
@@ -12850,15 +14253,9 @@ export default function App({
                           showNotification('could not change the mini player', 'error');
                         }
                       }}
-                      style={{
-                        padding: '8px 14px',
-                        background: on ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                        border: `1px solid ${dimBorderColor(themeColor)}`,
-                        color: on ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                        fontSize: '12px'
-                      }}
+                      style={on ? settingsOnStyle : undefined}
                     >
-                      mini player: {needsPermission ? 'needs permission' : on ? 'on' : 'off'}
+                      {needsPermission ? 'needs permission' : on ? 'on' : 'off'}
                     </button>
                   );
                 })()}
@@ -12870,6 +14267,7 @@ export default function App({
             <div style={{ marginBottom: '30px' }}>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>home screen player</h4>
               <button
+                className="smp-setting"
                 onClick={() => {
                   try {
                     const asked = window.SmpNative.pinWidget && window.SmpNative.pinWidget();
@@ -12892,7 +14290,7 @@ export default function App({
                   transition: 'none'
                 }}
               >
-                add the player widget to the home screen
+                add widget
               </button>
             </div>
           )}
@@ -12907,18 +14305,14 @@ export default function App({
               </div>
               <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 <button
+                  className="smp-setting"
                   onClick={() => setForceOffline((on) => !on)}
-                  style={{
-                    padding: '8px 14px',
-                    background: forceOffline ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                    border: `1px solid ${dimBorderColor(themeColor)}`,
-                    color: forceOffline ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                    fontSize: '12px'
-                  }}
+                  style={forceOffline ? settingsOnStyle : undefined}
                 >
-                  offline mode: {forceOffline ? 'always on' : 'automatic'}
+                  {forceOffline ? 'always offline' : 'automatic'}
                 </button>
                 <button
+                  className="smp-setting smp-setting-danger"
                   onClick={() => {
                     if (!offlineIds.size) return;
                     if (!confirmClearSaved) { setConfirmClearSaved(true); return; }
@@ -12935,7 +14329,7 @@ export default function App({
                     opacity: offlineIds.size ? 1 : 0.4
                   }}
                 >
-                  {confirmClearSaved ? 'tap again to remove all' : 'remove all saved songs'}
+                  {confirmClearSaved ? 'confirm remove' : 'remove saved songs'}
                 </button>
               </div>
             </div>
@@ -12962,6 +14356,7 @@ export default function App({
                 {downloadsFolder || 'not set yet'}
               </div>
               <button
+                className="smp-setting"
                 onClick={handleChangeDownloadsFolder}
                 style={{
                   width: '100%',
@@ -12989,126 +14384,48 @@ export default function App({
           )}
 
           {user && (
-            <div style={{ marginBottom: '15px' }}>
+            <div style={{ marginBottom: '30px' }}>
+              <h4 style={settingsTitleStyle}>what i'm listening to</h4>
               <button
+                className="smp-setting"
                 onClick={() => onHideListeningToggle && onHideListeningToggle(!hideListening)}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  background: hideListening ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                  border: `1px solid ${dimBorderColor(themeColor)}`,
-                  borderRadius: '6px',
-                  color: hideListening ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                  fontWeight: hideListening ? 'bold' : 'normal'
-                }}
+                style={!hideListening ? settingsOnStyle : undefined}
               >
-                what i'm listening to: {hideListening ? 'hidden' : 'shown'}
+                {hideListening ? 'hidden' : 'shown'}
               </button>
             </div>
           )}
 
           {discordAvailable && (
-            <div style={{ marginBottom: '15px' }}>
+            <div style={{ marginBottom: '30px' }}>
+              <h4 style={settingsTitleStyle}>discord status</h4>
               <button
+                className="smp-setting"
                 onClick={() => setDiscordOn((on) => !on)}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  background: discordOn ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                  border: `1px solid ${dimBorderColor(themeColor)}`,
-                  borderRadius: '6px',
-                  color: discordOn ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                  fontWeight: discordOn ? 'bold' : 'normal'
-                }}
+                style={discordOn ? settingsOnStyle : undefined}
               >
-                discord status: {discordOn ? 'on' : 'off'}
+                {discordOn ? 'on' : 'off'}
               </button>
             </div>
           )}
 
-          <div style={{ marginBottom: '15px' }}>
-            <button
-              onClick={cycleProgressIcon}
-              style={{
-                width: '100%',
-                padding: '12px',
-                background: 'transparent',
-                border: `1px solid ${dimBorderColor(themeColor)}`,
-                borderRadius: '6px',
-                color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                cursor: 'pointer',
-                fontSize: '14px'
-              }}
-            >
-              progress icon: {progressIconMode === 'custom' ? 'picture' : progressIconMode}
+          <div style={{ marginBottom: '30px' }}>
+            <h4 style={settingsTitleStyle}>progress icon</h4>
+            <button className="smp-setting" onClick={cycleProgressIcon}>
+              {progressIconMode === 'custom' ? 'picture' : progressIconMode}
             </button>
             {progressIconMode === 'custom' && (
-              <button
-                onClick={() => progressIconInputRef.current && progressIconInputRef.current.click()}
-                style={{
-                  width: '100%',
-                  marginTop: '8px',
-                  padding: '12px',
-                  background: 'transparent',
-                  border: `1px solid ${dimBorderColor(themeColor)}`,
-                  borderRadius: '6px',
-                  color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  cursor: 'pointer',
-                  fontSize: '14px'
-                }}
-              >
+              <button className="smp-setting" onClick={() => progressIconInputRef.current && progressIconInputRef.current.click()}>
                 choose picture
               </button>
             )}
             <input ref={progressIconInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleProgressIconFile} />
           </div>
 
-          {currentVersion && (
-            <div style={{ marginBottom: '15px' }}>
-              <div
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  border: `1px solid ${dimBorderColor(themeColor)}`,
-                  borderRadius: '6px',
-                  color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  fontSize: '14px',
-                  textAlign: 'center'
-                }}
-              >
-                version {currentVersion}{shellVersion && shellVersion !== currentVersion ? ` (app ${shellVersion})` : ''}
-              </div>
-            </div>
-          )}
-
-          {versionMismatch && (
-            <div style={{ marginBottom: '15px' }}>
-              <button
-                onClick={applyUpdate}
-                disabled={updateBusy}
-                style={{
-                  width: '100%',
-                  padding: '12px',
-                  background: 'transparent',
-                  border: `1px solid ${dimBorderColor(themeColor)}`,
-                  borderRadius: '6px',
-                  color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                  cursor: 'pointer',
-                  fontSize: '14px'
-                }}
-              >
-                {updateBusy ? (updateProgress ? `updating ${updateProgress}` : 'updating...') : updateKind === 'installer' ? `download ${latestVersion}` : `update to ${latestVersion}`}
-              </button>
-            </div>
-          )}
-
-          {}
-          <div style={{ marginBottom: '15px' }}>
+          <div style={{ marginBottom: '30px' }}>
+            <h4 style={settingsTitleStyle}>debug logs</h4>
             <button
+              className="smp-setting"
               onClick={() => {
                 const newMode = !debugMode;
                 if (onDebugModeToggle) {
@@ -13116,23 +14433,26 @@ export default function App({
                 }
                 addDebugLog('settings', `debug mode ${newMode ? 'enabled' : 'disabled'}`, { nextMode: newMode }, true);
               }}
-              style={{
-                width: '100%',
-                padding: '12px',
-                background: debugMode ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                border: `1px solid ${dimBorderColor(themeColor)}`,
-                borderRadius: '6px',
-                color: debugMode ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                cursor: 'pointer',
-                fontSize: '14px',
-                fontWeight: debugMode ? 'bold' : 'normal'
-              }}
+              style={debugMode ? settingsOnStyle : undefined}
             >
-              debug logs: {debugMode ? 'ON' : 'OFF'}
+              {debugMode ? 'on' : 'off'}
             </button>
           </div>
 
-          <div style={{ marginTop: '24px', fontSize: '12px' }}>
+          {currentUserId ? ['youtube'].filter((provider) => integrations[provider] && integrations[provider].configured).map((provider) => (
+            <div key={provider} style={{ marginBottom: '30px' }}>
+              <h4 style={settingsTitleStyle}>{provider}{integrations[provider].connected && integrations[provider].account ? ' \u00b7 ' + integrations[provider].account : ''}</h4>
+              <button
+                className="smp-setting"
+                onClick={() => (integrations[provider].connected ? disconnectProvider(provider) : connectProvider(provider))}
+                style={integrations[provider].connected ? settingsOnStyle : undefined}
+              >
+                {integrations[provider].connected ? 'disconnect' : 'connect'}
+              </button>
+            </div>
+          )) : null}
+
+          <div className="smp-settings-footer" style={{ marginTop: '24px', fontSize: '12px' }}>
             <a
               href="https://ko-fi.com/shibenchi"
               target="_blank"
@@ -13145,6 +14465,18 @@ export default function App({
             >
               support the project
             </a>
+            {currentVersion || versionMismatch ? (
+              <span className="smp-footer-version">
+                {currentVersion ? (
+                  <span style={{ color: '#9ca3af' }}>v{currentVersion}{shellVersion && shellVersion !== currentVersion ? ` (app ${shellVersion})` : ''}</span>
+                ) : null}
+                {versionMismatch ? (
+                  <button className="smp-footer-button" onClick={applyUpdate} disabled={updateBusy}>
+                    {updateBusy ? (updateProgress ? `updating ${updateProgress}` : 'updating...') : updateKind === 'installer' ? `download ${latestVersion}` : `update to ${latestVersion}`}
+                  </button>
+                ) : null}
+              </span>
+            ) : null}
           </div>
         </Modal.Body>
       </Modal>
@@ -13332,7 +14664,7 @@ export default function App({
                 pointerEvents: 'none'
               }}
             >
-              {tab === 'main' ? renderMainView() : tab === 'social' ? socialView : collabView}
+              {tab === 'main' ? renderMainView() : tab === 'social' ? socialView : tab === 'stats' ? statsView : collabView}
             </div>
           ))}
         </div>
@@ -13646,6 +14978,72 @@ export default function App({
           </Button>
         </Modal.Footer>
       </Modal>
+
+      {(() => {
+        const first = shibbyConnect && shibbyConnect.kind === 'first';
+        const view = shibbyTalk
+          ? {
+            key: shibbyTalk.key,
+            narrow: Boolean(shibbyTalk.narrow),
+            text: shibbyTalk.text,
+            buttons: shibbyTalk.buttons.map((button) => ({ label: button.label, onClick: () => answerShibbyTalk(button.value) }))
+          }
+          : shibbyConnect
+          ? {
+            key: first ? 'connect-first' : 'connect-again',
+            narrow: !first,
+            text: first
+              ? `yo bro, heads up. the next screen is google's and it says this app isn't verified, which looks a little sketchy. press advanced at the bottom, then go to the app (unsafe), to keep going. i only need your account connection so i can create playlists in your account (and read yours when you import one). without it songs would be missing and i'd be limited in what i can do. if you still don't trust this app that's fine, you can go back`
+              : "you've denied me before, is it still alright to continue?",
+            buttons: [
+              { label: first ? 'continue' : 'yes, continue', onClick: () => answerShibbyConnect(true) },
+              { label: first ? 'go back' : 'no', onClick: () => answerShibbyConnect(false) }
+            ]
+          }
+          : shibby
+            ? {
+              key: shibby.state,
+              narrow: false,
+              text: shibby.state === 'ask'
+                ? `yo bro, "${shibby.title.length > 70 ? shibby.title.slice(0, 70) + '...' : shibby.title}" is unavailable. i can search for the same title and replace it (not very confident unfortunately) or you can do it yourself. just letting you know`
+                : shibby.state === 'searching'
+                  ? 'searching...'
+                  : "couldn't find anything that matches, sorry bro. you can delete it or skip it",
+              buttons: [
+                ...(shibby.state === 'ask' ? [{ label: 'search and replace', onClick: shibbyReplace }] : []),
+                ...(shibby.state !== 'searching' ? [{ label: 'delete from queue', onClick: shibbyDelete }, { label: 'skip', onClick: shibbySkip }] : [])
+              ]
+            }
+            : null;
+        if (!view) return null;
+        return (
+          <div data-shibby={view.key} style={{ position: 'fixed', right: '24px', bottom: '90px', zIndex: 2000, display: 'flex', alignItems: 'flex-start', gap: '16px', width: view.narrow ? 'min(340px, calc(100vw - 32px))' : 'min(440px, calc(100vw - 32px))' }}>
+            <div
+              aria-hidden="true"
+              style={{
+                width: '64px',
+                height: '64px',
+                flexShrink: 0,
+                borderRadius: '50%',
+                background: '#fff url(/download.png) 50% 44% / 150% no-repeat',
+                border: `1px solid ${accentRgb}`
+              }}
+            />
+            <div style={{ position: 'relative', flex: 1, minWidth: 0, background: 'rgb(20, 20, 20)', border: `1px solid ${accentRgb}`, borderRadius: '10px', padding: '12px 14px', boxShadow: 'var(--theme-neon-glow)' }}>
+              <div style={{ position: 'absolute', left: '-6px', top: '24px', width: '10px', height: '10px', background: 'rgb(20, 20, 20)', borderLeft: `1px solid ${accentRgb}`, borderBottom: `1px solid ${accentRgb}`, transform: 'rotate(45deg)' }} />
+              <div style={{ color: accentRgb, fontWeight: 'bold', fontSize: '13px', marginBottom: '6px' }}>Shibby</div>
+              <div style={{ color: '#fff', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere' }}>{view.text}</div>
+              {view.buttons.length ? (
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' }}>
+                  {view.buttons.map((button) => (
+                    <Button key={button.label} variant="outline-light" size="sm" onClick={button.onClick} style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}>{button.label}</Button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
+        );
+      })()}
 
       {showToast && (
         <div className={`toast ${showToast.variant}`}>

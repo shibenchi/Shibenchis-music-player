@@ -184,7 +184,16 @@ const SOCIAL_PREFIXES = [
   '/api/servers',
   '/api/server/',
   '/api/collab/',
-  '/api/user/'
+  '/api/user/',
+  // private messages (keys), invites to rooms, listening stats, connected YouTube / Spotify accounts and the
+  // playlists that go to them or come from them. without these the app, which gets its screens from its own
+  // local server and its social data from the club server, sent them to the local server (no login there)
+  '/api/e2e/',
+  '/api/invites',
+  '/api/stats',
+  '/api/integrations',
+  '/api/export/',
+  '/api/import/'
 ];
 
 // is this path one of the "social" endpoints (gets auth handling)? stuff
@@ -253,6 +262,8 @@ async function socialFetch(path, options = {}) {
     headers: {
       'Content-Type': 'application/json',
       'X-Client-Id': CLIENT_ID,
+      // this app can open private (end to end encrypted) messages (when the page has the cryptography for it)
+      ...(globalThis.crypto && globalThis.crypto.subtle ? { 'X-SMP-E2E': '1' } : {}),
       ...(authToken ? { 'X-Auth-Token': authToken } : {}),
       ...options.headers
     }

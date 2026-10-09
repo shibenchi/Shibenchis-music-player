@@ -1,5 +1,23 @@
 import React, { useState } from 'react';
 import { socialFetch } from './socialApi';
+import { createE2e, e2eSupported } from './e2e';
+
+// private messages need the account's key on this device. signing in is the moment the password is at hand: the key is
+// made (the first time) or fetched and unlocked (on a new device), in the background. the messages panel asks for the
+// password itself if this did not work out
+async function setupPrivateMessages(userId, password) {
+  if (!e2eSupported() || !userId) return;
+  try {
+    const api = {
+      get: async (path) => (await socialFetch(path)).json(),
+      put: async (path, body) => (await socialFetch(path, { method: 'PUT', body: JSON.stringify(body) })).json()
+    };
+    await createE2e({ userId, api }).setup(password);
+    window.dispatchEvent(new Event('smp-e2e-changed'));
+  } catch {
+    // asked for later
+  }
+}
 
 // same rules the server enforces, checked here too so the error shows up
 // before a round trip. the server still has the final say
@@ -61,6 +79,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
         if (data.authToken) {
           localStorage.setItem('music_auth_token', data.authToken);
         }
+        setupPrivateMessages(data.user.id, password);
         onAuthSuccess(data.user);
       } else {
         if (password !== confirmPassword) {
@@ -97,6 +116,7 @@ export default function AuthForm({ user, onAuthSuccess, onLogout, themeColor }) 
         if (data.authToken) {
           localStorage.setItem('music_auth_token', data.authToken);
         }
+        setupPrivateMessages(data.user.id, password);
         onAuthSuccess(data.user);
       }
     } catch (err) {

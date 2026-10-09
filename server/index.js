@@ -202,7 +202,41 @@ if (IS_LOCAL_HELPER) {
   // tweaking gets around) - everything else here just avoids paying that
   // cost twice: once via the resolved-url cache above, and once via
   // /api/prefetch getting called ahead of time for whatevers up next in queue
+  // videos that YouTube says are not there (removed, private, blocked). remembered for half an hour, so a second try is
+  // answered at once instead of spending another 20 seconds in yt-dlp (a song like that was tried over and over:
+  // every try ran the resolve, then a full download, and the player showed "slow connection" the whole time)
+  const unavailableVideos = new Map(); // videoId -> until
+  const UNAVAILABLE_TTL_MS = 30 * 60 * 1000;
+  const UNAVAILABLE_PATTERN = /video unavailable|this video is (not available|unavailable|private|no longer available)|private video|has been removed|removed by the uploader|account (associated with this video )?has been terminated|blocked it in your country|not available in your country|not made this video available|video is not available/i;
+  const isUnavailableError = (error) => Boolean(error && (error.unavailable || UNAVAILABLE_PATTERN.test(String(error.stderr || '') + ' ' + String(error.message || ''))));
+  function unavailableNow(videoId) {
+    const until = unavailableVideos.get(videoId);
+    if (!until) return false;
+    if (until < Date.now()) { unavailableVideos.delete(videoId); return false; }
+    return true;
+  }
+  function markUnavailable(videoId) {
+    unavailableVideos.set(videoId, Date.now() + UNAVAILABLE_TTL_MS);
+  }
+  // YouTube's own answer to "is this video there": 404 is removed or private, and it comes in a few hundred
+  // milliseconds where yt-dlp needs 6 to 19 seconds to reach the same conclusion. only a 404 settles this promise
+  // (rejecting), everything else leaves the decision to yt-dlp
+  function unavailableAtYoutube(videoId) {
+    return axios.get('https://www.youtube.com/oembed', {
+      params: { url: `https://www.youtube.com/watch?v=${videoId}`, format: 'json' },
+      timeout: 4000,
+      validateStatus: () => true
+    }).then((response) => {
+      if (response.status === 404) throw Object.assign(new Error('Video unavailable'), { unavailable: true });
+      return new Promise(() => {});
+    }, () => new Promise(() => {}));
+  }
+
   function resolveDirectUrl(videoId) {
+    if (unavailableNow(videoId)) {
+      helperLog(`resolveDirectUrl(${videoId}): known to be unavailable, not asking again`);
+      return Promise.reject(Object.assign(new Error('This video is not available on YouTube'), { unavailable: true }));
+    }
     const cached = resolvedUrlCache.get(videoId);
     if (cached && cached.expiresAt > Date.now()) {
       helperLog(`resolveDirectUrl(${videoId}): cache hit, instant`);
@@ -216,7 +250,9 @@ if (IS_LOCAL_HELPER) {
     const startedAt = Date.now();
     helperLog(`resolveDirectUrl(${videoId}): starting cold yt-dlp resolve`);
     const promise = (async () => {
-      const raw = await ytdlp(`https://www.youtube.com/watch?v=${videoId}`, {
+      const gone = unavailableAtYoutube(videoId);
+      gone.catch(() => {});
+      const run = ytdlp(`https://www.youtube.com/watch?v=${videoId}`, {
         dumpSingleJson: true,
         noWarnings: true,
         noCheckCertificate: true,
@@ -233,6 +269,15 @@ if (IS_LOCAL_HELPER) {
         // both ways against several of the failing videoIds
         format: AUDIO_FORMAT_SELECTOR
       });
+      run.catch(() => {});
+      let raw;
+      try {
+        raw = await Promise.race([run, gone]);
+      } catch (error) {
+        // YouTube said the video is not there: yt-dlp is stopped, it would only come to the same answer later
+        if (error && error.unavailable && typeof run.kill === 'function') { try { run.kill(); } catch { /* already over */ } }
+        throw error;
+      }
       const info = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!info.url) throw new Error('no direct stream url resolved');
       resolvedUrlCache.set(videoId, { url: info.url, expiresAt: Date.now() + RESOLVED_URL_TTL_MS });
@@ -241,8 +286,13 @@ if (IS_LOCAL_HELPER) {
       return info.url;
     })()
       .catch((err) => {
-        noteYoutubeFailure(err);
-        helperLog(`resolveDirectUrl(${videoId}): FAILED after ${Date.now() - startedAt}ms - ${err.message}`);
+        if (isUnavailableError(err)) {
+          err.unavailable = true;
+          markUnavailable(videoId);
+        } else {
+          noteYoutubeFailure(err);
+        }
+        helperLog(`resolveDirectUrl(${videoId}): FAILED after ${Date.now() - startedAt}ms - ${String(err.message).split('\n')[0].slice(0, 300)}`);
         throw err;
       })
       .finally(() => inFlightResolves.delete(videoId));
@@ -270,9 +320,9 @@ if (IS_LOCAL_HELPER) {
       await resolveDirectUrl(videoId);
       res.json({ ok: true });
     } catch (error) {
-      helperLog(`/api/prefetch(${videoId}): failed - ${error.message}`);
+      helperLog(`/api/prefetch(${videoId}): failed - ${String(error.message).split('\n')[0].slice(0, 300)}`);
       // not fatal - /api/stream will just resolve cold when it actually plays
-      res.json({ ok: false, error: error.message });
+      res.json({ ok: false, error: error.message, ...(error.unavailable ? { code: 'unavailable' } : {}) });
     }
   });
 
@@ -318,7 +368,7 @@ if (IS_LOCAL_HELPER) {
     // instant as the resolve below just makes them fight over cpu/network
     // right when the resolve latency is what the user's staring at
     setTimeout(() => {
-      if (inYoutubeCooldown()) return;
+      if (inYoutubeCooldown() || unavailableNow(videoId)) return;
       downloadToCache(videoId, audioFile).catch(() => {
         // background cache-warm failed; the fallback path below will retry
         // it inline if the fast path also fails too, otherwise just skip
@@ -394,6 +444,13 @@ if (IS_LOCAL_HELPER) {
       if (isBotCheckError(fastPathError)) {
         helperLog(`/api/stream(${videoId}): youtube bot check, not retrying`);
         if (!res.headersSent) return sendYoutubeError(res, fastPathError, 'Stream failed');
+        return res.destroy();
+      }
+      // removed, private or blocked: there is nothing to fall back to. answered at once, with a status the page can read
+      if (isUnavailableError(fastPathError)) {
+        markUnavailable(videoId);
+        helperLog(`/api/stream(${videoId}): not available on youtube, answered after ${Date.now() - reqStartedAt}ms`);
+        if (!res.headersSent) return res.status(410).json({ error: 'This video is not available on YouTube', code: 'unavailable' });
         return res.destroy();
       }
       helperLog(`/api/stream(${videoId}): fast path FAILED at ${Date.now() - reqStartedAt}ms - ${fastPathError.message}, falling back to full download`);
@@ -480,6 +537,17 @@ if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 // logging setup
 const logFile = path.join(logsDir, `server-${new Date().toISOString().split('T')[0]}.log`);
 const errorLogFile = path.join(logsDir, `errors-${new Date().toISOString().split('T')[0]}.log`);
+
+// the app on a computer: a person is sitting at it, a server that logged a problem and went on is better for them
+// than a dead one (the Discord crash took the whole local server down with it)
+if (process.env.APP_DATA_DIR && process.env.DISABLE_MEDIA_ENDPOINTS !== '1') {
+  process.on('uncaughtException', (error) => {
+    try { logToFile('[SERVER] uncaught error, going on: ' + ((error && error.stack) || error), true); } catch { /* the log itself is the problem */ }
+  });
+  process.on('unhandledRejection', (reason) => {
+    try { logToFile('[SERVER] unhandled rejection, going on: ' + ((reason && reason.stack) || reason), true); } catch { /* the log itself is the problem */ }
+  });
+}
 
 function logToFile(message, isError = false) {
   const timestamp = new Date().toISOString();
@@ -707,6 +775,60 @@ function isListeningHidden(userId) {
   }
   return hiddenListeningCache.get(userId);
 }
+
+// every open connection of one account
+function sendToUser(userId, payload) {
+  wsClients.forEach((client) => {
+    if (client.userId === userId) sendWs(client.ws, payload);
+  });
+}
+
+// ---- what people listen to, counted for their own stats. a connection that says it is playing something starts
+// a stretch, any change (another song, a pause, the connection going away) and every half minute while it plays
+// close it and add it to the account's stats. two devices playing at once do not count twice
+const listeningCredited = new Map();
+// flushing: the stretch is still going, so a piece that is too short to count is left to grow instead of dropped.
+// when a stretch ends, a short one is dropped (somebody skipping through songs), unless part of it was counted already
+function commitListening(client, nowMs, flushing = false) {
+  const state = client.listeningState;
+  const since = client.listeningSince;
+  if (!client.userId || !state || !since || state.is_playing === false) {
+    client.listeningSince = null;
+    client.listeningCounted = 0;
+    return;
+  }
+  const end = Math.floor(nowMs / 1000);
+  const start = Math.max(Math.floor(since / 1000), listeningCredited.get(client.userId) || 0);
+  if (end - start < (client.listeningCounted ? 1 : 5)) {
+    if (flushing) return;
+    client.listeningSince = null;
+    client.listeningCounted = 0;
+    return;
+  }
+  try {
+    if (db.recordListening(client.userId, state, start, end)) {
+      listeningCredited.set(client.userId, end);
+      client.listeningCounted = (client.listeningCounted || 0) + (end - start);
+    }
+  } catch (error) {
+    logToFile(`[STATS] Could not record listening: ${error.message}`, true);
+  }
+  client.listeningSince = flushing ? nowMs : null;
+  if (!flushing) client.listeningCounted = 0;
+}
+// the stretch so far is counted and goes on (the person's stats page is then up to the second)
+function flushListening(userId = null) {
+  const now = Date.now();
+  wsClients.forEach((client) => {
+    if (!client.listeningSince || (userId && client.userId !== userId)) return;
+    commitListening(client, now, true);
+  });
+}
+setInterval(() => flushListening(), 30 * 1000).unref();
+
+// invites to rooms are kept a day
+try { db.purgeRoomInvites(); } catch { /* nothing to clean */ }
+setInterval(() => { try { db.purgeRoomInvites(); } catch { /* next time */ } }, 60 * 60 * 1000).unref();
 
 function getConnectedUsers() {
   const connectedUsers = new Map();
@@ -2917,6 +3039,11 @@ app.get('/api/users', requireAuth, (req, res) => {
     });
 
     // slap online status + theme color onto every user
+    // when somebody was last seen is for an admin and for their friends to know, nobody else gets it for the ones who are offline
+    const isAdminRequest = Boolean(db.getUserById(req.session.userId)?.is_admin);
+    const friendIds = db.friendIdsOf(req.session.userId);
+    const lastSeenAll = new Map(db.getAllOnlineStatus().map((row) => [row.user_id, row.last_seen]));
+    const usersWithKeys = new Set(db.userIdsWithKeys());
     const usersWithStatus = allUsers.map((u) => {
       const livePresence = presenceMap.get(u.id);
       const onlineStatus = onlineStatusMap.get(u.id);
@@ -2926,7 +3053,9 @@ app.get('/api/users', requireAuth, (req, res) => {
         ...u,
         is_online: isOnline,
         current_server_id: livePresence?.current_server_id || onlineStatus?.current_server_id || null,
-        last_seen: onlineStatus?.last_seen || null,
+        last_seen: onlineStatus?.last_seen || ((isAdminRequest || friendIds.has(u.id)) ? (lastSeenAll.get(u.id) || null) : null),
+        is_friend: friendIds.has(u.id),
+        has_e2e: usersWithKeys.has(u.id),
         listening_to: livePresence?.listening_to || null,
         platforms: livePresence?.platforms || [],
         theme_color: userThemeColors[u.id] || { r: 255, g: 89, b: 0 }
@@ -2990,6 +3119,7 @@ app.delete('/api/users/:userId', requireAuth, requireAdmin, (req, res) => {
 });
 
 // send friend request
+const friendRequestLimiter = validation.createRateLimiter({ windowMs: 60 * 60 * 1000, max: 40 });
 app.post('/api/friends/request', requireAuth, (req, res) => {
   try {
     const { receiverId } = req.body;
@@ -2999,6 +3129,14 @@ app.post('/api/friends/request', requireAuth, (req, res) => {
 
     if (receiverId === req.session.userId) {
       return res.status(400).json({ error: 'Cannot send friend request to yourself' });
+    }
+
+    if (!db.getUserById(receiverId)) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const limit = friendRequestLimiter.hit(req.session.userId);
+    if (!limit.allowed) {
+      return tooManyAttempts(res, limit.retryAfterSec);
     }
 
     const result = db.createFriendRequest(req.session.userId, receiverId);
@@ -3012,7 +3150,13 @@ app.post('/api/friends/request', requireAuth, (req, res) => {
     }
 
     logToFile(`[FRIENDS] Friend request sent from ${req.session.username} to ${receiverId}`);
-    res.json({ ok: true, request: result });
+    if (result.auto_accepted) {
+      // they had asked first, so this is a yes
+      sendToUser(receiverId, { type: 'friend_accepted', from: req.session.username, from_id: req.session.userId });
+    } else {
+      sendToUser(receiverId, { type: 'friend_request_received', from: req.session.username, from_id: req.session.userId, request_id: result.id });
+    }
+    res.json({ ok: true, request: result, auto_accepted: Boolean(result.auto_accepted) });
   } catch (error) {
     logToFile(`[FRIENDS] Send request error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to send friend request' });
@@ -3023,7 +3167,9 @@ app.post('/api/friends/request', requireAuth, (req, res) => {
 app.get('/api/friends/requests', requireAuth, (req, res) => {
   try {
     const requests = db.getPendingFriendRequests(req.session.userId);
-    res.json({ ok: true, requests });
+    // the ones this person sent and nobody answered yet
+    const sent = db.getSentFriendRequests(req.session.userId);
+    res.json({ ok: true, requests, sent });
   } catch (error) {
     logToFile(`[FRIENDS] Get requests error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to get friend requests' });
@@ -3098,6 +3244,9 @@ app.post('/api/friends/requests/:id/accept', requireAuth, (req, res) => {
     }
 
     logToFile(`[FRIENDS] Friend request accepted: ${requestId} by ${receiverId}`);
+    if (result.request) {
+      sendToUser(result.request.sender_id, { type: 'friend_accepted', from: req.session.username, from_id: receiverId });
+    }
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[FRIENDS] Accept request error (requestId=${req.params?.id || 'unknown'}, receiverId=${req.session?.userId || 'unknown'}): ${error.stack || error.message}`, true);
@@ -3124,6 +3273,24 @@ app.post('/api/friends/requests/:id/decline', requireAuth, (req, res) => {
   }
 });
 
+// take back a request that was sent
+app.delete('/api/friends/requests/:id', requireAuth, (req, res) => {
+  try {
+    const result = db.cancelFriendRequest(req.params.id, req.session.userId);
+    if (result.error === 'forbidden') {
+      return res.status(403).json({ error: 'You can only take back your own requests' });
+    }
+    if (result.error) {
+      return res.status(404).json({ error: 'Friend request not found' });
+    }
+    sendToUser(result.request.receiver_id, { type: 'friend_request_cancelled', from_id: req.session.userId, request_id: req.params.id });
+    res.json({ ok: true });
+  } catch (error) {
+    logToFile(`[FRIENDS] Cancel request error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to take the request back' });
+  }
+});
+
 // get friends list
 app.get('/api/friends', requireAuth, (req, res) => {
   try {
@@ -3141,6 +3308,7 @@ app.delete('/api/friends/:friendId', requireAuth, (req, res) => {
     const { friendId } = req.params;
     db.removeFriend(req.session.userId, friendId);
     logToFile(`[FRIENDS] Friend removed: ${friendId}`);
+    sendToUser(friendId, { type: 'friend_removed', from_id: req.session.userId });
     res.json({ ok: true });
   } catch (error) {
     logToFile(`[FRIENDS] Remove friend error: ${error.message}`, true);
@@ -3151,9 +3319,104 @@ app.delete('/api/friends/:friendId', requireAuth, (req, res) => {
 // direct messaging
 
 // get conversation list
+// ---- listening stats: what an account has listened to, for that account (and a friends list for comparing)
+const STATS_RANGES = ['week', 'month', 'year', 'all'];
+app.get('/api/stats', requireAuth, (req, res) => {
+  try {
+    const range = STATS_RANGES.includes(req.query.range) ? req.query.range : 'week';
+    flushListening(req.session.userId);
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, stats: db.getListeningStats(req.session.userId, { range, offsetMin: Number(req.query.tz) || 0 }) });
+  } catch (error) {
+    logToFile(`[STATS] Get stats error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to get your stats' });
+  }
+});
+
+// how much the person and their friends listened in a range. a friend who keeps their listening to themselves is not in it
+app.get('/api/stats/friends', requireAuth, (req, res) => {
+  try {
+    const range = STATS_RANGES.includes(req.query.range) ? req.query.range : 'week';
+    const me = req.session.userId;
+    flushListening();
+    const friends = db.getFriends(me).filter((friend) => !isListeningHidden(friend.friend_id));
+    const names = new Map(friends.map((friend) => [friend.friend_id, friend.username]));
+    names.set(me, req.session.username);
+    const board = db.getListeningBoard([...names.keys()], { range, offsetMin: Number(req.query.tz) || 0 })
+      .map((row) => ({ ...row, username: names.get(row.user_id), me: row.user_id === me }));
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, range, board });
+  } catch (error) {
+    logToFile(`[STATS] Get friends board error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to get the list' });
+  }
+});
+
+// ---- connected YouTube and Spotify accounts: exporting playlists to them, reading a Spotify playlist (see integrations.js)
+require('./integrations').createIntegrations({ app, db, requireAuth, validation, logToFile, getPublicAppUrl });
+
+// ---- end to end encrypted direct messages
+// the apps lock a message with a key only the two people have, the server stores and passes on what it can not read.
+// each account has one key pair: the public half is handed to anyone who wants to write to the person, the private
+// half is stored locked with the person's password by the app (the server keeps the locked blob, it can not open it).
+// an app older than this has no idea what a locked message is, so it is handed a note instead of the gibberish
+const E2E_NOTE = '[private message, update the app to read it]';
+const wantsE2e = (req) => req.headers['x-smp-e2e'] === '1';
+function presentDirectMessage(message, canOpen) {
+  if (canOpen || !message || !db.atRest.isEnvelope(message.message)) return message;
+  return { ...message, message: E2E_NOTE };
+}
+const ENVELOPE_PATTERN = /^e2e1:[A-Za-z0-9+/=_-]{16,16000}$/;
+
+function publicKeyOf(userId) {
+  const key = db.getUserKey(userId);
+  return key ? { public_key: key.public_key, kid: key.kid } : null;
+}
+
+// the person's own key (public half and the locked private half)
+app.get('/api/e2e/key', requireAuth, (req, res) => {
+  const key = db.getUserKey(req.session.userId);
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    key: key ? { public_key: key.public_key, kid: key.kid, wrapped_private: key.wrapped_private, wrap_salt: key.wrap_salt, wrap_iv: key.wrap_iv, wrap_iters: key.wrap_iters } : null
+  });
+});
+
+// the first device of an account makes the key and stores it here. there is no way to replace a key that exists
+// (two devices making one at the same moment end up with the first one, the second gets it back in the answer)
+app.put('/api/e2e/key', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const text = (value, max) => typeof value === 'string' && value.length > 0 && value.length <= max;
+  let jwk = null;
+  try { jwk = JSON.parse(body.public_key); } catch { jwk = null; }
+  const validKey = jwk && jwk.kty === 'EC' && jwk.crv === 'P-256' && text(jwk.x, 64) && text(jwk.y, 64) && !jwk.d;
+  const iters = Number(body.wrap_iters);
+  if (!validKey || !text(body.kid, 64) || !text(body.wrapped_private, 4096) || !text(body.wrap_salt, 128) || !text(body.wrap_iv, 64) || !Number.isInteger(iters) || iters < 100000 || iters > 5000000) {
+    return res.status(400).json({ error: 'That key is not valid' });
+  }
+  const created = db.createUserKey(req.session.userId, {
+    public_key: body.public_key, kid: body.kid, wrapped_private: body.wrapped_private, wrap_salt: body.wrap_salt, wrap_iv: body.wrap_iv, wrap_iters: iters
+  });
+  const key = db.getUserKey(req.session.userId);
+  res.json({
+    ok: true,
+    created,
+    key: { public_key: key.public_key, kid: key.kid, wrapped_private: key.wrapped_private, wrap_salt: key.wrap_salt, wrap_iv: key.wrap_iv, wrap_iters: key.wrap_iters }
+  });
+});
+
+// the public key of somebody, or none when that person has not turned private messages on (their app is older)
+app.get('/api/e2e/public/:userId', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, key: publicKeyOf(req.params.userId) });
+});
+
 app.get('/api/messages/conversations', requireAuth, (req, res) => {
   try {
-    const conversations = db.getConversations(req.session.userId);
+    const canOpen = wantsE2e(req);
+    const conversations = db.getConversations(req.session.userId)
+      .map((entry) => (canOpen || !db.atRest.isEnvelope(entry.last_message) ? entry : { ...entry, last_message: E2E_NOTE }));
     res.json({ ok: true, conversations });
   } catch (error) {
     logToFile(`[MESSAGES] Get conversations error: ${error.message}`, true);
@@ -3166,7 +3429,8 @@ app.get('/api/messages/:userId', requireAuth, (req, res) => {
   try {
     const { userId } = req.params;
     const uid = req.session.userId;
-    const messages = db.getDirectMessages(uid, userId, userId, uid);
+    const canOpen = wantsE2e(req);
+    const messages = db.getDirectMessages(uid, userId, userId, uid).map((entry) => presentDirectMessage(entry, canOpen));
     res.json({ ok: true, messages });
   } catch (error) {
     logToFile(`[MESSAGES] Get messages error: ${error.message}`, true);
@@ -3179,28 +3443,53 @@ app.post('/api/messages/:userId', requireAuth, (req, res) => {
   try {
     const { userId } = req.params;
     const { message, text, sender_theme_color } = req.body || {};
-    const contentCheck = validation.cleanText(message || text || '', { field: 'Message', max: 2000, multiline: true });
-    if (!contentCheck.ok) {
-      return res.status(400).json({ error: contentCheck.error });
-    }
-    const content = contentCheck.value;
 
     const targetUser = db.getUserById(userId);
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const msg = db.createDirectMessage(req.session.userId, req.session.username, userId, targetUser.username, content, sender_theme_color || null);
-
-    // ping the recipient over ws if theyre online
-    if (globalWss) {
-      broadcastWs({
-        type: 'direct_message',
-        message: msg
-      }, (client) => client.userId === userId || client.userId === req.session.userId);
+    // a message made by an app that knows end to end encryption arrives as an envelope the server can not read
+    const raw = String(message || text || '');
+    const senderKey = db.getUserKey(req.session.userId);
+    const receiverKey = db.getUserKey(userId);
+    let content;
+    if (raw.startsWith('e2e1:')) {
+      if (!ENVELOPE_PATTERN.test(raw)) return res.status(400).json({ error: 'That message is not valid' });
+      if (!senderKey || !receiverKey) return res.status(400).json({ error: 'Both people need private messages turned on', code: 'e2e_missing_key' });
+      // the envelope says which keys it was made with (not secret), they have to be the two people's
+      try {
+        const head = JSON.parse(Buffer.from(raw.slice(5), 'base64').toString('utf8'));
+        if (head.s !== senderKey.kid || head.r !== receiverKey.kid) return res.status(400).json({ error: 'That message was made with the wrong keys', code: 'e2e_wrong_key' });
+      } catch {
+        return res.status(400).json({ error: 'That message is not valid' });
+      }
+      content = raw;
+    } else {
+      // plain text is only for two people whose apps do not know about private messages yet. once either has
+      // them on (or the server is told to require them) a plain message is refused
+      if (process.env.SMP_REQUIRE_E2E === '1' || senderKey || receiverKey) {
+        return res.status(400).json({ error: 'Messages are private now, update the app to send one', code: 'e2e_required' });
+      }
+      const contentCheck = validation.cleanText(raw, { field: 'Message', max: 2000, multiline: true });
+      if (!contentCheck.ok) {
+        return res.status(400).json({ error: contentCheck.error });
+      }
+      content = contentCheck.value;
     }
 
-    res.json({ ok: true, message: msg });
+    const msg = db.createDirectMessage(req.session.userId, req.session.username, userId, targetUser.username, content, sender_theme_color || null);
+
+    // ping the recipient (and the sender's other devices) over ws if they are online. an app that does not know
+    // private messages gets the note instead of the ciphertext
+    if (globalWss) {
+      wsClients.forEach((client) => {
+        if (client.userId !== userId && client.userId !== req.session.userId) return;
+        sendWs(client.ws, { type: 'direct_message', message: presentDirectMessage(msg, client.e2e === true) });
+      });
+    }
+
+    res.json({ ok: true, message: presentDirectMessage(msg, wantsE2e(req)) });
   } catch (error) {
     logToFile(`[MESSAGES] Send message error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to send message' });
@@ -3273,6 +3562,7 @@ function joinServerAsUser(req, res, server) {
     db.updateOnlineServer(req.session.userId, serverId);
     setClientServerForUser(req.session.userId, serverId);
 
+    db.clearRoomInvites(serverId, req.session.userId);
     logToFile(`[SERVERS] User ${req.session.username} joined server ${serverId}`);
 
     // let ws clients know theres a new member
@@ -3308,7 +3598,7 @@ app.post('/api/servers/:serverId/join', requireAuth, (req, res) => {
     }
 
     // a private one needs its code, the host who stepped out of it does not
-    if (server.is_private && server.host_id !== req.session.userId && !db.isServerMember(serverId, req.session.userId)) {
+    if (server.is_private && server.host_id !== req.session.userId && !db.isServerMember(serverId, req.session.userId) && !db.hasRoomInvite(serverId, req.session.userId)) {
       const limit = joinCodeLimiter.hit(`${req.session.userId}:${getClientKey(req)}`);
       if (!limit.allowed) {
         return tooManyAttempts(res, limit.retryAfterSec);
@@ -3346,6 +3636,84 @@ app.post('/api/servers/join-code', requireAuth, (req, res) => {
   } catch (error) {
     logToFile(`[SERVERS] Join by code error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to join server' });
+  }
+});
+
+// a member asks a friend to come to the room. the invite also lets the friend into a private room without its code
+const inviteLimiter = validation.createRateLimiter({ windowMs: 60 * 1000, max: 12 });
+app.post('/api/servers/:serverId/invite', requireAuth, (req, res) => {
+  try {
+    const { serverId } = req.params;
+    const me = req.session.userId;
+    const toId = String((req.body || {}).userId || '');
+    const limit = inviteLimiter.hit(me);
+    if (!limit.allowed) {
+      return tooManyAttempts(res, limit.retryAfterSec);
+    }
+    const server = db.getActiveServerById(serverId);
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+    if (!db.isServerMember(serverId, me)) {
+      return res.status(403).json({ error: 'Only people in the room can invite' });
+    }
+    if (!toId || toId === me) {
+      return res.status(400).json({ error: 'Pick a friend to invite' });
+    }
+    if (!db.getUserById(toId)) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    if (!db.isFriend(me, toId)) {
+      return res.status(403).json({ error: 'You can only invite your friends' });
+    }
+    if (db.isServerMember(serverId, toId)) {
+      return res.status(400).json({ error: 'They are in the room already' });
+    }
+    const id = db.createRoomInvite(serverId, me, toId);
+    sendToUser(toId, {
+      type: 'room_invite',
+      invite: {
+        id,
+        server_id: serverId,
+        server_name: server.name,
+        from_id: me,
+        from_username: req.session.username,
+        is_private: Boolean(server.is_private),
+        created_at: Math.floor(Date.now() / 1000)
+      }
+    });
+    logToFile(`[SERVERS] ${req.session.username} invited ${toId} to ${serverId}`);
+    res.json({ ok: true, id });
+  } catch (error) {
+    logToFile(`[SERVERS] Invite error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to send the invite' });
+  }
+});
+
+// the invites waiting for the person (the ones for a room they are in already are not shown)
+app.get('/api/invites', requireAuth, (req, res) => {
+  try {
+    const me = req.session.userId;
+    const invites = db.getRoomInvites(me).filter((invite) => !db.isServerMember(invite.server_id, me));
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, invites });
+  } catch (error) {
+    logToFile(`[SERVERS] Get invites error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to get invites' });
+  }
+});
+
+app.post('/api/invites/:id/decline', requireAuth, (req, res) => {
+  try {
+    const invite = db.getRoomInvite(req.params.id);
+    if (!invite || invite.to_id !== req.session.userId) {
+      return res.status(404).json({ error: 'Invite not found' });
+    }
+    db.deleteRoomInvite(invite.id);
+    res.json({ ok: true });
+  } catch (error) {
+    logToFile(`[SERVERS] Decline invite error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to decline the invite' });
   }
 });
 
@@ -3889,13 +4257,17 @@ wss.on('connection', (ws, request) => {
           const previousSerialized = JSON.stringify(client.listeningState || null);
           const nextSerialized = JSON.stringify(nextListeningState || null);
 
+          // what was playing until now is counted, then the new state starts its own stretch
+          commitListening(client, Date.now());
           client.listeningState = nextListeningState;
+          client.listeningSince = nextListeningState && nextListeningState.is_playing !== false ? Date.now() : null;
           sendWs(ws, {
             type: 'listening_state_set',
             listening_to: nextListeningState
           });
 
-          if (previousSerialized !== nextSerialized) {
+          // a person who keeps their listening to themselves does not make a presence update for it
+          if (previousSerialized !== nextSerialized && !(client.userId && isListeningHidden(client.userId))) {
             broadcastPresence();
           }
           break;
@@ -3969,6 +4341,8 @@ wss.on('connection', (ws, request) => {
         case 'client_info': {
           // the kind of device this connection is on, for the icons next to the person's name
           const platform = data.platform === 'mobile' || data.platform === 'pc' ? data.platform : null;
+          // this app can read private messages (an older one is sent a note instead)
+          client.e2e = data.e2e === true;
           if (platform && client.platform !== platform) {
             client.platform = platform;
             broadcastPresence();
@@ -4099,6 +4473,7 @@ wss.on('connection', (ws, request) => {
     console.log(`[WS] Client disconnected: ${clientId}`);
 
     const client = wsClients.get(clientId);
+    if (client) commitListening(client, Date.now());
     wsClients.delete(clientId);
     console.log(`[WS] Total clients: ${wsClients.size}`);
 

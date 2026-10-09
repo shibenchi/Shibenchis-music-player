@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Shibenchi's Music Player",
-  "version": "1.4.4",
+  "version": "1.4.6",
   "identifier": "com.shibenchi.musicplayer",
   "build": {
     "frontendDist": "../build",

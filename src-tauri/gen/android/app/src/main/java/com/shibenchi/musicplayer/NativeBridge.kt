@@ -90,6 +90,13 @@ object Playback {
   @Volatile var activity: WeakReference<MainActivity>? = null
   @Volatile var inPip = false
 
+  // when the page last reported that the sound really runs (the page says "playing" the moment play is
+  // pressed, which is not the same thing when android has frozen it or refuses the audio)
+  @Volatile var soundReportedAt = 0L
+  // the play being watched, and until when a failed one is not tried again through opening the app
+  @Volatile private var playAskedAt = 0L
+  @Volatile private var noRetryUntil = 0L
+
   // the page has loaded and reported a track, so it can answer a command. false while the app is closed
   @Volatile var pageReady = false
   // a button was pressed while there was no page to answer it (the app was closed). the command waits
@@ -116,6 +123,32 @@ object Playback {
   fun command(name: String, arg: Double? = null) {
     val extra = if (arg != null) ",$arg" else ""
     js("window.__smpNativeCommand&&window.__smpNativeCommand('$name'$extra)")
+    if (name == "play") watchPlay()
+  }
+
+  // a play that the page does not answer with sound (android had frozen the page, or refused the audio) is
+  // not left looking like it plays on the widget: it goes back to paused and the app is opened, which wakes the
+  // page and is allowed to start the sound. once per press
+  private fun watchPlay() {
+    val asked = SystemClock.elapsedRealtime()
+    playAskedAt = asked
+    main.postDelayed({
+      if (playAskedAt != asked || soundReportedAt >= asked) return@postDelayed
+      if (SystemClock.elapsedRealtime() < noRetryUntil) return@postDelayed
+      val context = webView?.context?.applicationContext ?: return@postDelayed
+      noRetryUntil = SystemClock.elapsedRealtime() + 15_000
+      Log.w("SmpBridge", "play was pressed but no sound came, opening the app to start it")
+      NowPlaying.positionMs = NowPlaying.currentPositionMs()
+      NowPlaying.playing = false
+      NowPlaying.stamp = SystemClock.elapsedRealtime()
+      PlayerWidget.refresh(context)
+      minimizeUntil = SystemClock.elapsedRealtime() + 40_000
+      try {
+        context.startActivity(launchIntent(context).putExtra("smp_command", "play"))
+      } catch (e: Exception) {
+        Log.w("SmpBridge", "could not open the app: ${e.message}")
+      }
+    }, 3_000)
   }
 
   // the command is run as soon as the page can answer it
@@ -193,6 +226,8 @@ class NativeBridge(private val context: Context) {
       NowPlaying.artist = o.optString("artist")
       NowPlaying.thumbnail = o.optString("thumb")
       NowPlaying.playing = o.optBoolean("playing", false)
+      // the sound really runs (screens older than this one do not say, their word for playing is taken)
+      if (NowPlaying.playing && o.optBoolean("running", true)) Playback.soundReportedAt = SystemClock.elapsedRealtime()
       NowPlaying.positionMs = (o.optDouble("pos", 0.0) * 1000).toLong()
       NowPlaying.durationMs = (o.optDouble("dur", 0.0) * 1000).toLong()
       NowPlaying.stamp = SystemClock.elapsedRealtime()

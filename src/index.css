@@ -8,9 +8,9 @@ html, body, #root {
    showing through unblurred. bumped a touch darker than before - a bright
    or busy visualizer preset was still washing out the text through it */
 .glass-dark {
-  background: rgba(8, 8, 8, 0.8) !important;
-  backdrop-filter: blur(14px) !important;
-  -webkit-backdrop-filter: blur(14px) !important;
+  background: rgba(8, 8, 8, 0.74) !important;
+  backdrop-filter: blur(12px) !important;
+  -webkit-backdrop-filter: blur(12px) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
 }
 
@@ -19,9 +19,14 @@ html, body, #root {
    background with no blur, so a lively visualizer behind it wasn't dimmed
    or blurred at all and could overpower the floating card's own content */
 .glass {
-  background: rgba(5, 5, 5, 0.6) !important;
-  backdrop-filter: blur(10px) !important;
-  -webkit-backdrop-filter: blur(10px) !important;
+  background: rgba(5, 5, 5, 0.5) !important;
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+}
+
+/* and the drawing itself a little brighter (on a phone the media query further down takes over) */
+.visualizer-canvas {
+  filter: brightness(1.18) saturate(1.1);
 }
 
 /* theme vars, react updates these live */
@@ -570,6 +575,71 @@ input[type="range"].eq-slider::-moz-range-track {
   fill: #000000 !important;
 }
 
+/* every control in settings looks the same: a title above and one button on the right, same size, same border. the
+   filled look (inline) is what "on" is. the red one is for removing things */
+.settings-modal .smp-setting,
+.settings-modal .smp-setting-box {
+  display: block;
+  box-sizing: border-box;
+  width: 120px !important;
+  margin-left: auto !important;
+  padding: 6px 8px !important;
+  border: 1px solid var(--theme-primary) !important;
+  border-radius: 6px !important;
+  font-size: 12px !important;
+  line-height: 1.2;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-modal .smp-setting {
+  background: transparent;
+  color: var(--theme-primary);
+  cursor: pointer;
+}
+
+.settings-modal .smp-setting + .smp-setting {
+  margin-top: 8px;
+}
+
+.settings-modal .smp-setting.smp-setting-danger {
+  color: #ef4444;
+  border-color: #ef4444 !important;
+}
+
+.settings-modal .smp-setting-box {
+  color: var(--theme-primary);
+}
+
+/* the bottom line of settings: support the project, the version, and the update button when there is one */
+.settings-modal .smp-settings-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+/* the version and the update button stay together, wherever the line breaks */
+.settings-modal .smp-settings-footer .smp-footer-version {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.settings-modal .smp-footer-button {
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--theme-primary);
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
 /* logout btn always hovers red, no exceptions */
 .logout-btn:hover {
   background: #ff4444 !important;
@@ -605,6 +675,17 @@ input[type="range"].eq-slider::-moz-range-track {
 .btn-group .btn:hover svg {
   color: #000000 !important;
   fill: #000000 !important;
+}
+
+/* the green buttons (accept, join an invite): the same shape as the others, a lighter green on hover */
+.btn-go {
+  background: #22c55e !important;
+  border: 1px solid #22c55e !important;
+  color: #000 !important;
+}
+.btn-go:hover:not(:disabled) {
+  background: #4ade80 !important;
+  border-color: #4ade80 !important;
 }
 
 /* ==== simplified btn components, cleaner than the mess before ==== */
@@ -1383,8 +1464,8 @@ input[type="range"].eq-slider::-moz-range-track {
 /* settings: a button is as wide as its text and sits on the right, instead of
    being stretched across the whole box. the inline widths are why this needs
    !important */
-.settings-modal .modal-body button[style*="width: 100%"],
-.settings-modal .modal-body .w-100 {
+.settings-modal .modal-body button[style*="width: 100%"]:not(.smp-setting),
+.settings-modal .modal-body .w-100:not(.smp-setting) {
   width: auto !important;
   display: block !important;
   margin-left: auto !important;
@@ -1437,3 +1518,8 @@ input[type="range"].eq-slider::-moz-range-track {
     order: var(--panel-order, 0) !important;
   }
 }
+
+/* the four numbers on top of the stats tab: the same size, the same distance from each other */
+.stats-top { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 900px) { .stats-top { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .stats-top { grid-template-columns: minmax(0, 1fr); } }

@@ -53,6 +53,11 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     myWebView = webView
+    // the page's process keeps its importance while the app is out of sight. by default it is set aside (and
+    // frozen after a while) as soon as the screen is hidden, so a play from the widget waited until the app was opened
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+    }
     Playback.webView = webView
     webView.addJavascriptInterface(NativeBridge(applicationContext), "SmpNative")
   }

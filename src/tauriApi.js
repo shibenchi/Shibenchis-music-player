@@ -229,7 +229,7 @@ function reportToAndroid(state, colorSettled = false) {
   const hasTrack = !!(state && state.title);
   const position = (state && state.currentTime) || 0;
   const now = Date.now();
-  const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom, !!state?.isBuffering].join('|');
+  const key = [hasTrack, state?.title, state?.author, state?.thumbnail, !!state?.isPlaying, !!state?.running, Math.round(state?.duration || 0), !!state?.shuffle, state?.repeat, state?.muted ? 'm' : Math.round((state?.volume ?? 1) * 100), !!state?.inRoom, !!state?.isBuffering].join('|');
   const expected = lastNativeReport.pos + (lastNativeReport.playing ? (now - lastNativeReport.at) / 1000 : 0);
   const jumped = Math.abs(position - expected) > 2.5;
   const color = state?.themeColor;
@@ -253,6 +253,8 @@ function reportToAndroid(state, colorSettled = false) {
       artist: state?.author || '',
       thumb: state?.thumbnail || '',
       playing: !!state?.isPlaying,
+      // the sound really runs (a press on play can be ahead of it, or be refused by the system)
+      running: !!state?.running,
       pos: position,
       dur: state?.duration || 0,
       shuffle: !!state?.shuffle,

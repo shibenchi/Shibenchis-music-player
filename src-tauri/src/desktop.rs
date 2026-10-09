@@ -38,7 +38,11 @@ const NODE_BIN_NAME: &str = "node.exe";
 #[cfg(not(windows))]
 const NODE_BIN_NAME: &str = "node";
 
-struct BackendProcesses(Mutex<Vec<Child>>);
+// the two local servers the app started (true: the media helper on 3002, false: the main server on 3001)
+struct BackendProcesses(Mutex<Vec<(bool, Child)>>);
+
+// set when the app is closing, so the watchdog below does not start them again
+static BACKEND_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn port_open(port: u16) -> bool {
     TcpStream::connect(("127.0.0.1", port)).is_ok()
@@ -240,6 +244,7 @@ fn apply_shortcut_prefs(desktop: bool, taskbar: bool) {
 }
 
 // resolved once at startup, reused everywhere, see resolve_paths() below
+#[derive(Clone)]
 struct AppPaths {
     /// where the actual per-user data lives (db, downloads, cache, logs).
     /// %APPDATA%\<identifier> on windows, ~/Library/Application
@@ -414,11 +419,70 @@ fn spawn_node(paths: &AppPaths, is_helper: bool) -> std::io::Result<Child> {
 }
 
 fn kill_backend(app: &tauri::AppHandle) {
+    BACKEND_SHUTTING_DOWN.store(true, Ordering::SeqCst);
     let state = app.state::<BackendProcesses>();
     let mut children = state.0.lock().unwrap();
     log_line(&format!("kill_backend: killing {} child process(es)", children.len()));
-    for mut child in children.drain(..) {
+    for (_, mut child) in children.drain(..) {
         let _ = child.kill();
+    }
+}
+
+// keeps the two local servers alive. the main server once ended a few seconds after the app opened (a bug in the
+// Discord code) and stayed gone until the whole app was closed and opened again, and with it everything that
+// server does (update checks, Discord, the local api) while the music, played by the other process, carried on
+// as if nothing was wrong. a server that ended is started again: after a short pause, and at most five times in
+// ten minutes, so one that cannot start at all does not loop forever
+fn watch_backend(app: tauri::AppHandle, paths: AppPaths) {
+    let mut starts: [Vec<std::time::Instant>; 2] = [Vec::new(), Vec::new()];
+    loop {
+        thread::sleep(Duration::from_secs(3));
+        if BACKEND_SHUTTING_DOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut ended: Vec<bool> = Vec::new();
+        {
+            let state = app.state::<BackendProcesses>();
+            let mut children = state.0.lock().unwrap();
+            let mut index = 0;
+            while index < children.len() {
+                let (is_helper, child) = &mut children[index];
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        log_line(&format!(
+                            "watchdog: the {} (pid {}) ended ({status})",
+                            if *is_helper { "local helper" } else { "main server" },
+                            child.id()
+                        ));
+                        ended.push(*is_helper);
+                        children.remove(index);
+                    }
+                    _ => index += 1,
+                }
+            }
+        }
+        for is_helper in ended {
+            let slot = usize::from(is_helper);
+            let now = std::time::Instant::now();
+            starts[slot].retain(|at| now.duration_since(*at) < Duration::from_secs(600));
+            let name = if is_helper { "local helper" } else { "main server" };
+            if starts[slot].len() >= 5 {
+                log_line(&format!("watchdog: the {name} ended 5 times in 10 minutes, not starting it again"));
+                continue;
+            }
+            thread::sleep(Duration::from_secs(2));
+            if BACKEND_SHUTTING_DOWN.load(Ordering::SeqCst) {
+                return;
+            }
+            match spawn_node(&paths, is_helper) {
+                Ok(child) => {
+                    log_line(&format!("watchdog: the {name} started again, pid={}", child.id()));
+                    starts[slot].push(now);
+                    app.state::<BackendProcesses>().0.lock().unwrap().push((is_helper, child));
+                }
+                Err(e) => log_line(&format!("watchdog: could not start the {name} again: {e}")),
+            }
+        }
     }
 }
 
@@ -632,7 +696,7 @@ pub fn run() {
                     match spawn_node(&paths, false) {
                         Ok(child) => {
                             log_line(&format!("setup: main server spawned, pid={}", child.id()));
-                            children.push(child);
+                            children.push((false, child));
                         }
                         Err(e) => log_line(&format!("setup: FAILED to start backend server: {e}")),
                     }
@@ -644,13 +708,20 @@ pub fn run() {
                     match spawn_node(&paths, true) {
                         Ok(child) => {
                             log_line(&format!("setup: local helper spawned, pid={}", child.id()));
-                            children.push(child);
+                            children.push((true, child));
                         }
                         Err(e) => log_line(&format!("setup: FAILED to start local helper: {e}")),
                     }
                 } else {
                     log_line("setup: port 3002 already open, reusing existing server");
                 }
+            }
+
+            // from here on a server that ends is started again (see watch_backend)
+            {
+                let watch_handle = app.handle().clone();
+                let watch_paths = paths.clone();
+                thread::spawn(move || watch_backend(watch_handle, watch_paths));
             }
 
             // NOTE: tried a real "initializing... 40%" splash here

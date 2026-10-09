@@ -43,4 +43,5 @@ installer.bat
 start.bat
 stop.bat
 build-web/
+build-split/
 update-files/

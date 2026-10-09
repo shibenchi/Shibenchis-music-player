@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import OriginalApp from './App';
+import { forgetLocalKey } from './e2e';
 import { socialFetch } from './socialApi';
 import { transferGuestDataToAccount } from './guestTransfer';
 
@@ -267,6 +268,12 @@ export default function AppWithAuth() {
   const handleLogout = useCallback(async () => {
     if (user) {
       await api.logout();
+      // the device forgets the key for private messages and the opened copies of them, the password brings them back
+      try {
+        forgetLocalKey(user.id);
+        localStorage.removeItem(`music_dm_messages:${user.id}`);
+        localStorage.removeItem(`music_conversation_list:${user.id}`);
+      } catch { /* nothing to forget */ }
     }
     // wipe the token, back to guest
     localStorage.removeItem('music_auth_token');

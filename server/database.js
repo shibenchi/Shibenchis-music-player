@@ -20,6 +20,10 @@ if (!fs.existsSync(dataDir)) {
 
 const db = new Database(dbPath);
 
+// stored chat text is scrambled with a key kept outside the database (see atRest.js)
+const atRest = require('./atRest');
+atRest.init(process.env.APP_DATA_DIR || dataDir);
+
 // usernames that get admin when the account is created. comma separated list
 // in ADMIN_USERNAMES, defaults to the project owner, matched ignoring case.
 // register the admin account first after a fresh deploy, since whoever
@@ -35,6 +39,10 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex
 
 // turn on foreign keys
 db.pragma('foreign_keys = ON');
+
+// a changed or deleted row is overwritten with zeros instead of staying readable in the file (scrambling the old
+// messages would otherwise leave their text behind in the freed space)
+db.pragma('secure_delete = ON');
 
 // make the tables
 db.exec(`
@@ -293,6 +301,66 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(playlist_id);
   CREATE INDEX IF NOT EXISTS idx_downloaded_tracks_user_id ON downloaded_tracks(user_id);
   CREATE INDEX IF NOT EXISTS idx_user_queue_user_id ON user_queue(user_id);
+  -- the key pair of an account for end to end encrypted direct messages. the public half is for anyone to use
+  -- when writing to this person, the private half is stored locked with the person's password (the apps do
+  -- the locking and unlocking, the server only keeps the locked blob and can not open it)
+  CREATE TABLE IF NOT EXISTS user_keys (
+    user_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    kid TEXT NOT NULL,
+    wrapped_private TEXT NOT NULL,
+    wrap_salt TEXT NOT NULL,
+    wrap_iv TEXT NOT NULL,
+    wrap_iters INTEGER NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
+  -- what each account has listened to, for its own stats. one row is a stretch of one song (a pause and a
+  -- resume a few minutes later extend the row), plays is 0 on the row that only continues a song
+  CREATE TABLE IF NOT EXISTS listen_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    track_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'personal',
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL,
+    seconds INTEGER NOT NULL,
+    plays INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_listen_events_user_time ON listen_events(user_id, started_at);
+
+  -- a friend asking another friend to come to a room. gone when answered, when the room goes, or after a day
+  CREATE TABLE IF NOT EXISTS room_invites (
+    id TEXT PRIMARY KEY,
+    server_id TEXT NOT NULL,
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (server_id) REFERENCES active_servers(id) ON DELETE CASCADE,
+    FOREIGN KEY (from_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(server_id, to_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_room_invites_to ON room_invites(to_id);
+
+  -- a YouTube or Spotify account connected to an account of the app (to export playlists to it). the tokens are
+  -- stored scrambled like the messages (see atRest.js)
+  CREATE TABLE IF NOT EXISTS integrations (
+    user_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL DEFAULT '',
+    expires_at INTEGER NOT NULL DEFAULT 0,
+    account_name TEXT NOT NULL DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    PRIMARY KEY (user_id, provider),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
   CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_friend_requests_sender ON friend_requests(sender_id);
@@ -958,6 +1026,49 @@ const statements = {
     WHERE row_rank = 1
     ORDER BY last_message_at DESC, user_id ASC
   `),
+  getAllOnlineStatus: db.prepare(`SELECT user_id, is_online, last_seen FROM online_status`),
+  getUserKey: db.prepare(`SELECT * FROM user_keys WHERE user_id = ?`),
+  createUserKey: db.prepare(`
+    INSERT OR IGNORE INTO user_keys (user_id, public_key, kid, wrapped_private, wrap_salt, wrap_iv, wrap_iters)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  listUserKeyIds: db.prepare(`SELECT user_id FROM user_keys`),
+  getIntegration: db.prepare(`SELECT * FROM integrations WHERE user_id = ? AND provider = ?`),
+  saveIntegration: db.prepare(`
+    INSERT INTO integrations (user_id, provider, access_token, refresh_token, expires_at, account_name)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, provider) DO UPDATE SET access_token = excluded.access_token, refresh_token = excluded.refresh_token,
+      expires_at = excluded.expires_at, account_name = excluded.account_name
+  `),
+  deleteIntegration: db.prepare(`DELETE FROM integrations WHERE user_id = ? AND provider = ?`),
+  getSentFriendRequests: db.prepare(`
+    SELECT fr.*, u.username AS receiver_username FROM friend_requests fr
+    JOIN users u ON fr.receiver_id = u.id
+    WHERE fr.sender_id = ? AND fr.status = 'pending'
+  `),
+  lastListen: db.prepare(`SELECT * FROM listen_events WHERE user_id = ? ORDER BY id DESC LIMIT 1`),
+  insertListen: db.prepare(`
+    INSERT INTO listen_events (user_id, track_key, title, author, source, started_at, ended_at, seconds, plays)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+  extendListen: db.prepare(`UPDATE listen_events SET seconds = seconds + ?, ended_at = ? WHERE id = ?`),
+  upsertInvite: db.prepare(`
+    INSERT INTO room_invites (id, server_id, from_id, to_id) VALUES (?, ?, ?, ?)
+    ON CONFLICT(server_id, to_id) DO UPDATE SET id = excluded.id, from_id = excluded.from_id, created_at = strftime('%s', 'now')
+  `),
+  getInvitesFor: db.prepare(`
+    SELECT ri.id, ri.server_id, ri.from_id, ri.created_at, u.username AS from_username, s.name AS server_name, s.is_private
+    FROM room_invites ri
+    JOIN users u ON u.id = ri.from_id
+    JOIN active_servers s ON s.id = ri.server_id
+    WHERE ri.to_id = ? AND ri.created_at >= ?
+    ORDER BY ri.created_at DESC
+  `),
+  getInviteById: db.prepare(`SELECT * FROM room_invites WHERE id = ?`),
+  hasInvite: db.prepare(`SELECT 1 AS yes FROM room_invites WHERE server_id = ? AND to_id = ? AND created_at >= ?`),
+  deleteInvite: db.prepare(`DELETE FROM room_invites WHERE id = ?`),
+  clearInvitesFor: db.prepare(`DELETE FROM room_invites WHERE server_id = ? AND to_id = ?`),
+  purgeInvites: db.prepare(`DELETE FROM room_invites WHERE created_at < ?`),
   getDirectMessages: db.prepare(`
     SELECT * FROM direct_messages
     WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)
@@ -1066,9 +1177,185 @@ const declineFriendRequestTxn = db.transaction((requestId, receiverId = null) =>
   return { ok: true, request };
 });
 
+// ---- invites
+const INVITE_TTL_SECONDS = 24 * 60 * 60;
+
+// ---- listening stats
+const MERGE_GAP_SECONDS = 10 * 60;
+const MAX_SEGMENT_SECONDS = 4 * 60 * 60;
+const trackKeyOf = (title, author) => `${String(title).trim().toLowerCase()}|${String(author || '').trim().toLowerCase()}`;
+
+// one stretch of listening to one song. a stretch that continues the last one (same song, a few minutes apart, same
+// hour so the hours chart stays right) is added to its row, a song that comes back later is a new play
+function recordListening(userId, track, startedAt, endedAt) {
+  const start = Math.floor(startedAt);
+  const end = Math.floor(endedAt);
+  const seconds = Math.min(end - start, MAX_SEGMENT_SECONDS);
+  if (!userId || !track || !String(track.title || '').trim() || !(seconds >= 1)) return false;
+  const title = String(track.title).trim().slice(0, 200);
+  const author = String(track.author || '').trim().slice(0, 120);
+  const key = trackKeyOf(title, author);
+  const last = statements.lastListen.get(userId);
+  const continues = last && last.track_key === key && start - last.ended_at <= MERGE_GAP_SECONDS && start >= last.ended_at - 60;
+  if (continues && Math.floor(last.started_at / 3600) === Math.floor(start / 3600)) {
+    statements.extendListen.run(seconds, Math.max(last.ended_at, start + seconds), last.id);
+  } else {
+    statements.insertListen.run(userId, key, title, author, String(track.source || 'personal').slice(0, 20), start, start + seconds, seconds, continues ? 0 : 1);
+  }
+  return true;
+}
+
+// the bounds of a range in local days (offsetMin is the minutes the person's clock is east of UTC)
+function statsRange(range, nowSec, offsetMin) {
+  const offset = Math.max(-14 * 60, Math.min(14 * 60, Math.trunc(Number(offsetMin) || 0))) * 60;
+  const today = Math.floor((nowSec + offset) / 86400);
+  const length = { week: 7, month: 30, year: 365 }[range] || 0;
+  const from = length ? (today - length + 1) * 86400 - offset : 0;
+  const to = (today + 1) * 86400 - offset;
+  const previousFrom = length ? from - length * 86400 : 0;
+  return { range: length ? range : 'all', offset, today, length, from, to, previousFrom };
+}
+
+const dayName = (dayIndex) => new Date(dayIndex * 86400000).toISOString().slice(0, 10);
+
+function getListeningStats(userId, { range = 'week', offsetMin = 0, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  const r = statsRange(range, nowSec, offsetMin);
+  const q = (sql, ...params) => db.prepare(sql).all(...params);
+  const where = 'user_id = ? AND started_at >= ? AND started_at < ?';
+  const base = [userId, r.from, r.to];
+
+  const totals = q(`SELECT COALESCE(SUM(seconds), 0) AS seconds, COALESCE(SUM(plays), 0) AS plays,
+      COUNT(DISTINCT track_key) AS tracks, COUNT(DISTINCT CASE WHEN author <> '' THEN lower(author) END) AS artists
+    FROM listen_events WHERE ${where}`, ...base)[0];
+  const previous = r.length
+    ? q(`SELECT COALESCE(SUM(seconds), 0) AS seconds FROM listen_events WHERE user_id = ? AND started_at >= ? AND started_at < ?`, userId, r.previousFrom, r.from)[0].seconds
+    : null;
+
+  const topTracks = q(`SELECT title, author, SUM(seconds) AS seconds, SUM(plays) AS plays FROM listen_events WHERE ${where}
+    GROUP BY track_key ORDER BY seconds DESC, plays DESC LIMIT 25`, ...base);
+  const topArtists = q(`SELECT MIN(author) AS author, SUM(seconds) AS seconds, SUM(plays) AS plays, COUNT(DISTINCT track_key) AS tracks
+    FROM listen_events WHERE ${where} AND author <> '' GROUP BY lower(author) ORDER BY seconds DESC, plays DESC LIMIT 25`, ...base);
+
+  const hours = new Array(24).fill(0);
+  q(`SELECT (CAST(started_at + ? AS INTEGER) % 86400) / 3600 AS h, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY h`, r.offset, ...base)
+    .forEach((row) => { hours[row.h] = row.s; });
+  const weekdays = new Array(7).fill(0);
+  q(`SELECT ((CAST(started_at + ? AS INTEGER) / 86400) + 4) % 7 AS d, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY d`, r.offset, ...base)
+    .forEach((row) => { weekdays[row.d] = row.s; });
+
+  // the last 30 days, one bar each (today last)
+  const perDay = new Map(q(`SELECT CAST(started_at + ? AS INTEGER) / 86400 AS d, SUM(seconds) AS s FROM listen_events
+    WHERE user_id = ? AND started_at >= ? GROUP BY d`, r.offset, userId, (r.today - 29) * 86400 - r.offset).map((row) => [row.d, row.s]));
+  const days = [];
+  for (let d = r.today - 29; d <= r.today; d += 1) days.push({ day: dayName(d), seconds: perDay.get(d) || 0 });
+
+  // the last 12 months, one bar each
+  const monthRows = new Map(q(`SELECT strftime('%Y-%m', started_at + ?, 'unixepoch') AS m, SUM(seconds) AS s FROM listen_events
+    WHERE user_id = ? GROUP BY m ORDER BY m DESC LIMIT 12`, r.offset, userId).map((row) => [row.m, row.s]));
+  const months = [];
+  const nowDate = new Date((nowSec + r.offset) * 1000);
+  for (let i = 11; i >= 0; i -= 1) {
+    const d = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth() - i, 1));
+    const key = d.toISOString().slice(0, 7);
+    months.push({ month: key, seconds: monthRows.get(key) || 0 });
+  }
+
+  // days in a row with something played (today does not break it before it is over)
+  const activeDays = q(`SELECT DISTINCT CAST(started_at + ? AS INTEGER) / 86400 AS d FROM listen_events WHERE user_id = ? ORDER BY d DESC LIMIT 1000`, r.offset, userId).map((row) => row.d);
+  let current = 0;
+  let cursor = activeDays[0] === r.today ? r.today : r.today - 1;
+  for (const d of activeDays) {
+    if (d === cursor) { current += 1; cursor -= 1; } else if (d < cursor) break;
+  }
+  let best = 0; let run = 0; let prev = null;
+  for (const d of activeDays) {
+    run = prev !== null && prev - d === 1 ? run + 1 : 1;
+    best = Math.max(best, run);
+    prev = d;
+  }
+
+  // songs and artists heard for the first time in this range
+  const firstSeen = (column) => q(`SELECT COUNT(*) AS n FROM (SELECT MIN(started_at) AS f FROM listen_events WHERE user_id = ? ${column === 'artist' ? "AND author <> ''" : ''} GROUP BY ${column === 'artist' ? 'lower(author)' : 'track_key'}) WHERE f >= ? AND f < ?`, userId, r.from, r.to)[0].n;
+  const first = q('SELECT MIN(started_at) AS f FROM listen_events WHERE user_id = ?', userId)[0].f;
+
+  // the day with the most listening in this range, and the single longest stretch of one song
+  const bestDayRow = q(`SELECT CAST(started_at + ? AS INTEGER) / 86400 AS d, SUM(seconds) AS s FROM listen_events WHERE ${where}
+    GROUP BY d ORDER BY s DESC LIMIT 1`, r.offset, ...base)[0];
+  const longestRow = q(`SELECT title, author, seconds FROM listen_events WHERE ${where} ORDER BY seconds DESC LIMIT 1`, ...base)[0];
+
+  return {
+    range: r.range,
+    from: r.from,
+    to: r.to,
+    days_in_range: r.length || (first ? Math.max(1, r.today - Math.floor((first + r.offset) / 86400) + 1) : 1),
+    totals: {
+      seconds: totals.seconds, plays: totals.plays, tracks: totals.tracks, artists: totals.artists,
+      previous_seconds: previous, new_tracks: firstSeen('track'), new_artists: firstSeen('artist')
+    },
+    today_seconds: perDay.get(r.today) || 0,
+    top_tracks: topTracks,
+    top_artists: topArtists,
+    hours,
+    weekdays,
+    days,
+    months,
+    streak: { current, best, active_days: activeDays.length },
+    best_day: bestDayRow ? { day: dayName(bestDayRow.d), seconds: bestDayRow.s } : null,
+    longest: longestRow ? { title: longestRow.title, author: longestRow.author, seconds: longestRow.seconds } : null,
+    since: first || null
+  };
+}
+
+// how much each of these accounts listened in a range (for a list of friends)
+function getListeningBoard(userIds, { range = 'week', offsetMin = 0, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  const r = statsRange(range, nowSec, offsetMin);
+  const out = [];
+  const total = db.prepare('SELECT COALESCE(SUM(seconds), 0) AS s FROM listen_events WHERE user_id = ? AND started_at >= ? AND started_at < ?');
+  const artist = db.prepare(`SELECT MIN(author) AS author FROM listen_events WHERE user_id = ? AND started_at >= ? AND started_at < ? AND author <> ''
+    GROUP BY lower(author) ORDER BY SUM(seconds) DESC LIMIT 1`);
+  for (const userId of userIds) {
+    const seconds = total.get(userId, r.from, r.to).s;
+    out.push({ user_id: userId, seconds, top_artist: seconds ? (artist.get(userId, r.from, r.to) || {}).author || null : null });
+  }
+  return out.sort((a, b) => b.seconds - a.seconds);
+}
+
+// every chat row written before the scrambling existed is plain text. it is scrambled once, here, at start
+// (a row that is already scrambled, or already an end to end envelope, is left alone)
+function scrambleStoredMessages() {
+  let changed = 0;
+  const run = db.transaction(() => {
+    for (const [table, column] of [['direct_messages', 'message'], ['server_messages', 'message']]) {
+      const rows = db.prepare(`SELECT id, ${column} AS text FROM ${table} WHERE ${column} NOT LIKE 'enc1:%' AND ${column} NOT LIKE 'e2e1:%'`).all();
+      const update = db.prepare(`UPDATE ${table} SET ${column} = ? WHERE id = ?`);
+      for (const row of rows) {
+        update.run(atRest.seal(row.text), row.id);
+        changed += 1;
+      }
+    }
+  });
+  try {
+    run();
+  } catch (error) {
+    console.error('could not scramble the stored messages:', error.message);
+  }
+  return changed;
+}
+const scrambledAtStart = scrambleStoredMessages();
+if (scrambledAtStart > 0) {
+  console.log(`[PRIVACY] ${scrambledAtStart} stored messages were scrambled`);
+  // rewrite the file so no old copy of the text is left in pages that were freed
+  try {
+    db.exec('VACUUM');
+  } catch (error) {
+    console.error('could not compact the database after scrambling:', error.message);
+  }
+}
+
 module.exports = {
   db,
   statements,
+  atRest,
   ADMIN_USERNAMES,
   createPlaylistTrackId,
   createDownloadedTrackId,
@@ -1196,9 +1483,17 @@ module.exports = {
       return { error: 'already_friends' };
     }
 
-    // request already out there in either direction? dont send a dupe
-    const existingRequest = statements.getFriendRequestByUsers.get(senderId, receiverId)
-      || statements.getFriendRequestByUsers.get(receiverId, senderId);
+    // the other person already asked you: asking back is the same as saying yes
+    const reverse = statements.getFriendRequestByUsers.get(receiverId, senderId);
+    if (reverse && (!reverse.status || reverse.status === 'pending')) {
+      const accepted = acceptFriendRequestTxn(reverse.id, senderId);
+      if (!accepted.error) {
+        return { auto_accepted: true, id: reverse.id, sender_id: senderId, receiver_id: receiverId, status: 'accepted' };
+      }
+    }
+
+    // request already out there? dont send a dupe
+    const existingRequest = statements.getFriendRequestByUsers.get(senderId, receiverId) || reverse;
     if (existingRequest) {
       return { error: 'request_exists' };
     }
@@ -1211,6 +1506,20 @@ module.exports = {
   getPendingFriendRequests: (userId) => {
     return statements.getPendingFriendRequests.all(userId);
   },
+
+  // the requests this person sent that have not been answered
+  getSentFriendRequests: (userId) => statements.getSentFriendRequests.all(userId),
+
+  // takes a request back (only the one who sent it can)
+  cancelFriendRequest: (requestId, senderId) => {
+    const request = statements.getFriendRequestById.get(requestId);
+    if (!request || (request.status && request.status !== 'pending')) return { error: 'not_found' };
+    if (request.sender_id !== senderId) return { error: 'forbidden' };
+    statements.deleteFriendRequest.run(requestId);
+    return { ok: true, request };
+  },
+
+  friendIdsOf: (userId) => new Set(statements.getFriends.all(userId).map((row) => row.friend_id)),
 
   acceptFriendRequest: (requestId, receiverId = null) => {
     return acceptFriendRequestTxn(requestId, receiverId);
@@ -1494,7 +1803,7 @@ module.exports = {
     const trimmedMessage = String(message || '').trim();
     const themeColorJson = senderThemeColor ? JSON.stringify(senderThemeColor) : null;
 
-    statements.createServerMessage.run(id, serverId, userId, username, trimmedMessage, themeColorJson);
+    statements.createServerMessage.run(id, serverId, userId, username, atRest.seal(trimmedMessage), themeColorJson);
     return {
       id,
       server_id: serverId,
@@ -1507,7 +1816,8 @@ module.exports = {
   },
 
   getServerMessages: (serverId, limit = 100) => {
-    return statements.getServerMessages.all(serverId, limit).reverse();
+    return statements.getServerMessages.all(serverId, limit).reverse()
+      .map((row) => ({ ...row, message: atRest.open(row.message) }));
   },
 
   // active servers
@@ -1645,19 +1955,63 @@ module.exports = {
     return statements.getUserOnlineStatus.get(userId);
   },
 
+  getAllOnlineStatus: () => statements.getAllOnlineStatus.all(),
+
   // dms
   getConversations: (userId) => {
-    return statements.getConversations.all(userId, userId, userId, userId, userId);
+    return statements.getConversations.all(userId, userId, userId, userId, userId)
+      .map((row) => ({ ...row, last_message: atRest.open(row.last_message) }));
   },
 
   getDirectMessages: (userId1, userId2) => {
-    return statements.getDirectMessages.all(userId1, userId2, userId2, userId1);
+    return statements.getDirectMessages.all(userId1, userId2, userId2, userId1)
+      .map((row) => ({ ...row, message: atRest.open(row.message) }));
   },
+
+  // the account keys of end to end encrypted direct messages
+  getUserKey: (userId) => statements.getUserKey.get(userId) || null,
+  createUserKey: (userId, key) => {
+    const result = statements.createUserKey.run(userId, key.public_key, key.kid, key.wrapped_private, key.wrap_salt, key.wrap_iv, key.wrap_iters);
+    return result.changes > 0;
+  },
+  userIdsWithKeys: () => statements.listUserKeyIds.all().map((row) => row.user_id),
+
+  // ---- invites to rooms (kept a day)
+  INVITE_TTL_SECONDS,
+  createRoomInvite: (serverId, fromId, toId) => {
+    const id = `invite_${crypto.randomUUID()}`;
+    statements.upsertInvite.run(id, serverId, fromId, toId);
+    return id;
+  },
+  getRoomInvites: (userId) => statements.getInvitesFor.all(userId, Math.floor(Date.now() / 1000) - INVITE_TTL_SECONDS)
+    .map((row) => ({ ...row, is_private: row.is_private === 1 })),
+  getRoomInvite: (inviteId) => statements.getInviteById.get(inviteId) || null,
+  hasRoomInvite: (serverId, userId) => !!statements.hasInvite.get(serverId, userId, Math.floor(Date.now() / 1000) - INVITE_TTL_SECONDS),
+  deleteRoomInvite: (inviteId) => statements.deleteInvite.run(inviteId).changes > 0,
+  clearRoomInvites: (serverId, userId) => statements.clearInvitesFor.run(serverId, userId),
+  purgeRoomInvites: () => statements.purgeInvites.run(Math.floor(Date.now() / 1000) - INVITE_TTL_SECONDS).changes,
+
+  // ---- connected YouTube / Spotify accounts (the tokens are stored scrambled)
+  getIntegration: (userId, provider) => {
+    const row = statements.getIntegration.get(userId, provider);
+    if (!row) return null;
+    return { ...row, access_token: atRest.open(row.access_token), refresh_token: row.refresh_token ? atRest.open(row.refresh_token) : '' };
+  },
+  saveIntegration: (userId, provider, record) => {
+    statements.saveIntegration.run(userId, provider, atRest.seal(String(record.access_token || '')), record.refresh_token ? atRest.seal(String(record.refresh_token)) : '', Math.floor(Number(record.expires_at) || 0), String(record.account_name || '').slice(0, 120));
+  },
+  deleteIntegration: (userId, provider) => statements.deleteIntegration.run(userId, provider).changes > 0,
+
+  // ---- listening stats
+  recordListening: (userId, track, startedAt, endedAt) => recordListening(userId, track, startedAt, endedAt),
+  getListeningStats: (userId, options) => getListeningStats(userId, options),
+  getListeningBoard: (userIds, options) => getListeningBoard(userIds, options),
 
   createDirectMessage: (senderId, senderUsername, receiverId, receiverUsername, message, senderThemeColor = null) => {
     const id = `dm_${crypto.randomUUID()}`;
     const themeColorJson = senderThemeColor ? JSON.stringify(senderThemeColor) : null;
-    statements.createDirectMessage.run(id, senderId, senderUsername, receiverId, receiverUsername, message, themeColorJson);
+    // what is stored is scrambled (an end to end envelope is stored as it is, it already is ciphertext)
+    statements.createDirectMessage.run(id, senderId, senderUsername, receiverId, receiverUsername, atRest.seal(message), themeColorJson);
     return {
       id,
       sender_id: senderId,
