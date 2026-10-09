@@ -45,6 +45,19 @@ Right now this is **windows only**. I don't own a mac myself, so a mac build is 
 
 ---
 
+## spotify playlists with more than 100 songs
+
+importing from a spotify link only gets the first 100 songs. that's all spotify shows to other apps, and their api now wants the app owner to have premium, so there's no connecting your account. instead there's a small helper that reads the playlist the way you see it on the spotify website.
+
+1. download [`public/spotify-helper.html`](public/spotify-helper.html) and open it in your browser (newer versions of the app also have it under import, from spotify, get the helper)
+2. drag the **send to shibenchi** button up to your bookmarks bar
+3. open the playlist on open.spotify.com in your browser and press the bookmark. log in to spotify there first, spotify only shows 25 songs to visitors. it scrolls down the whole list and copies it
+4. in the app go to import, from spotify, **paste from helper**. on a version without that button, press **save file** on the helper panel and use import, **from file**
+
+nothing is sent anywhere, it only reads the page you have open. it works on playlists, albums and your liked songs. if spotify changes their website it can stop working, tell me and i'll fix it.
+
+---
+
 ## running from source
 
 You don't need any of this to just use the app, this is only if you want to poke at the code or build it yourself.
