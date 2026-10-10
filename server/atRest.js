@@ -12,6 +12,8 @@ const path = require('path');
 
 const PREFIX = 'enc1:';
 const E2E_PREFIX = 'e2e1:';
+// a message in a room that was locked by the members (see roomKeys.js), stored as it came
+const ROOM_E2E_PREFIX = 'r2e1:';
 let key = null;
 
 function loadKey(dir) {
@@ -36,7 +38,7 @@ function init(dir) {
 }
 
 const isSealed = (value) => typeof value === 'string' && value.startsWith(PREFIX);
-const isEnvelope = (value) => typeof value === 'string' && value.startsWith(E2E_PREFIX);
+const isEnvelope = (value) => typeof value === 'string' && (value.startsWith(E2E_PREFIX) || value.startsWith(ROOM_E2E_PREFIX));
 
 // text -> scrambled text. an end to end envelope (already ciphertext) and an already scrambled value stay as they are
 function seal(text) {
@@ -62,4 +64,4 @@ function open(value) {
   }
 }
 
-module.exports = { init, seal, open, isSealed, isEnvelope, PREFIX, E2E_PREFIX };
+module.exports = { init, seal, open, isSealed, isEnvelope, PREFIX, E2E_PREFIX, ROOM_E2E_PREFIX };

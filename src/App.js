@@ -7,8 +7,10 @@ import PipPlayer from './PipPlayer';
 import Marquee from './Marquee';
 import { applyAppIconColor } from './appIcon';
 import { isAndroidApp, onPictureInPicture, isTauriApp, sendNowPlaying, sendVisualizerFrame, onMiniplayerControl, onMiniplayerReady, saveFileWithDialog, getDefaultDownloadsDir, chooseDownloadsFolder, saveFileToFolder, applyShortcutPrefs, frontendLog, openExternalUrl, pickTextFile, setMiniplayerEnabled } from './tauriApi';
-import { createE2e, e2eSupported, isEnvelope } from './e2e';
+import { createE2e, e2eSupported, isEnvelope, isRoomEnvelope } from './e2e';
 import { pickWithRecencyPenalty, recordPlayed } from './shuffle';
+import { AUDIO_ACCEPT, addLocalFile, clearLocalFiles, getLocalFileRecord, isLocalTrack, localCoverUrl, localFileIds, localFileSizes, localFileUrl, looksLikeAudio, refreshLocalFiles, saveLocalBlob, subscribeLocalFiles } from './localAudio';
+import { fetchBlob, sendFile } from './roomFiles';
 import {
   buildSharedPlayerUpdate,
   getSharedResumeTime,
@@ -406,6 +408,7 @@ function getTrackKey(track) {
 function getTrackThumbnail(track) {
   if (!track) return '';
   if (track.thumbnail) return track.thumbnail;
+  if (isLocalTrack(track)) return '';
   if (track.videoId) {
     return `https://img.youtube.com/vi/${track.videoId}/hqdefault.jpg`;
   }
@@ -418,8 +421,17 @@ function getTrackThumbnail(track) {
 // instead of just leaving a busted image icon sitting there
 function TrackThumbnail({ track, className, alt }) {
   const [tier, setTier] = useState(0);
+  const [coverUrl, setCoverUrl] = useState('');
   const videoId = track?.videoId;
-  const sources = [
+  const local = isLocalTrack(track);
+  // the cover of an audio file comes out of the file itself, on this device
+  useEffect(() => {
+    let alive = true;
+    setCoverUrl('');
+    if (local && videoId) localCoverUrl(videoId).then((url) => { if (alive) setCoverUrl(url); }).catch(() => {});
+    return () => { alive = false; };
+  }, [local, videoId]);
+  const sources = local ? [coverUrl].filter(Boolean) : [
     getTrackThumbnail(track),
     videoId ? `https://img.youtube.com/vi/${videoId}/mqdefault.jpg` : null,
     videoId ? `https://img.youtube.com/vi/${videoId}/default.jpg` : null
@@ -427,7 +439,7 @@ function TrackThumbnail({ track, className, alt }) {
 
   useEffect(() => {
     setTier(0);
-  }, [track?.videoId, track?.thumbnail]);
+  }, [track?.videoId, track?.thumbnail, coverUrl]);
 
   if (!track || tier >= sources.length) return null;
 
@@ -464,7 +476,7 @@ function normalizeTrack(track) {
     title: track?.title || '',
     author: track?.author || track?.artist || '',
     format: track?.format || 'mp3',
-    thumbnail: track?.thumbnail || (videoId ? getTrackThumbnail({ ...track, videoId }) : ''),
+    thumbnail: track?.thumbnail || (videoId ? getTrackThumbnail({ ...track, videoId, source }) : ''),
     externalUrl: track?.externalUrl || track?.external_url || '',
     durationMs: Number(track?.durationMs || track?.duration_ms || 0) || 0
   };
@@ -516,7 +528,7 @@ function playlistToCsv(playlist) {
   const header = ['Title', 'Artist', 'VideoId', 'URL', 'Duration (sec)'];
   const rows = (playlist?.tracks || []).map((t) => {
     const track = normalizeTrack(t);
-    const url = track.videoId ? `https://www.youtube.com/watch?v=${track.videoId}` : '';
+    const url = track.videoId && !isLocalTrack(track) ? `https://www.youtube.com/watch?v=${track.videoId}` : '';
     const durationSec = track.durationMs ? Math.round(track.durationMs / 1000) : '';
     return [track.title, track.author, track.videoId, url, durationSec];
   });
@@ -780,6 +792,9 @@ function toIsoTimestamp(value) {
 const E2E_LOCKED_NOTE = '[private message, unlock your messages to read it]';
 const E2E_UNREADABLE_NOTE = '[private message that can not be opened]';
 const E2E_CHANGED_NOTE = '[private message, their security key changed]';
+const ROOM_LOCKED_NOTE = '[private room message, unlock your messages to read it]';
+const ROOM_WAITING_NOTE = '[private room message, waiting for the room key]';
+const ROOM_UNREADABLE_NOTE = '[private room message that can not be opened]';
 
 function normalizeDirectMessageRecord(message) {
   if (!message || typeof message !== 'object') return null;
@@ -1074,6 +1089,48 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+// ---- audio files in a room (see server/roomFiles.js and src/roomFiles.js). the file of a song goes up to the room's server when the
+// song is added, and comes back down for the people who want to keep a copy
+let roomFilesStatusCache = { at: 0, value: null };
+async function roomFilesStatus(force = false) {
+  if (!force && roomFilesStatusCache.value && Date.now() - roomFilesStatusCache.at < 60000) return roomFilesStatusCache.value;
+  let value = { enabled: false };
+  try {
+    value = await fetchJson('/api/room-files/status');
+  } catch (error) {
+    value = { enabled: false };
+  }
+  roomFilesStatusCache = { at: Date.now(), value };
+  return value;
+}
+
+// nothing is sent when the room already has the file. throws a message a person can read
+async function sendLocalFileToRoom(serverId, track, onProgress) {
+  const status = await roomFilesStatus();
+  if (!status.enabled) throw new Error('rooms on this server do not take audio files yet');
+  const listed = await fetchJson(`/api/server/${encodeURIComponent(serverId)}/files`).catch(() => ({ files: [] }));
+  if ((listed.files || []).some((entry) => entry.id === track.videoId)) return;
+  const record = await getLocalFileRecord(track.videoId);
+  if (!record || !record.blob) throw new Error(`"${track.title}" is not on this device and no longer in the room`);
+  if (record.size > status.maxFileBytes) throw new Error(`"${track.title}" is bigger than ${Math.round(status.maxFileBytes / 1048576)} MB, the most a room takes`);
+  const target = await resolveApiTarget(`/api/server/${encodeURIComponent(serverId)}/files/${encodeURIComponent(track.videoId)}`);
+  const token = typeof window !== 'undefined' ? window.localStorage.getItem('music_auth_token') : null;
+  const result = await sendFile({ url: target.url, blob: record.blob, type: record.type, token, clientId: CLIENT_ID, onProgress });
+  if (result.status !== 200) throw new Error((result.json && result.json.error) || 'the room did not take the file');
+}
+
+// the address that the player and "keep a copy" use for a file that is in the room
+async function roomFileUrl(serverId, fileId) {
+  const link = await fetchJson(`/api/server/${encodeURIComponent(serverId)}/files/${encodeURIComponent(fileId)}/link`);
+  return socialUrl(link.path);
+}
+
+async function keepRoomFile(serverId, track, onProgress) {
+  const url = await roomFileUrl(serverId, track.videoId);
+  const blob = await fetchBlob(url, onProgress);
+  await saveLocalBlob(track.videoId, blob, { title: track.title, artist: track.author, durationMs: track.durationMs, name: track.title });
+}
+
 function readSnapLayout(storageKey, fallback) {
   if (typeof window === 'undefined') return fallback;
 
@@ -1345,6 +1402,34 @@ function SavedTag({ themeColor }) {
   );
 }
 
+// the marker of a song that is a file of a person's own and not on youtube. it is dim when the file is not on this device
+// 'here' for an audio file that is on this device, 'missing' for one that was added on another device, null for the rest
+function fileStateOf(track, have) {
+  if (!isLocalTrack(track)) return null;
+  return have && have.has(track.videoId) ? 'here' : 'missing';
+}
+
+function FileTag({ themeColor, missing = false }) {
+  return (
+    <span
+      data-file-tag={missing ? 'missing' : 'here'}
+      title={missing ? 'this audio file is not on this device' : 'an audio file from this device, not from youtube'}
+      style={{
+        marginLeft: '8px',
+        padding: '0 6px',
+        fontSize: '10px',
+        border: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+        color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+        borderRadius: '8px',
+        whiteSpace: 'nowrap',
+        opacity: missing ? 0.6 : 1
+      }}
+    >
+      {missing ? 'file missing' : 'file'}
+    </span>
+  );
+}
+
 const QueueRow = React.memo(function QueueRow({
   item,
   idx,
@@ -1356,20 +1441,23 @@ const QueueRow = React.memo(function QueueRow({
   onDownloadSingle,
   offlineMode = false,
   offline = false,
-  dimmed = false
+  dimmed = false,
+  fileState = null
 }) {
   return (
     <ListGroup.Item
       active={active}
       className="track-item border-0 d-flex justify-content-between align-items-start"
-      style={dimmed ? { opacity: 0.4 } : undefined}
-      title={dimmed ? 'not saved on this phone' : undefined}
+      data-file-state={fileState || undefined}
+      style={dimmed || fileState === 'missing' ? { opacity: 0.4 } : undefined}
+      title={dimmed ? 'not saved on this phone' : fileState === 'missing' ? 'this audio file is not on this device' : undefined}
       onClick={() => { if (!dimmed) onPlayTrack(idx); }}
     >
       <div style={{ flex: 1, minWidth: 0 }}>
         <Marquee className="fw-bold" text={item.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
         <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
           {item.author}
+          {fileState && <FileTag themeColor={themeColor} missing={fileState === 'missing'} />}
           {offlineMode && offline && <SavedTag themeColor={themeColor} />}
         </div>
       </div>
@@ -1430,7 +1518,7 @@ const QueueRow = React.memo(function QueueRow({
         >
           {SVGIcons.arrowDown}
         </Button>
-        <Button
+        {!fileState && <Button
           variant="outline-light"
           size="sm"
           type="button"
@@ -1462,7 +1550,7 @@ const QueueRow = React.memo(function QueueRow({
               <polyline points="20 6 9 17 4 12" />
             </svg>
           ) : SVGIcons.download}
-        </Button>
+        </Button>}
       </div>
     </ListGroup.Item>
   );
@@ -1483,13 +1571,15 @@ const PlaylistTrackRow = React.memo(function PlaylistTrackRow({
   offline = false,
   onToggleOffline = null,
   onAddToQueue = null,
-  dimmed = false
+  dimmed = false,
+  fileState = null
 }) {
   return (
     <ListGroup.Item
       active={active}
-      style={dimmed ? { opacity: 0.4 } : undefined}
-      title={dimmed ? 'not saved on this phone' : undefined}
+      data-file-state={fileState || undefined}
+      style={dimmed || fileState === 'missing' ? { opacity: 0.4 } : undefined}
+      title={dimmed ? 'not saved on this phone' : fileState === 'missing' ? 'this audio file is not on this device' : undefined}
       className={`track-item border-0 d-flex justify-content-between align-items-start ${dragged ? 'opacity-50' : ''}`}
       draggable
       onDragStart={(e) => onDragStart(e, idx)}
@@ -1524,7 +1614,7 @@ const PlaylistTrackRow = React.memo(function PlaylistTrackRow({
         >
           {SVGIcons.trash}
         </Button>
-        {offlineMode && onToggleOffline && (
+        {offlineMode && onToggleOffline && !fileState && (
           <Button
             variant="outline-light"
             size="sm"
@@ -1559,6 +1649,7 @@ const PlaylistTrackRow = React.memo(function PlaylistTrackRow({
           <Marquee className="fw-bold" text={track.title} style={{ maxWidth: '200px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
           <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
             {track.author}
+            {fileState && <FileTag themeColor={themeColor} missing={fileState === 'missing'} />}
             {offlineMode && offline && <SavedTag themeColor={themeColor} />}
           </div>
         </div>
@@ -1613,7 +1704,8 @@ const QueueList = React.memo(function QueueList({
   offlineMode = false,
   offlineIds = null,
   offlineModeActive = false,
-  savingProgress = null
+  savingProgress = null,
+  localHave = null
 }) {
   return (
     <>
@@ -1631,7 +1723,8 @@ const QueueList = React.memo(function QueueList({
             onDownloadSingle={onDownloadSingle}
             offlineMode={offlineMode}
             offline={!!(offlineIds && offlineIds.has(item.videoId))}
-            dimmed={offlineModeActive && !(offlineIds && offlineIds.has(item.videoId))}
+            fileState={fileStateOf(item, localHave)}
+            dimmed={offlineModeActive && !(offlineIds && offlineIds.has(item.videoId)) && fileStateOf(item, localHave) !== 'here'}
           />
         ))}
       </ResizableListGroup>
@@ -1850,6 +1943,13 @@ export default function App({
   const [playlistExportDone, setPlaylistExportDone] = useState(null); // { provider, url, line } after it
   // the import panel under the playlist ('spotify' or 'youtube'), what is typed in it, and the person's own playlists at the service
   const [importPanel, setImportPanel] = useState(null);
+  // which audio files (the person's own, not from youtube) are on this device
+  const [localHave, setLocalHave] = useState(() => new Set());
+  useEffect(() => {
+    const stop = subscribeLocalFiles((ids) => setLocalHave(new Set(ids)));
+    refreshLocalFiles();
+    return stop;
+  }, []);
   const [spotifyUrl, setSpotifyUrl] = useState('');
   const [youtubeUrl, setYoutubeUrl] = useState('');
   const [importLists, setImportLists] = useState({}); // { spotify: { state: 'loading' | 'ok' | 'error', items, code, message } }
@@ -1864,6 +1964,7 @@ export default function App({
   const [shibby, setShibby] = useState(null);
   const shibbyRef = useRef(null);
   const shibbyOpenRef = useRef(() => false);
+  const keepOfferRef = useRef(() => {});
   const unavailableIdsRef = useRef(new Set());
 
   
@@ -2736,6 +2837,128 @@ export default function App({
     return () => { cancelled = true; };
   }, [currentUserId, e2eEpoch]);
 
+  // ---- private room chat (see roomKeys.js on the server): the room has one key and every member holds a locked copy of it, the
+  // server only ever sees locked text. this device keeps the current key of the open room in memory (roomKey), opens the messages
+  // when they arrive (roomPlain: message id -> text) and hands the key to members who joined without one
+  // unsupported: the server of the room does not know room keys yet (an older server), nothing can be locked there
+  const [roomKey, setRoomKey] = useState({ serverId: '', kid: '', unsupported: false });
+  const [roomKeyEpoch, setRoomKeyEpoch] = useState(0);
+  const [roomPlain, setRoomPlain] = useState({});
+  const roomKeyRunRef = useRef({ busy: false, again: false });
+  const syncRoomKeysRef = useRef(() => {});
+  const syncRoomKeys = useCallback(async (serverId) => {
+    const e2e = e2eRef.current;
+    const run = roomKeyRunRef.current;
+    if (!serverId || !e2e || !e2e.ready) return;
+    if (run.busy) {
+      run.again = true;
+      return;
+    }
+    run.busy = true;
+    try {
+      const wrapAll = async (kid, ids) => {
+        const envelopes = [];
+        for (const id of ids) {
+          try {
+            envelopes.push({ user_id: id, wrapped: await e2e.room.wrapFor(serverId, kid, id) });
+          } catch (error) {
+            // somebody whose key can not be used right now gets their copy on a later round
+          }
+        }
+        return envelopes;
+      };
+      const base = `/api/server/${encodeURIComponent(serverId)}/keys`;
+      let heldKid = '';
+      let opened = false;
+      for (let round = 0; round < 3; round += 1) {
+        const info = await fetchJson(base);
+        const mine = Array.isArray(info.mine) ? info.mine : [];
+        const had = mine.filter((copy) => e2e.room.has(serverId, copy.kid)).length;
+        const openedKids = await e2e.room.open(serverId, mine);
+        if (openedKids.length > had) opened = true;
+        const memberIds = (Array.isArray(info.members) ? info.members : []).filter((member) => member.has_key).map((member) => member.user_id);
+        if (!info.current_kid || info.rotate) {
+          // the room has no key yet, or somebody left: this device makes the key for the members who are there now
+          const kid = await e2e.room.make(serverId);
+          const envelopes = await wrapAll(kid, memberIds);
+          if (!envelopes.some((entry) => entry.user_id === currentUserId)) break;
+          const result = await fetchJson(base, { method: 'PUT', body: JSON.stringify({ kid, make_current: true, envelopes }) });
+          if (result.made_current === false) continue; // somebody else was first, look again
+          heldKid = kid;
+          opened = true;
+          break;
+        }
+        if (e2e.room.has(serverId, info.current_kid)) {
+          heldKid = info.current_kid;
+          const missing = Array.isArray(info.missing) ? info.missing : [];
+          if (missing.length) {
+            const envelopes = await wrapAll(info.current_kid, missing);
+            if (envelopes.length) await fetchJson(base, { method: 'PUT', body: JSON.stringify({ kid: info.current_kid, envelopes }) });
+          }
+        }
+        break;
+      }
+      if (currentChannelRef.current === serverId) {
+        setRoomKey((prev) => (prev.serverId === serverId && prev.kid === heldKid && !prev.unsupported ? prev : { serverId, kid: heldKid, unsupported: false }));
+      }
+      if (opened) setRoomKeyEpoch((n) => n + 1);
+    } catch (error) {
+      addDebugLog('warn', 'room keys could not be synced', { serverId, error: (error && error.message) || String(error) }, true);
+      if (error && error.status === 404 && currentChannelRef.current === serverId) {
+        setRoomKey((prev) => (prev.serverId === serverId && prev.unsupported ? prev : { serverId, kid: '', unsupported: true }));
+      }
+    }
+    run.busy = false;
+    if (run.again) {
+      run.again = false;
+      const open = currentChannelRef.current;
+      if (open) syncRoomKeysRef.current(open);
+    }
+  }, [addDebugLog, currentUserId]);
+  syncRoomKeysRef.current = syncRoomKeys;
+
+  useEffect(() => {
+    if (!currentChannelId || e2eState !== 'ready') {
+      setRoomKey((prev) => (prev.kid || prev.unsupported ? { serverId: '', kid: '', unsupported: false } : prev));
+      return undefined;
+    }
+    syncRoomKeys(currentChannelId);
+    // somebody who just got an account key, or a holder who was offline, is caught on the next round
+    const timer = setInterval(() => syncRoomKeys(currentChannelId), 20000);
+    return () => clearInterval(timer);
+  }, [currentChannelId, e2eState, syncRoomKeys]);
+
+  useEffect(() => {
+    setRoomPlain({});
+  }, [currentChannelId, currentUserId]);
+
+  // the locked messages of the open room, opened as soon as their key is here (a message with no key yet is tried again later)
+  useEffect(() => {
+    const e2e = e2eRef.current;
+    if (!currentChannelId || !e2e || !e2e.ready) return undefined;
+    const pending = channelMessages.filter((message) => isRoomEnvelope(message.message) && roomPlain[message.id] === undefined);
+    if (!pending.length) return undefined;
+    let cancelled = false;
+    (async () => {
+      const found = {};
+      for (const message of pending) {
+        try {
+          found[message.id] = await e2e.room.decrypt(currentChannelId, message.message, message.user_id);
+        } catch (error) {
+          if (!error || error.code !== 'no_key') found[message.id] = ROOM_UNREADABLE_NOTE;
+        }
+      }
+      if (!cancelled && Object.keys(found).length) setRoomPlain((prev) => ({ ...prev, ...found }));
+    })();
+    return () => { cancelled = true; };
+  }, [channelMessages, currentChannelId, roomKeyEpoch, roomPlain, e2eState]);
+
+  const roomMessageText = (message) => {
+    if (!isRoomEnvelope(message.message)) return message.message;
+    if (roomPlain[message.id] !== undefined) return roomPlain[message.id];
+    return e2eState === 'locked' ? ROOM_LOCKED_NOTE : ROOM_WAITING_NOTE;
+  };
+
   // the stats tab: the person's own numbers and the friends list, again every half minute while it is open
   useEffect(() => {
     if (activeTab !== 'stats' || !currentUserId) return undefined;
@@ -2772,6 +2995,8 @@ export default function App({
     setDmMessages({});
     setConversationList([]);
     setSelectedConversationId('');
+    setRoomPlain({});
+    setRoomKey({ serverId: '', kid: '', unsupported: false });
   }, [currentUserId]);
 
   // a message as the server has it -> the same message with its text opened (or a note saying why not)
@@ -3631,18 +3856,37 @@ export default function App({
     const text = channelMessageText.trim();
     if (!currentChannelId || !text) return;
 
-    addDebugLog('collab', 'sending channel message over http', { channelId: currentChannelId, text }, true);
+    addDebugLog('collab', 'sending channel message over http', { channelId: currentChannelId }, true);
+
+    // the text is locked here, the server only gets the locked form
+    const e2e = e2eRef.current;
+    if (!e2e || !e2e.ready) {
+      showNotification(e2eState === 'locked' ? 'unlock your private messages first' : 'private messages are not available here', 'warning');
+      return;
+    }
+    const kid = roomKey.serverId === currentChannelId ? roomKey.kid : '';
+    if (!kid) {
+      if (roomKey.serverId === currentChannelId && roomKey.unsupported) {
+        showNotification('this server does not have private room chat yet', 'warning');
+        return;
+      }
+      showNotification('the room key has not arrived yet, try again in a moment', 'warning');
+      syncRoomKeys(currentChannelId);
+      return;
+    }
 
     try {
+      const envelope = await e2e.room.encrypt(currentChannelId, kid, text);
       const data = await fetchJson(`/api/server/${encodeURIComponent(currentChannelId)}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({ text: envelope })
       });
 
       if (data.message) {
+        setRoomPlain((prev) => ({ ...prev, [data.message.id]: text }));
         setChannelMessages((prev) => (
           prev.some((entry) => entry.id === data.message.id) ? prev : [...prev, data.message]
         ));
@@ -3650,9 +3894,10 @@ export default function App({
       setChannelMessageText('');
     } catch (error) {
       addDebugLog('error', 'channel message send failed', { channelId: currentChannelId, error: error.message || String(error) }, true);
+      if (/unknown_key|room_e2e_required/.test(String((error && error.responseData && error.responseData.code) || ''))) syncRoomKeys(currentChannelId);
       showNotification(error.message || 'failed to send channel message', 'warning');
     }
-  }, [addDebugLog, channelMessageText, currentChannelId, showNotification]);
+  }, [addDebugLog, channelMessageText, currentChannelId, e2eState, roomKey, showNotification, syncRoomKeys]);
 
   const addTrackToCurrentChannel = useCallback(async (track) => {
     if (!currentChannelId) {
@@ -3664,6 +3909,16 @@ export default function App({
     if (!normalizedTrack.videoId || !normalizedTrack.title) {
       showNotification('pick a valid track first', 'warning');
       return;
+    }
+    if (isLocalTrack(normalizedTrack)) {
+      // the file goes to the room's server first, the song is only added once the room has it
+      try {
+        showNotification(`sending "${normalizedTrack.title}" to the room`, 'info');
+        await sendLocalFileToRoom(currentChannelId, normalizedTrack);
+      } catch (error) {
+        showNotification((error && error.message) || 'could not send the file', 'warning');
+        return;
+      }
     }
 
     addDebugLog('collab', 'adding track to shared queue over http', {
@@ -3711,9 +3966,20 @@ export default function App({
       return;
     }
     let added = 0;
+    let fileProblem = '';
+    let filesSkipped = 0;
     for (let i = 0; i < list.length; i += 1) {
       setRoomAddProgress({ done: i, total: list.length });
       try {
+        if (isLocalTrack(list[i])) {
+          try {
+            await sendLocalFileToRoom(currentChannelId, list[i]);
+          } catch (error) {
+            filesSkipped += 1;
+            fileProblem = (error && error.message) || 'could not send the file';
+            continue;
+          }
+        }
         await fetchJson(`/api/server/${encodeURIComponent(currentChannelId)}/queue`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -3737,7 +4003,8 @@ export default function App({
     }
     setRoomAddProgress(null);
     await loadChannelState(currentChannelId);
-    showNotification(added ? `added ${added} song${added === 1 ? '' : 's'} to the room's queue` : `could not add ${label} to the room`, added ? 'success' : 'warning');
+    const skippedNote = filesSkipped ? `, ${filesSkipped} audio file${filesSkipped === 1 ? '' : 's'} could not be sent (${fileProblem})` : '';
+    showNotification(added ? `added ${added} song${added === 1 ? '' : 's'} to the room's queue${skippedNote}` : (filesSkipped ? fileProblem : `could not add ${label} to the room`), added && !filesSkipped ? 'success' : 'warning');
   }, [addDebugLog, currentChannelId, loadChannelState, roomAddProgress, showNotification]);
   const addMyQueueToRoom = useCallback(() => addTracksToRoom(queueRef.current, 'your queue'), [addTracksToRoom]);
 
@@ -4679,6 +4946,15 @@ export default function App({
               }
               break;
 
+            case 'chat_history':
+              // the room's messages again, in the form this app can open (the server sent notes before it knew what this app reads)
+              if (data.serverId === currentChannelRef.current && Array.isArray(data.messages)) setChannelMessages(data.messages);
+              break;
+
+            case 'room_keys_changed':
+              if (data.serverId === currentChannelRef.current) syncRoomKeysRef.current(data.serverId);
+              break;
+
             case 'server_members_updated':
               if (data.serverId === currentChannelRef.current) {
                 setChannelMembers(Array.isArray(data.members) ? data.members : []);
@@ -4900,6 +5176,12 @@ export default function App({
               if (data.error) {
                 setPendingFriendTargetIds((prev) => prev.filter(id => id !== data.receiverId));
               }
+              break;
+
+            case 'import_waiting':
+              // the spotify helper sent a list to this account
+              showNotification(`"${data.name}" is waiting, import it from spotify`, 'info');
+              loadWaitingImports();
               break;
 
             case 'friend_request_received':
@@ -5516,6 +5798,7 @@ export default function App({
     if (
       isAndroidApp() && nextSource !== 'shared'
       && networkConfirmedDown
+      && !isLocalTrack(track)
       && !offlineIdsRef.current.has(track.videoId)
     ) {
       const savedLeft = list.some((item) => item && offlineIdsRef.current.has(normalizeTrack(item).videoId));
@@ -5571,21 +5854,58 @@ export default function App({
 
     
     
+    // a file of the person's own plays straight from this device: no helper, no stream, nothing to buffer
+    const localFile = isLocalTrack(track);
     const streamPath = `/api/stream?videoId=${encodeURIComponent(track.videoId)}`;
-    addDebugLog('api', `stream request: ${streamPath}`, { videoId: track.videoId, startTime }, true);
+    addDebugLog('api', localFile ? `local file: ${track.videoId}` : `stream request: ${streamPath}`, { videoId: track.videoId, startTime }, true);
     let streamUrl = streamPath;
     setBufferStage('helper');
-    try {
-      streamUrl = await resolveMediaUrl(streamPath);
-    } catch (error) {
+    let fromRoom = false;
+    if (localFile) {
+      streamUrl = await localFileUrl(track.videoId).catch(() => '');
       if (requestSerial !== playRequestSerialRef.current) {
         return;
       }
-      addDebugLog('error', `stream url resolve failed: ${error.message}`, { videoId: track.videoId }, true);
-      showNotification(`failed to load: ${track.title}`, 'error');
-      setIsPlaying(false);
-      setIsBuffering(false);
-      return;
+      // in a room a file that is not on this device plays from the room's server (and Shibby asks if it should be kept)
+      if (!streamUrl && nextSource === 'shared' && currentChannelRef.current) {
+        streamUrl = await roomFileUrl(currentChannelRef.current, track.videoId).catch(() => '');
+        if (requestSerial !== playRequestSerialRef.current) {
+          return;
+        }
+        if (streamUrl) {
+          fromRoom = true;
+          keepOfferRef.current(track);
+        }
+      }
+      if (!streamUrl) {
+        addDebugLog('error', 'audio file is not on this device', { videoId: track.videoId }, true);
+        setIsPlaying(false);
+        setIsBuffering(false);
+        showNotification(`"${track.title}" is an audio file that is not on this device`, 'warning');
+        audio._consecutiveFailures = (audio._consecutiveFailures || 0) + 1;
+        if (options.stayOnFail !== true && nextSource !== 'shared' && audio._consecutiveFailures < 3) {
+          setTimeout(() => {
+            if (requestSerial !== playRequestSerialRef.current) return;
+            handleNextRef.current();
+          }, 800);
+        } else {
+          audio._consecutiveFailures = 0;
+        }
+        return;
+      }
+    } else {
+      try {
+        streamUrl = await resolveMediaUrl(streamPath);
+      } catch (error) {
+        if (requestSerial !== playRequestSerialRef.current) {
+          return;
+        }
+        addDebugLog('error', `stream url resolve failed: ${error.message}`, { videoId: track.videoId }, true);
+        showNotification(`failed to load: ${track.title}`, 'error');
+        setIsPlaying(false);
+        setIsBuffering(false);
+        return;
+      }
     }
 
     if (requestSerial !== playRequestSerialRef.current) {
@@ -5601,7 +5921,7 @@ export default function App({
 
 
 
-    audio._loadTimeout = setTimeout(() => {
+    audio._loadTimeout = localFile && !fromRoom ? null : setTimeout(() => {
       if (requestSerial !== playRequestSerialRef.current) {
         return;
       }
@@ -5660,7 +5980,7 @@ export default function App({
     }, 15000);
 
     // a song that YouTube itself says does not exist is not worth waiting out the retries for
-    if (nextSource !== 'shared') {
+    if (nextSource !== 'shared' && !localFile) {
       setTimeout(async () => {
         // only while this very song is still what the element is trying to load (an error, a stop or a delete took the source away)
         if (requestSerial !== playRequestSerialRef.current || audio.readyState > 0 || !audio.getAttribute('src') || document.hidden) return;
@@ -6056,6 +6376,14 @@ export default function App({
       // a song that never got going and was refused (not on YouTube any more, private, blocked where this computer
       // is) is not "a slow connection": Shibby asks what to do with it. with no connection at all, or when nobody
       // can see a popup, it is the plain way: say so, and move on
+      if (errorCode === 4 && playedSeconds < 1 && isLocalTrack(currentTrack)) {
+        showNotification(`"${currentTrack?.title || 'that file'}" could not be played on this device, skipping it`, 'warning');
+        setTimeout(() => {
+          if (failedSerial !== playRequestSerialRef.current) return;
+          handleNextRef.current();
+        }, 1000);
+        return;
+      }
       if (errorCode === 4 && playedSeconds < 1) {
         const refused = currentTrack;
         probeYoutube(refused && refused.videoId).then((state) => {
@@ -7292,6 +7620,8 @@ export default function App({
     if (!list || nextIndex >= list.length) return;
 
     const track = list[nextIndex];
+    // a file on this device has nothing to fetch ahead
+    if (isLocalTrack(track)) return;
     const prefetchAudio = prefetchAudioRef.current;
     if (!prefetchAudio) return;
 
@@ -8731,7 +9061,7 @@ export default function App({
     // and the next one starts at once. the computer only looks the next one up
     const wanted = ahead
       .slice(0, isAndroidApp() ? 2 : 1)
-      .filter((track) => track?.videoId && track.videoId !== currentTrack.videoId);
+      .filter((track) => track?.videoId && track.videoId !== currentTrack.videoId && !isLocalTrack(track));
     if (!wanted.length) return;
     wanted
       .reduce((chain, track, index) => chain.then(() => resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(track.videoId)}${isAndroidApp() ? `&full=${index === 0 ? 1 : 2}` : ''}`).then((url) => fetch(url))), Promise.resolve())
@@ -8739,6 +9069,34 @@ export default function App({
         // best-effort - /api/stream just resolves cold when actually played
       });
   }, [currentTrack, queue, playIndex, shuffle, currentChannelId, playNextQueue, repeatMode, planShuffleAhead]);
+
+  // in a room every device looks up the songs that come next, like it does for its own queue. without it every
+  // song of the room started cold: the room waits for the slowest lookup (15 to 25 s for a song on youtube), and a
+  // player that needs longer than the grace time is left out of the start and falls out of step. it waits until the
+  // song that is playing has started, so the lookups do not compete with the one the room is waiting for
+  const roomWarmedRef = useRef(new Map());
+  useEffect(() => {
+    if (!currentChannelId || playbackSource !== 'shared' || channelPlayerState?.sync_phase !== 'playing' || !channelQueue.length) return undefined;
+    const currentEntryId = channelPlayerState.current_track_id;
+    const at = channelQueue.findIndex((entry) => entry.id === currentEntryId);
+    const after = at >= 0 ? [...channelQueue.slice(at + 1), ...channelQueue.slice(0, at)] : channelQueue.slice();
+    const pool = after.map((entry) => normalizeTrack(entry)).filter((track) => track.videoId && !isLocalTrack(track) && track.videoId !== currentTrack?.videoId);
+    // with shuffle the next song is picked at random when this one ends, so a few of them are looked up
+    const ordered = channelPlayerState.shuffle ? pool.slice().sort(() => Math.random() - 0.5) : pool;
+    const wanted = ordered.slice(0, isAndroidApp() ? 2 : 3).filter((track) => Date.now() - (roomWarmedRef.current.get(track.videoId) || 0) > 15 * 60 * 1000);
+    if (!wanted.length) return undefined;
+    const timer = setTimeout(() => {
+      wanted
+        .reduce((chain, track, index) => chain.then(() => {
+          roomWarmedRef.current.set(track.videoId, Date.now());
+          return resolveMediaUrl(`/api/prefetch?videoId=${encodeURIComponent(track.videoId)}${isAndroidApp() ? `&full=${index === 0 ? 1 : 2}` : ''}`).then((url) => fetch(url));
+        }), Promise.resolve())
+        .catch(() => {
+          // best-effort, the song is found when its turn comes
+        });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [currentChannelId, playbackSource, channelQueue.length, channelPlayerState?.sync_phase, channelPlayerState?.current_track_id, channelPlayerState?.shuffle, currentTrack?.videoId]);
 
   const stopAndResetPlayback = () => {
     logClient('stopAndResetPlayback', { playIndex: playIndexRef.current });
@@ -9085,6 +9443,30 @@ export default function App({
   };
 
   // Shibby says something and waits for a button: resolves with the value of the button (null when something else was said)
+  // a song that is a file in the room and that this device does not have: Shibby asks, once, whether to keep a copy
+  const keepAskedRef = useRef(new Set());
+  keepOfferRef.current = async (track) => {
+    if (!track || keepAskedRef.current.has(track.videoId) || localFileIds().has(track.videoId)) return;
+    keepAskedRef.current.add(track.videoId);
+    const channelId = currentChannelRef.current;
+    if (!channelId) return;
+    const sender = track.added_by || track.addedBy || 'someone';
+    const answer = await shibbyTalkAsk({
+      key: 'keep-file',
+      text: `yo bro, ${sender} sent this one to the room as a file. want to keep a copy on your device? it is gone from the room once the queue is done`,
+      buttons: [{ label: 'keep a copy', value: true }, { label: 'just listen', value: false }]
+    });
+    if (answer !== true) return;
+    showNotification(`keeping "${track.title}"`, 'info');
+    try {
+      await keepRoomFile(channelId, normalizeTrack(track));
+      showNotification(`kept "${track.title}" on this device`, 'success');
+    } catch (error) {
+      keepAskedRef.current.delete(track.videoId);
+      showNotification((error && error.message) || 'could not keep the file', 'warning');
+    }
+  };
+
   const shibbyTalkAsk = (content) => new Promise((resolve) => {
     if (shibbyTalkResolveRef.current) shibbyTalkResolveRef.current(null);
     shibbyTalkResolveRef.current = resolve;
@@ -9170,12 +9552,18 @@ export default function App({
       const connected = await connectProvider(provider);
       if (!connected) return;
     }
+    // audio files of the person's own are not on youtube
+    const exportable = currentTracks.filter((track) => !isLocalTrack(track));
+    if (!exportable.length) {
+      showNotification('nothing in this playlist is on youtube', 'warning');
+      return;
+    }
     setPlaylistExportDone(null);
-    setPlaylistExportJob({ provider, done: 0, total: currentTracks.length });
+    setPlaylistExportJob({ provider, done: 0, total: exportable.length });
     try {
       const started = await fetchJson('/api/export/' + provider, {
         method: 'POST',
-        body: JSON.stringify({ name: playlist.name, tracks: currentTracks.map((track) => ({ title: track.title, author: track.author, videoId: track.videoId })) })
+        body: JSON.stringify({ name: playlist.name, tracks: exportable.map((track) => ({ title: track.title, author: track.author, videoId: track.videoId })) })
       });
       let job = null;
       for (let i = 0; i < 1200; i += 1) {
@@ -9265,6 +9653,62 @@ export default function App({
       }
     }
     return { resolved, unmatched, failed };
+  };
+
+  // audio files of the person's own: the file stays on this device, and the queue or the playlist gets a song that carries the file marker
+  const addAudioFiles = async (fileList, target = 'queue') => {
+    const files = Array.from(fileList || []).filter((file) => looksLikeAudio(file));
+    if (!files.length) {
+      showNotification('no audio files there', 'warning');
+      return;
+    }
+    if (files.length > 3) showNotification(`adding ${files.length} audio files`, 'info');
+    const tracks = [];
+    const problems = [];
+    for (const file of files) {
+      try {
+        const { track } = await addLocalFile(file);
+        tracks.push(track);
+      } catch (error) {
+        problems.push(`${file.name}: ${(error && error.message) || 'could not be added'}`);
+      }
+    }
+    if (tracks.length) {
+      if (target === 'playlist') {
+        const playlist = ensureTargetPlaylist('my files');
+        setPlaylists((prev) => prev.map((p) => {
+          if (p.id !== playlist.id) return p;
+          const have = new Set((p.tracks || []).map((t) => getTrackKey(t)));
+          return { ...p, tracks: [...p.tracks, ...tracks.filter((t) => !have.has(t.videoId)).map((t) => ({ ...normalizeTrack(t), addedAt: Date.now() }))] };
+        }));
+      } else {
+        setQueue((prev) => [...prev, ...tracks.map((t) => normalizeTrack(t))]);
+      }
+    }
+    addDebugLog('playlist', `audio files: ${tracks.length} added, ${problems.length} not`, { target, problems: problems.slice(0, 5) }, true);
+    if (problems.length) {
+      showNotification(tracks.length ? `added ${tracks.length}, ${problems.length} could not be added (${problems[0]})` : problems[0], tracks.length ? 'warning' : 'error');
+    } else {
+      showNotification(tracks.length === 1 ? `added "${tracks[0].title}"` : `added ${tracks.length} audio files`, 'success');
+    }
+  };
+
+  const pickAudioFiles = (target = 'queue') => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = AUDIO_ACCEPT;
+    input.style.display = 'none';
+    input.setAttribute('data-audio-input', target);
+    const done = () => input.remove();
+    input.onchange = () => {
+      const picked = Array.from(input.files || []);
+      done();
+      if (picked.length) addAudioFiles(picked, target);
+    };
+    input.oncancel = done;
+    document.body.appendChild(input);
+    input.click();
   };
 
   const importPlaylistFromFile = async () => {
@@ -9386,34 +9830,104 @@ export default function App({
   };
 
 
-  // a Spotify playlist opens as a playlist of its own, and every step says what it is doing
+  // the name that several parts of one playlist share: "cool music-1", "cool music 2", "cool music (3)" -> "cool music"
+  const sharedPlaylistName = (names) => {
+    const base = (name) => String(name || '').replace(/[\s_-]*[([]?\s*(part|pt)?[\s._-]*\d+\s*[)\]]?\s*$/i, '').trim();
+    const first = base(names[0]);
+    if (names.length > 1 && first && names.every((name) => base(name).toLowerCase() === first.toLowerCase())) return first;
+    return names[0];
+  };
+
+  // lists that the spotify helper sent to this account (see public/spotify-send.html): they wait here until they are imported
+  const [waitingImports, setWaitingImports] = useState([]);
+  const loadWaitingImports = useCallback(async () => {
+    try {
+      const data = await fetchJson('/api/user/imports');
+      setWaitingImports(Array.isArray(data && data.imports) ? data.imports : []);
+    } catch (error) {
+      // not signed in, or a server that does not have the helper yet
+      setWaitingImports([]);
+    }
+  }, []);
+
+  const importWaiting = async (item) => {
+    if (playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
+    setPlaylistNotice({ kind: 'working', text: `reading "${item.name}"` });
+    let list = null;
+    try {
+      const data = await fetchJson(`/api/user/imports/${encodeURIComponent(item.id)}`);
+      list = data && data.import;
+    } catch (error) {
+      const message = (error && error.message) || 'could not read that list';
+      setPlaylistNotice({ kind: 'error', text: message });
+      loadWaitingImports();
+      return;
+    }
+    if (!list || !Array.isArray(list.tracks) || !list.tracks.length) {
+      setPlaylistNotice({ kind: 'error', text: 'there are no songs in that list' });
+      return;
+    }
+    setImportPanel(null);
+    const pending = list.tracks.map((track) => ({ title: String(track.title), author: String(track.author || ''), videoId: '', durationMs: Number(track.durationMs || 0) || 0 }));
+    const playlist = createPlaylistNamed(String(list.name || 'spotify playlist'));
+    setPlaylistNotice({ kind: 'working', text: 'found ' + pending.length + (pending.length === 1 ? ' song' : ' songs') + ', looking them up for "' + playlist.name + '"' });
+    await runPendingImport(pending, playlist, 'spotify');
+    // a list that was imported is taken off the waiting list (one that was stopped half way stays)
+    if (!importCancelRef.current) {
+      try { await fetchJson(`/api/user/imports/${encodeURIComponent(item.id)}`, { method: 'DELETE' }); } catch (error) { /* it stays on the list */ }
+    }
+    loadWaitingImports();
+  };
+
+  const dismissWaiting = async (item) => {
+    try { await fetchJson(`/api/user/imports/${encodeURIComponent(item.id)}`, { method: 'DELETE' }); } catch (error) { /* shown again */ }
+    loadWaitingImports();
+  };
+
+  useEffect(() => {
+    if (currentUserId && importPanel === 'spotify') loadWaitingImports();
+  }, [currentUserId, importPanel, loadWaitingImports]);
+
+  // a Spotify playlist opens as a playlist of its own, and every step says what it is doing. several links at once (a long
+  // playlist that was cut into parts of 100) are read one after the other and come in as one playlist
   const importSpotifyPlaylist = async (picked) => {
-    const url = (typeof picked === 'string' ? picked : spotifyUrl).trim();
-    if (!url || playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
+    const links = String(typeof picked === 'string' ? picked : spotifyUrl).split(/[\s,]+/).filter(Boolean).slice(0, 25);
+    if (!links.length || playlistImport || (playlistNotice && playlistNotice.kind === 'working')) return;
     if (!currentUserId) {
       showNotification('sign in first', 'warning');
       return;
     }
-    setPlaylistNotice({ kind: 'working', text: 'reading the spotify playlist' });
-    let data = null;
-    try {
-      data = await fetchJson('/api/import/spotify', { method: 'POST', body: JSON.stringify({ url }) });
-    } catch (error) {
-      const message = (error && error.message) || 'could not read that playlist';
-      setPlaylistNotice({ kind: 'error', text: message });
-      showNotification(message, 'error');
-      return;
+    const many = links.length > 1;
+    const parts = [];
+    const unreadable = [];
+    let lastError = '';
+    for (let i = 0; i < links.length; i += 1) {
+      setPlaylistNotice({ kind: 'working', text: many ? `reading spotify playlist ${i + 1} of ${links.length}` : 'reading the spotify playlist' });
+      try {
+        const data = await fetchJson('/api/import/spotify', { method: 'POST', body: JSON.stringify({ url: links[i] }) });
+        if (data && Array.isArray(data.tracks) && data.tracks.length) parts.push(data);
+        else { unreadable.push(i + 1); lastError = 'there are no songs in that playlist that could be read'; }
+      } catch (error) {
+        unreadable.push(i + 1);
+        lastError = (error && error.message) || 'could not read that playlist';
+      }
     }
-    if (!data || !Array.isArray(data.tracks) || !data.tracks.length) {
-      setPlaylistNotice({ kind: 'error', text: 'there are no songs in that playlist that could be read' });
+    if (!parts.length) {
+      setPlaylistNotice({ kind: 'error', text: lastError });
+      showNotification(lastError, 'error');
       return;
     }
     setImportPanel(null);
     setSpotifyUrl('');
-    const pending = data.tracks.map((track) => ({ title: track.title, author: track.author, videoId: '', durationMs: track.durationMs || 0 }));
-    const playlist = createPlaylistNamed(data.name || 'spotify playlist');
-    setPlaylistNotice({ kind: 'working', text: 'found ' + pending.length + (pending.length === 1 ? ' song' : ' songs') + ', looking them up for "' + playlist.name + '"' });
-    await runPendingImport(pending, playlist, 'spotify', data.partial ? 'only the first ' + data.tracks.length + ' songs could be read' : '');
+    const tracks = parts.flatMap((part) => part.tracks);
+    const pending = tracks.map((track) => ({ title: track.title, author: track.author, videoId: '', durationMs: track.durationMs || 0 }));
+    const playlist = createPlaylistNamed(sharedPlaylistName(parts.map((part) => part.name || 'spotify playlist')));
+    const notes = [];
+    if (unreadable.length) notes.push(unreadable.length === 1 ? `link ${unreadable[0]} could not be read` : `${unreadable.length} links could not be read (${unreadable.join(', ')})`);
+    // one link that gave a full hundred may have had more, a list that was cut into parts is what it is
+    if (!many && parts[0].partial) notes.push('only the first ' + parts[0].tracks.length + ' songs could be read');
+    setPlaylistNotice({ kind: 'working', text: 'found ' + pending.length + (pending.length === 1 ? ' song' : ' songs') + (many ? ` in ${parts.length} playlists` : '') + ', looking them up for "' + playlist.name + '"' });
+    await runPendingImport(pending, playlist, 'spotify', notes.join(', '));
   };
 
   // a playlist of the person's own YouTube account: the video ids are known, so nothing has to be looked up
@@ -9509,6 +10023,22 @@ export default function App({
     setQueue((prev) => [...prev, normalized]);
     showNotification('added to queue', 'info');
     logClient('addTrackToQueue', { videoId: normalized.videoId, title: normalized.title });
+  };
+
+  // a song of the room's queue into the person's own queue. a file of the room is kept on this device first
+  const addRoomTrackToMyQueue = async (track) => {
+    const normalized = normalizeTrack(track);
+    if (isLocalTrack(normalized) && !localFileIds().has(normalized.videoId)) {
+      showNotification(`keeping "${normalized.title}" on this device`, 'info');
+      try {
+        await keepRoomFile(currentChannelRef.current, normalized);
+      } catch (error) {
+        showNotification((error && error.message) || 'could not keep the file', 'warning');
+        return;
+      }
+    }
+    const { id: roomEntryId, ...rest } = normalized;
+    addTrackToQueue(isLocalTrack(normalized) ? { ...rest, id: normalized.videoId } : rest);
   };
 
   const handleDragStart = (e, index) => {
@@ -9641,6 +10171,14 @@ export default function App({
       return;
     }
     const normalizedTrack = normalizeTrack(track);
+    if (isLocalTrack(normalizedTrack)) {
+      try {
+        await sendLocalFileToRoom(currentChannelId, normalizedTrack);
+      } catch (error) {
+        showNotification((error && error.message) || 'could not send the file', 'warning');
+        return;
+      }
+    }
     try {
       const result = await fetchJson(`/api/servers/${currentChannelId}/collab-playlists/${playlistId}/tracks`, {
         method: 'POST',
@@ -9728,15 +10266,30 @@ export default function App({
     } catch {}
   };
 
-  const loadCollabPlaylistToQueue = () => {
+  const loadCollabPlaylistToQueue = async () => {
     if (!currentCollabTracks.length) {
       showNotification('collab playlist is empty', 'warning');
       return;
     }
     const playlist = playlists.find((p) => p.id === currentCollabPlaylistId);
     addDebugLog('collab_playlist', `load "${playlist?.name}" to your queue: ${currentCollabTracks.length} tracks`);
-    setQueue((prev) => [...prev, ...currentCollabTracks.map((t) => normalizeTrack(t))]);
-    showNotification(`added ${currentCollabTracks.length} song${currentCollabTracks.length === 1 ? '' : 's'} from "${playlist?.name}" to your queue`, 'success');
+    const loaded = [];
+    let gone = 0;
+    for (const t of currentCollabTracks) {
+      const track = normalizeTrack(t);
+      if (isLocalTrack(track) && !localFileIds().has(track.videoId)) {
+        try {
+          await keepRoomFile(currentChannelRef.current, track);
+        } catch (error) {
+          gone += 1;
+          continue;
+        }
+      }
+      const { id: entryId, ...rest } = track;
+      loaded.push(isLocalTrack(track) ? { ...rest, id: track.videoId } : track);
+    }
+    if (loaded.length) setQueue((prev) => [...prev, ...loaded]);
+    showNotification(loaded.length ? `added ${loaded.length} song${loaded.length === 1 ? '' : 's'} from "${playlist?.name}" to your queue${gone ? `, ${gone} audio file${gone === 1 ? ' is' : 's are'} no longer in the room` : ''}` : 'the audio files are no longer in the room', loaded.length && !gone ? 'success' : 'warning');
   };
 
   // the room's queue into the selected playlist. a collab playlist is saved on the
@@ -9751,8 +10304,28 @@ export default function App({
       return;
     }
     if (playlist.type !== 'collab') {
-      setPlaylists((prev) => prev.map((p) => (p.id === playlist.id ? { ...p, tracks: [...p.tracks, ...tracks.map((t) => ({ ...t, addedAt: Date.now() }))] } : p)));
-      showNotification(`added ${tracks.length} tracks to "${playlist.name}"`, 'success');
+      // a song that is a file in the room is only worth having in a playlist with its file: it is kept on this device first
+      const keepable = [];
+      let gone = 0;
+      for (const t of tracks) {
+        if (isLocalTrack(t) && !localFileIds().has(t.videoId)) {
+          try {
+            showNotification(`keeping "${t.title}" on this device`, 'info');
+            await keepRoomFile(currentChannelId, t);
+          } catch (error) {
+            gone += 1;
+            continue;
+          }
+        }
+        const { id: roomEntryId, ...rest } = t;
+        keepable.push(isLocalTrack(t) ? { ...rest, id: t.videoId } : t);
+      }
+      if (!keepable.length) {
+        showNotification('the audio files are no longer in the room', 'warning');
+        return;
+      }
+      setPlaylists((prev) => prev.map((p) => (p.id === playlist.id ? { ...p, tracks: [...p.tracks, ...keepable.map((t) => ({ ...t, addedAt: Date.now() }))] } : p)));
+      showNotification(`added ${keepable.length} tracks to "${playlist.name}"${gone ? `, ${gone} audio file${gone === 1 ? ' was' : 's were'} no longer in the room` : ''}`, gone ? 'warning' : 'success');
       return;
     }
     try {
@@ -10219,7 +10792,7 @@ export default function App({
     // saving it twice only made the count look short ("153 songs, 131 saved")
     const seenIds = new Set();
     const todo = (tracks || []).filter((track) => {
-      if (!track || !track.videoId || offlineIdsRef.current.has(track.videoId) || seenIds.has(track.videoId)) return false;
+      if (!track || !track.videoId || isLocalTrack(track) || offlineIdsRef.current.has(track.videoId) || seenIds.has(track.videoId)) return false;
       seenIds.add(track.videoId);
       return true;
     });
@@ -10280,7 +10853,7 @@ export default function App({
   }, [addDebugLog, showNotification]);
 
   const toggleOffline = useCallback(async (item) => {
-    if (!item || !item.videoId) return;
+    if (!item || !item.videoId || isLocalTrack(item)) return;
     if (offlineIdsRef.current.has(item.videoId)) {
       try {
         await fetchJson(`/api/offline/remove?videoId=${encodeURIComponent(item.videoId)}`);
@@ -10327,7 +10900,40 @@ export default function App({
     return () => clearTimeout(timer);
   }, [confirmClearSaved]);
 
+  // the audio files of this device: how much room they take, and taking them all off again
+  const [localBytes, setLocalBytes] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    localFileSizes().then((sizes) => { if (alive) setLocalBytes(Object.values(sizes).reduce((sum, size) => sum + size, 0)); });
+    return () => { alive = false; };
+  }, [localHave]);
+  const [confirmClearFiles, setConfirmClearFiles] = useState(false);
+  useEffect(() => {
+    if (!confirmClearFiles) return undefined;
+    const timer = setTimeout(() => setConfirmClearFiles(false), 6000);
+    return () => clearTimeout(timer);
+  }, [confirmClearFiles]);
+  const removeAllAudioFiles = async () => {
+    const audio = audioRef.current;
+    if (audio && isLocalTrack(currentTrackRef.current)) {
+      audio.pause();
+      audio.removeAttribute('src');
+      delete audio.dataset.lastSrc;
+      audio.load();
+      setIsPlaying(false);
+    }
+    const count = localHave.size;
+    try {
+      await clearLocalFiles();
+      showNotification(`removed ${count} audio file${count === 1 ? '' : 's'} from this device`, 'success');
+    } catch (error) {
+      showNotification((error && error.message) || 'could not remove the audio files', 'error');
+    }
+  };
+
   const downloadSingle = async (item) => {
+    // an audio file of the person's own is already on this device
+    if (isLocalTrack(item)) return;
     // on the phone the download button saves the song into the app for offline
     // listening, there is no downloads folder to put a file in
     if (isAndroidApp()) {
@@ -10413,6 +11019,7 @@ export default function App({
       if (!queueRunningRef.current) break;
       setCurrentIndex(i);
       const item = queue[i];
+      if (isLocalTrack(item)) continue;
 
       setVideoInfo({ title: item.title, author: item.author, videoId: item.videoId });
       showNotification(`downloading (${i + 1}/${queue.length})`, 'success');
@@ -12318,7 +12925,10 @@ export default function App({
               >
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <Marquee className="fw-bold" text={track.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
-                  <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{track.author || 'unknown artist'}</div>
+                  <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
+                    {track.author || 'unknown artist'}
+                    {isLocalTrack(track) && <FileTag themeColor={themeColor} />}
+                  </div>
                 </div>
 
                 <div className="btn-group" style={{ position: 'relative', zIndex: 10, gap: '4px' }}>
@@ -12326,6 +12936,37 @@ export default function App({
                     variant="outline-light"
                     size="sm"
                     className="btn"
+                    data-room-to-queue
+                    title="add to my queue"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      addRoomTrackToMyQueue(track);
+                    }}
+                    style={{
+                      borderRadius: '6px',
+                      color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                      border: `1px solid ${dimBorderColor(themeColor)}`,
+                      background: 'transparent',
+                      transition: 'none',
+                      transform: 'scale(1)',
+                      padding: '4px 8px'
+                    }}
+                    onMouseEnter={(e) => {
+                      e.target.style.transform = 'scale(1.15)';
+                    }}
+                    onMouseLeave={(e) => {
+                      e.target.style.transform = 'scale(1)';
+                    }}
+                  >
+                    {SVGIcons.queueAdd}
+                  </Button>
+                  <Button
+                    variant="outline-light"
+                    size="sm"
+                    className="btn"
+                    data-room-to-shared
+                    title="add to the shared playlist"
                     onClick={(e) => {
                       e.stopPropagation();
                       addTrackToCollabPlaylist(track);
@@ -12540,11 +13181,39 @@ export default function App({
                       >{message.username}</span>
                       <span style={{ color: '#9ca3af', fontSize: '10px' }}>{formatMessageTimestamp(message.created_at)}</span>
                     </div>
-                    <div style={{ color: '#fff', fontSize: '13px', marginTop: '6px', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{message.message}</div>
+                    <div style={{ color: '#fff', fontSize: '13px', marginTop: '6px', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{roomMessageText(message)}</div>
                   </div>
                 );
               })}
             </div>
+            {e2eState === 'locked' ? (
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={e2ePassword}
+                  onChange={(e) => setE2ePassword(e.target.value)}
+                  placeholder="password"
+                  data-room-unlock-password
+                  style={{ ...inputStyle, flex: 1 }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') unlockPrivateMessages();
+                  }}
+                />
+                <button className="btn btn-outline-light btn-sm"
+                  onClick={unlockPrivateMessages}
+                  disabled={e2eBusy || !e2ePassword}
+                  data-room-unlock
+                  style={{
+                    ...primaryButtonStyle,
+                    opacity: !e2eBusy && e2ePassword ? 1 : 0.5,
+                    cursor: !e2eBusy && e2ePassword ? 'pointer' : 'not-allowed'
+                  }}
+                >
+                  unlock
+                </button>
+              </div>
+            ) : (
             <div style={{ display: 'flex', gap: '10px' }}>
               <input
                 value={channelMessageText}
@@ -12565,6 +13234,7 @@ export default function App({
                 send
               </button>
             </div>
+            )}
           </div>
         )
       )),
@@ -12766,7 +13436,10 @@ export default function App({
                       )}
                       <div style={{ flex: 1 }}>
                         <Marquee className="fw-bold" text={track.title} style={{ maxWidth: '200px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
-                        <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{track.author}</div>
+                        <div className="text-muted small" style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
+                          {track.author}
+                          {isLocalTrack(track) && <FileTag themeColor={themeColor} />}
+                        </div>
                       </div>
                     </div>
                   </ListGroup.Item>
@@ -12970,7 +13643,7 @@ export default function App({
     showNotification('layout saved', 'success');
   };
 
-  const stableQueuePlay = useStableCallback((idx) => playTrackAtIndex(idx, queue, { source: 'personal' }));
+  const stableQueuePlay = useStableCallback((idx) => playTrackAtIndex(idx, queue, { source: 'personal', stayOnFail: true }));
   const stableQueueRemove = useStableCallback((idx) => removeFromQueue(idx));
   const stableQueueAddToPlaylist = useStableCallback((track) => addTrackToPlaylist(track));
   const stableQueueDownload = useStableCallback((item) => downloadSingle(item));
@@ -13012,6 +13685,19 @@ export default function App({
                       className="modern-input"
                     />
                   </Form.Group>
+
+                  <div className="mb-3">
+                    <Button
+                      variant="outline-light"
+                      size="sm"
+                      type="button"
+                      data-add-audio-files
+                      onClick={() => pickAudioFiles('queue')}
+                      style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                    >
+                      add audio files
+                    </Button>
+                  </div>
 
                   {isSuggesting && (
                     <div className="text-muted small mb-2 animate-pulse">
@@ -13197,6 +13883,7 @@ export default function App({
                       offlineIds={offlineIds}
                       offlineModeActive={offlineModeActive}
                       savingProgress={offlineProgress}
+                      localHave={localHave}
                     />
         </Card.Body>
       </Card>
@@ -13337,7 +14024,8 @@ export default function App({
                           offline={offlineIds.has(track.videoId)}
                           onToggleOffline={stableToggleOffline}
                           onAddToQueue={stableAddToQueue}
-                          dimmed={offlineModeActive && !offlineIds.has(track.videoId)}
+                          fileState={fileStateOf(track, localHave)}
+                          dimmed={offlineModeActive && !offlineIds.has(track.videoId) && fileStateOf(track, localHave) !== 'here'}
                         />
                       ));
                     })()}
@@ -13387,6 +14075,7 @@ export default function App({
                         <Dropdown.Item onClick={() => setImportPanel((open) => (open === 'spotify' ? null : 'spotify'))}>from spotify</Dropdown.Item>
                         <Dropdown.Item onClick={() => setImportPanel((open) => (open === 'youtube' ? null : 'youtube'))}>from youtube</Dropdown.Item>
                         <Dropdown.Item onClick={() => { setImportPanel(null); importPlaylistFromFile(); }}>from file (json or csv)</Dropdown.Item>
+                        <Dropdown.Item data-import-audio onClick={() => { setImportPanel(null); pickAudioFiles('playlist'); }}>from audio files</Dropdown.Item>
                       </Dropdown.Menu>
                     </Dropdown>
                     {currentTracks.length > 0 && (
@@ -13447,6 +14136,48 @@ export default function App({
                         import
                       </Button>
                     </div>
+                    {importPanel === 'spotify' && (
+                      <div data-helper-imports style={{ marginTop: '8px' }}>
+                        {waitingImports.map((item) => (
+                          <div key={item.id} data-helper-import style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
+                            <span className="text-truncate" style={{ flex: 1, minWidth: 0, color: '#fff', fontSize: '12px' }} title={item.name}>{item.name}</span>
+                            <span style={{ color: '#9ca3af', fontSize: '11px', flexShrink: 0 }}>{item.track_count}</span>
+                            <Button
+                              variant="outline-light"
+                              size="sm"
+                              className="flex-shrink-0"
+                              data-import-waiting
+                              onClick={() => importWaiting(item)}
+                              disabled={!!(playlistNotice && playlistNotice.kind === 'working')}
+                              style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                            >
+                              import
+                            </Button>
+                            <Button
+                              variant="outline-danger"
+                              size="sm"
+                              className="flex-shrink-0"
+                              data-dismiss-waiting
+                              onClick={() => dismissWaiting(item)}
+                              style={{ borderRadius: '6px' }}
+                            >
+                              remove
+                            </Button>
+                          </div>
+                        ))}
+                        <div className="d-flex gap-2 mt-2 flex-wrap">
+                          <Button
+                            variant="outline-light"
+                            size="sm"
+                            data-get-helper
+                            onClick={() => openExternalUrl(`${window.location.origin}/?view=spotify-helper`)}
+                            style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
+                          >
+                            spotify helper
+                          </Button>
+                        </div>
+                      </div>
+                    )}
                     {integrations[importPanel] && integrations[importPanel].configured ? (
                       integrations[importPanel].connected ? (
                         <div data-import-list={(importLists[importPanel] && importLists[importPanel].state) || 'loading'} style={{ marginTop: '8px', maxHeight: '220px', overflowY: 'auto' }}>
@@ -14335,6 +15066,36 @@ export default function App({
             </div>
           )}
 
+          {localHave.size > 0 && (
+            <div style={{ marginBottom: '30px' }} data-settings-audio-files>
+              <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>audio files</h4>
+              <div style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '10px' }}>
+                on this device: <strong style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{localHave.size}</strong> {localHave.size === 1 ? 'file' : 'files'}
+                {localBytes > 0 ? ` (${Math.max(1, Math.round(localBytes / (1024 * 1024)))} MB)` : ''}
+              </div>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                <button
+                  className="smp-setting smp-setting-danger"
+                  data-remove-audio-files
+                  onClick={() => {
+                    if (!confirmClearFiles) { setConfirmClearFiles(true); return; }
+                    setConfirmClearFiles(false);
+                    removeAllAudioFiles();
+                  }}
+                  style={{
+                    padding: '8px 14px',
+                    background: 'transparent',
+                    border: '1px solid #ef4444',
+                    color: '#ef4444',
+                    fontSize: '12px'
+                  }}
+                >
+                  {confirmClearFiles ? 'confirm remove' : 'remove audio files'}
+                </button>
+              </div>
+            </div>
+          )}
+
           {isTauriDesktop && !isAndroidApp() && (
             <div style={{ marginBottom: '30px' }}>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>downloads folder</h4>
@@ -14912,9 +15673,7 @@ export default function App({
         </Modal.Header>
         <Modal.Body style={{ background: `rgba(${themeColor.r}, ${themeColor.g}, ${themeColor.b}, 0.1)`, padding: '24px', maxHeight: '65vh', overflowY: 'auto', color: '#fff', fontSize: '14px', lineHeight: 1.6 }}>
           <p>
-            hi, i'm shibenchi. i built this because i got tired of paying for spotify or youtube
-            premium, and every other music player either got discontinued or had its good features
-            ripped out. it's just a private project, not something i'm trying to put out there. use
+            hi, i'm shibenchi. this is a private project i've built over the course of a year. use
             it if you want, no risk to you.
           </p>
           <p style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, fontWeight: 'bold', marginTop: '20px' }}>

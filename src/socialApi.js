@@ -193,7 +193,9 @@ const SOCIAL_PREFIXES = [
   '/api/stats',
   '/api/integrations',
   '/api/export/',
-  '/api/import/'
+  '/api/import/',
+  // audio files that people add to a room
+  '/api/room-files/'
 ];
 
 // is this path one of the "social" endpoints (gets auth handling)? stuff

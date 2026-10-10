@@ -234,8 +234,8 @@ export default function Miniplayer() {
 
   const thumbSources = [
     nowPlaying?.thumbnail,
-    nowPlaying?.videoId ? `https://img.youtube.com/vi/${nowPlaying.videoId}/mqdefault.jpg` : null,
-    nowPlaying?.videoId ? `https://img.youtube.com/vi/${nowPlaying.videoId}/default.jpg` : null
+    nowPlaying?.videoId && !String(nowPlaying.videoId).startsWith('local:') ? `https://img.youtube.com/vi/${nowPlaying.videoId}/mqdefault.jpg` : null,
+    nowPlaying?.videoId && !String(nowPlaying.videoId).startsWith('local:') ? `https://img.youtube.com/vi/${nowPlaying.videoId}/default.jpg` : null
   ].filter(Boolean);
 
   // same theme color as the main window, applied to the same css vars the

@@ -897,8 +897,10 @@ const SYNC_DROP_AFTER_MS = 60000;
 // works is ready a few seconds after the first one, and one that has not made it by now is
 // not going to (its audio helper can not find the song, it lost its connection), while the
 // whole room waits for it. it is taken out of the start like a straggler at the end of the
-// minute is, and told, and it can join again by pressing play
-const SYNC_LATE_GRACE_MS = 20000;
+// minute is, and told, and it can join again by pressing play.
+// 40 s (it was 20): a song that nobody had looked up yet takes a player 15 to 25 s to find on youtube, and a player left
+// out of the start was out of step until it pressed play. SMP_SYNC_LATE_GRACE_MS changes it (the tests use a short one)
+const SYNC_LATE_GRACE_MS = Number(process.env.SMP_SYNC_LATE_GRACE_MS) || 40000;
 // a player that was taken out of a start is not waited for again by the starts after it, unless
 // it presses play itself or proves it can get ready, for this long. without that it rejoined
 // on its own and held up the next song for a minute again
@@ -1252,6 +1254,8 @@ function broadcastServerMembers(serverId) {
     serverId,
     members: db.getServerMembers(serverId)
   });
+  // a new member needs a copy of the room's key (see roomKeys.js)
+  broadcastToServer(serverId, { type: 'room_keys_changed', serverId });
 }
 
 function setClientServerForUser(userId, serverId = null) {
@@ -1272,12 +1276,14 @@ function clearClientServer(serverId) {
 
 function sendServerState(ws, serverId, req = null) {
   const serverRecord = db.getActiveServerById(serverId);
+  let openable = false;
+  wsClients.forEach((candidate) => { if (candidate.ws === ws && candidate.e2e === true) openable = true; });
 
   sendWs(ws, {
     type: 'initial_state',
     serverId,
     server: buildServerPayload(serverRecord, req, true),
-    messages: db.getServerMessages(serverId),
+    messages: db.getServerMessages(serverId).map((message) => roomKeys.presentMessage(message, openable)),
     queue: db.getServerQueue(serverId),
     player: getSyncedPlayerState(serverId),
     server_now_ms: Date.now(),
@@ -2116,6 +2122,10 @@ app.post('/api/servers/:serverId/collab-playlists/:playlistId/tracks', requireAu
     if (!videoId || !track.title) {
       return res.status(400).json({ error: 'A track needs a video id and a title' });
     }
+    if (String(videoId).startsWith('local:') || track.source === 'local') {
+      if (!roomFiles.enabled) return res.status(400).json({ error: 'audio files cannot be shared in a room on this server' });
+      if (!roomFiles.has(serverId, String(videoId))) return res.status(409).json({ error: 'the file of this song is not on the server, send it first' });
+    }
     const trackId = `cpt_${crypto.randomUUID()}`;
     const newTrack = db.addTrackToCollabPlaylist(
       trackId, playlistId, videoId, track.title, track.author,
@@ -2186,6 +2196,8 @@ app.post('/api/servers/:serverId/collab-playlists/:playlistId/tracks-bulk', requ
     list.forEach((track) => {
       const videoId = track && (track.video_id || track.videoId);
       if (!videoId || !track.title) return;
+      // a song of a file needs its file in the room, the others of the list go in all the same
+      if ((String(videoId).startsWith('local:') || track.source === 'local') && !(roomFiles.enabled && roomFiles.has(serverId, String(videoId)))) return;
       added.push(db.addTrackToCollabPlaylist(
         `cpt_${crypto.randomUUID()}`, playlistId, videoId, track.title, track.author,
         track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url || track.externalUrl,
@@ -3355,6 +3367,29 @@ app.get('/api/stats/friends', requireAuth, (req, res) => {
 // ---- connected YouTube and Spotify accounts: exporting playlists to them, reading a Spotify playlist (see integrations.js)
 require('./integrations').createIntegrations({ app, db, requireAuth, validation, logToFile, getPublicAppUrl });
 
+// ---- audio files that people add to a room from their own device, kept in memory only for as long as the room needs them.
+// off unless SMP_ROOM_FILES=1 (see roomFiles.js)
+const roomFiles = require('./roomFiles').createRoomFiles({
+  isServerMember,
+  getQueueFileIds: (serverId) => {
+    const ids = db.getServerQueue(serverId).map((track) => track.videoId || track.video_id).filter(Boolean);
+    // the songs of the shared playlists of the room keep their files too
+    db.getCollabPlaylists(serverId).forEach((playlist) => {
+      db.getCollabPlaylistTracks(playlist.id).forEach((track) => { if (track.video_id) ids.push(track.video_id); });
+    });
+    return ids;
+  },
+  isRoomOccupied: (serverId) => [...wsClients.values()].some((client) => client.serverId === serverId),
+  logToFile
+});
+roomFiles.register(app, requireAuth);
+
+// ---- end to end encrypted room chat: the keys of a room and the rules for its messages (see roomKeys.js)
+const roomKeys = require('./roomKeys').createRoomKeys({ app, db, requireAuth, validation, logToFile, isServerMember, broadcastToServer, wsClients, sendWs });
+
+// ---- the spotify helper sends the long playlists it read to the person's account (see helperImport.js)
+require('./helperImport').createHelperImport({ app, db, requireAuth, validation, logToFile, sendToUser, themeColorOf, loginIpLimiter, loginAttemptLimiter, getClientKey, tooManyAttempts });
+
 // ---- end to end encrypted direct messages
 // the apps lock a message with a key only the two people have, the server stores and passes on what it can not read.
 // each account has one key pair: the public half is handed to anyone who wants to write to the person, the private
@@ -3725,6 +3760,7 @@ app.post('/api/servers/:serverId/leave', requireAuth, (req, res) => {
     db.updateOnlineServer(req.session.userId, null);
     setClientServerForUser(req.session.userId, null);
     logToFile(`[SERVERS] User ${req.session.username} left server ${serverId}`);
+    roomKeys.markRotate(serverId);
 
     // let ws clients know a member left
     if (globalWss) {
@@ -3824,6 +3860,7 @@ app.post('/api/servers/:serverId/kick/:userId', requireAuth, (req, res) => {
     db.updateOnlineServer(userId, null);
     setClientServerForUser(userId, null);
     logToFile(`[SERVERS] User ${userId} kicked from server ${serverId} by ${req.session.username}`);
+    roomKeys.markRotate(serverId);
 
     // let ws clients know someone got kicked
     if (globalWss) {
@@ -3865,7 +3902,8 @@ app.get('/api/server/:serverId/messages', requireAuth, (req, res) => {
       return res.status(403).json({ error: 'Must be a server member to view messages' });
     }
 
-    const messages = db.getServerMessages(serverId);
+    const canOpen = wantsE2e(req);
+    const messages = db.getServerMessages(serverId).map((message) => roomKeys.presentMessage(message, canOpen));
     res.json({ ok: true, messages });
   } catch (error) {
     logToFile(`[SERVER CHAT] Get messages error: ${error.message}`, true);
@@ -3881,26 +3919,22 @@ app.post('/api/server/:serverId/messages', requireAuth, (req, res) => {
       return res.status(403).json({ error: 'Must be a server member to send messages' });
     }
 
-    const textCheck = validation.cleanText(req.body?.text, { field: 'Message text', max: 2000, multiline: true });
-    if (!textCheck.ok) {
-      return res.status(400).json({ error: textCheck.error });
+    // what comes in is a message locked by the members, the server never gets the text
+    const checked = roomKeys.checkMessage(serverId, req.body && (req.body.text || req.body.message));
+    if (!checked.ok) {
+      return res.status(400).json({ error: checked.error, code: checked.code });
     }
-    const text = textCheck.value;
 
     const settings = db.getSettings(req.session.userId);
     const senderThemeColor = settings ? themeColorOf(settings) : null;
-    const message = db.createServerMessage(serverId, req.session.userId, req.session.username, text, senderThemeColor);
+    const message = db.createServerMessage(serverId, req.session.userId, req.session.username, checked.text, senderThemeColor);
     logToFile(`[SERVER CHAT] Message sent in ${serverId} by ${req.session.username}`);
 
     if (globalWss) {
-      broadcastToServer(serverId, {
-        type: 'chat_message',
-        serverId,
-        message
-      });
+      roomKeys.broadcastMessage(serverId, message);
     }
 
-    res.json({ ok: true, message });
+    res.json({ ok: true, message: roomKeys.presentMessage(message, wantsE2e(req)) });
   } catch (error) {
     logToFile(`[SERVER CHAT] Send message error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to send server message' });
@@ -3919,6 +3953,12 @@ app.post('/api/server/:serverId/queue', requireAuth, (req, res) => {
 
     if (!videoId || !title) {
       return res.status(400).json({ error: 'videoId and title required' });
+    }
+
+    // a song that is a file from somebody's device is only added once its file is on this server for the room
+    if (String(videoId).startsWith('local:') || source === 'local') {
+      if (!roomFiles.enabled) return res.status(400).json({ error: 'audio files cannot be shared in a room on this server' });
+      if (!roomFiles.has(serverId, String(videoId))) return res.status(409).json({ error: 'the file of this song is not on the server, send it first' });
     }
 
     const track = db.addToServerQueue(serverId, { 
@@ -3970,6 +4010,7 @@ app.delete('/api/server/:serverId/queue/:trackId', requireAuth, (req, res) => {
     }
     const queueBefore = db.getServerQueue(serverId);
     db.removeFromServerQueue(trackId, serverId);
+    roomFiles.prune(serverId);
     logToFile(`[SERVER QUEUE] Track removed from ${serverId}: ${trackId}`);
 
     if (globalWss) {
@@ -3992,6 +4033,7 @@ app.delete('/api/server/:serverId/queue', requireAuth, (req, res) => {
       return res.status(403).json({ error: 'Must be a server member to update the queue' });
     }
     db.clearServerQueue(serverId);
+    roomFiles.prune(serverId);
     logToFile(`[SERVER QUEUE] Queue cleared for ${serverId}`);
 
     if (globalWss) {
@@ -4342,7 +4384,13 @@ wss.on('connection', (ws, request) => {
           // the kind of device this connection is on, for the icons next to the person's name
           const platform = data.platform === 'mobile' || data.platform === 'pc' ? data.platform : null;
           // this app can read private messages (an older one is sent a note instead)
+          const couldOpenBefore = client.e2e === true;
           client.e2e = data.e2e === true;
+          // the room state was sent when the connection opened, before this app said what it can read: it got notes in
+          // place of the locked room messages, so it is given the history again in the form it can open
+          if (client.e2e && !couldOpenBefore && client.serverId && isServerMember(client.serverId, userId)) {
+            sendWs(ws, { type: 'chat_history', serverId: client.serverId, messages: db.getServerMessages(client.serverId).map((message) => roomKeys.presentMessage(message, true)) });
+          }
           if (platform && client.platform !== platform) {
             client.platform = platform;
             broadcastPresence();
@@ -4387,26 +4435,25 @@ wss.on('connection', (ws, request) => {
         case 'chat':
         case 'chat_message': {
           const targetServerId = data.serverId || client.serverId;
-          const wsTextCheck = validation.cleanText(data.text, { field: 'Message text', max: 2000, multiline: true });
-
-          if (!targetServerId || !wsTextCheck.ok) {
+          if (!targetServerId) {
             break;
           }
-          const text = wsTextCheck.value;
 
           if (!isServerMember(targetServerId, userId)) {
             sendWs(ws, { type: 'error', error: 'Must be a server member to chat' });
             break;
           }
 
+          const wsChecked = roomKeys.checkMessage(targetServerId, data.text);
+          if (!wsChecked.ok) {
+            sendWs(ws, { type: 'error', error: wsChecked.error, code: wsChecked.code });
+            break;
+          }
+
           const sSettings = db.getSettings(userId);
           const sSenderThemeColor = sSettings ? themeColorOf(sSettings) : null;
-          const serverMessage = db.createServerMessage(targetServerId, userId, username, text, sSenderThemeColor);
-          broadcastToServer(targetServerId, {
-            type: 'chat_message',
-            serverId: targetServerId,
-            message: serverMessage
-          });
+          const serverMessage = db.createServerMessage(targetServerId, userId, username, wsChecked.text, sSenderThemeColor);
+          roomKeys.broadcastMessage(targetServerId, serverMessage);
           break;
         }
 

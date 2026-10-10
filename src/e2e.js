@@ -18,8 +18,12 @@
 // the same key lasting forever (no forward secrecy), the length of a message (it shows)
 
 export const PREFIX = 'e2e1:';
+// a message in a room: "r2e1:<key id>.<iv>.<locked text>", locked with the key of the room (see the room part of createE2e)
+export const ROOM_PREFIX = 'r2e1:';
 const KDF_ITERATIONS = 250000;
 const CONTEXT = 'smp-dm-v1';
+const ROOM_CONTEXT = 'smp-room-v1';
+const ROOM_KEY_CONTEXT = 'smp-room-key-v1';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -27,6 +31,7 @@ const subtle = () => (globalThis.crypto && globalThis.crypto.subtle) || null;
 
 export const e2eSupported = () => Boolean(subtle());
 export const isEnvelope = (text) => typeof text === 'string' && text.startsWith(PREFIX);
+export const isRoomEnvelope = (text) => typeof text === 'string' && text.startsWith(ROOM_PREFIX);
 
 function toB64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -109,6 +114,11 @@ async function conversationKey(local, peer) {
 }
 
 const aadFor = (senderId, receiverId) => encoder.encode(`${CONTEXT}|${senderId}|${receiverId}`);
+// a locked copy of a room key is bound to the room, the key, who locked it and who it is for. a locked message to the room
+// is bound to the room, the key and the person who sent it, so the server can not move one or give it another name
+const roomKeyAad = (serverId, kid, byId, forId) => encoder.encode(`${ROOM_KEY_CONTEXT}|${serverId}|${kid}|${byId}|${forId}`);
+const roomMessageAad = (serverId, kid, senderId) => encoder.encode(`${ROOM_CONTEXT}|${serverId}|${kid}|${senderId}`);
+const hex = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 
 // ---- what a device keeps
 const keyName = (userId) => `smp_e2e_key:${userId}`;
@@ -178,7 +188,90 @@ export function createE2e({ userId, api, storage }) {
     return peer;
   }
 
+  // ---- the chat of a room: one AES key for the room, a locked copy of it for every member (locked like a private message, with
+  // the two people's key pairs). the keys of the rooms this device has opened are kept in memory only, they are opened again from
+  // the server's copies when the app starts
+  const roomKeys = new Map(); // "serverId|kid" -> { raw, key }
+  const roomKeyName = (serverId, kid) => `${serverId}|${kid}`;
+  async function keepRoomKey(serverId, kid, rawKey) {
+    const key = await subtle().importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+    roomKeys.set(roomKeyName(serverId, kid), { raw: rawKey, key });
+  }
+  // me or somebody else, in the shape the key work needs
+  async function personKey(personId) {
+    if (personId === userId) return { kid: local.kid, publicJwk: local.publicJwk };
+    return peerKey(personId);
+  }
+  const room = {
+    has: (serverId, kid) => roomKeys.has(roomKeyName(serverId, kid)),
+
+    // a new key for a room: its id
+    async make(serverId) {
+      if (!local) throw Object.assign(new Error('locked'), { code: 'locked' });
+      const kid = hex(randomBytes(8));
+      await keepRoomKey(serverId, kid, randomBytes(32));
+      return kid;
+    },
+
+    // a locked copy of a key that this device holds, for a member
+    async wrapFor(serverId, kid, memberId) {
+      if (!local) throw Object.assign(new Error('locked'), { code: 'locked' });
+      const held = roomKeys.get(roomKeyName(serverId, kid));
+      if (!held) throw Object.assign(new Error('this device does not have that key'), { code: 'no_key' });
+      const peer = await personKey(memberId);
+      if (!peer) throw Object.assign(new Error('they have not turned private messages on'), { code: 'peer_no_key' });
+      const lock = await conversationKey(local, peer);
+      const iv = randomBytes(12);
+      const ciphertext = await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: roomKeyAad(serverId, kid, userId, memberId) }, lock, held.raw);
+      const head = { v: 1, s: local.kid, r: peer.kid, iv: toB64(iv), ct: toB64(ciphertext) };
+      return PREFIX + toB64(encoder.encode(JSON.stringify(head)));
+    },
+
+    // the copies that the server has for this person: [{ kid, wrapped, wrapped_by }]. the ones that open are kept, the kids of those
+    async open(serverId, copies) {
+      if (!local) throw Object.assign(new Error('locked'), { code: 'locked' });
+      const opened = [];
+      for (const copy of Array.isArray(copies) ? copies : []) {
+        if (roomKeys.has(roomKeyName(serverId, copy.kid))) { opened.push(copy.kid); continue; }
+        try {
+          const head = JSON.parse(decoder.decode(fromB64(String(copy.wrapped).slice(PREFIX.length))));
+          if (head.v !== 1 || head.r !== local.kid) continue;
+          const by = await personKey(copy.wrapped_by);
+          if (!by || by.kid !== head.s) continue;
+          const lock = await conversationKey(local, by);
+          const plain = await subtle().decrypt({ name: 'AES-GCM', iv: fromB64(head.iv), additionalData: roomKeyAad(serverId, copy.kid, copy.wrapped_by, userId) }, lock, fromB64(head.ct));
+          if (plain.byteLength !== 32) continue;
+          await keepRoomKey(serverId, copy.kid, new Uint8Array(plain));
+          opened.push(copy.kid);
+        } catch {
+          // a copy that does not open (made for another key, or by somebody whose key changed) is left out
+        }
+      }
+      return opened;
+    },
+
+    // text -> what the server gets
+    async encrypt(serverId, kid, text) {
+      const held = roomKeys.get(roomKeyName(serverId, kid));
+      if (!held) throw Object.assign(new Error('this device does not have the key of the room'), { code: 'no_key' });
+      const iv = randomBytes(12);
+      const ciphertext = await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: roomMessageAad(serverId, kid, userId) }, held.key, encoder.encode(text));
+      return `${ROOM_PREFIX}${kid}.${toB64(iv)}.${toB64(ciphertext)}`;
+    },
+
+    // what the server has -> the text. throws with code no_key when the key of the message never reached this device
+    async decrypt(serverId, envelope, senderId) {
+      const parts = String(envelope).slice(ROOM_PREFIX.length).split('.');
+      if (parts.length !== 3) throw new Error('not a room message');
+      const held = roomKeys.get(roomKeyName(serverId, parts[0]));
+      if (!held) throw Object.assign(new Error('no key'), { code: 'no_key' });
+      const plain = await subtle().decrypt({ name: 'AES-GCM', iv: fromB64(parts[1]), additionalData: roomMessageAad(serverId, parts[0], senderId) }, held.key, fromB64(parts[2]));
+      return decoder.decode(plain);
+    }
+  };
+
   return {
+    room,
     get ready() { return Boolean(local); },
     get kid() { return local ? local.kid : ''; },
 
