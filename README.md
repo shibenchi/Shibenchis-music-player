@@ -1,6 +1,6 @@
 # Shibenchi's music player
 
-I built this because I didn't want to keep paying for Spotify or YouTube Premium, and every other free music player out there either got discontinued or had its good features ripped out. So I remade this. Search, queue, playlists, downloads, all in one place, no subscription, no ads.
+I built this project largely based on other open source music players out there. It's got everything you'd want in a music player; search, queue, playlists.
 
 ---
 
@@ -8,9 +8,9 @@ I built this because I didn't want to keep paying for Spotify or YouTube Premium
 
 Quick heads up on the version number: if you remember an older version of this, no, you didn't miss a bunch of releases between then and now. I'm running this off older code I picked back up, so I started a fresh numbering scheme instead of pretending it's a clean continuation from 1.0.0. Easier for me to just call it 1.3.1 and move on.
 
-The actual big change here: this used to run through your browser. That was pretty archaic and honestly kind of a pain, sorry about that. It's a real native desktop app now. Install it with an actual **MSI installer** like any other windows program, no terminal, no browser tab, no batch files to babysit. It's also just faster this way.
+The actual big change here: this used to run through your browser. That was pretty archaic and honestly kind of a pain, sorry about that. It's a real native desktop app now. You can install it with an actual **MSI installer** like any other windows program, no terminal, no browser tab, no batch files to babysit. It's also just faster this way.
 
-What changed:
+## What changed:
 
 - **native app** - installs and runs like a normal windows program now
 - **miniplayer** - pops up on its own when you minimize or click away from the main window. small, always-on-top, draggable, basic controls. built this specifically because I wanted something out of the way I could glance at instead of tabbing back into the full window every time
@@ -26,9 +26,9 @@ What changed:
 2. run it
 3. done 
 
-No Node, no npm, no cloning anything. That stuff's only for people messing with the source (below).
+No Node or cloning anything anymore. That stuff's only for people messing with the source (below).
 
-Right now this is **windows only**. I don't own a mac myself, so a mac build is something I'm working through. no promises on timing, but it's not abandoned. If you're on a mac and want to help test whenever that's ready, hit me up (contact info at the bottom).
+Right now this is **windows and android only**. I don't own a mac myself, so a mac build is something I'm working through. no promises on timing, but it's not abandoned. If you're on a mac and want to help test whenever that's ready, hit me up (contact info at the bottom).
 
 ---
 
