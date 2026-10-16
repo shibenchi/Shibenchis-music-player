@@ -361,6 +361,38 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
+  -- lists of songs that wait for the person's app to look them up (sent by the spotify helper, see helperImport.js)
+  CREATE TABLE IF NOT EXISTS pending_imports (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'spotify',
+    track_count INTEGER NOT NULL DEFAULT 0,
+    tracks TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_imports_user ON pending_imports(user_id);
+
+  -- the key of a room's chat (see roomKeys.js): one locked copy of it for every member, the server can not open any of them
+  CREATE TABLE IF NOT EXISTS room_keys (
+    server_id TEXT NOT NULL,
+    kid TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    wrapped TEXT NOT NULL,
+    wrapped_by TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s', 'now')),
+    PRIMARY KEY (server_id, kid, user_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_room_keys_user ON room_keys(user_id);
+  CREATE TABLE IF NOT EXISTS room_key_state (
+    server_id TEXT PRIMARY KEY,
+    current_kid TEXT,
+    rotate INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER DEFAULT (strftime('%s', 'now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
   CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_friend_requests_sender ON friend_requests(sender_id);
@@ -1041,6 +1073,22 @@ const statements = {
       expires_at = excluded.expires_at, account_name = excluded.account_name
   `),
   deleteIntegration: db.prepare(`DELETE FROM integrations WHERE user_id = ? AND provider = ?`),
+  createPendingImport: db.prepare(`INSERT INTO pending_imports (id, user_id, name, source, track_count, tracks) VALUES (?, ?, ?, ?, ?, ?)`),
+  listPendingImports: db.prepare(`SELECT id, name, source, track_count, created_at FROM pending_imports WHERE user_id = ? ORDER BY created_at DESC, rowid DESC`),
+  getPendingImport: db.prepare(`SELECT * FROM pending_imports WHERE id = ? AND user_id = ?`),
+  deletePendingImport: db.prepare(`DELETE FROM pending_imports WHERE id = ? AND user_id = ?`),
+  countPendingImports: db.prepare(`SELECT COUNT(*) AS n FROM pending_imports WHERE user_id = ?`),
+  trimPendingImports: db.prepare(`DELETE FROM pending_imports WHERE user_id = ? AND id NOT IN (SELECT id FROM pending_imports WHERE user_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?)`),
+  purgePendingImports: db.prepare(`DELETE FROM pending_imports WHERE created_at < ?`),
+  getRoomKeyState: db.prepare(`SELECT current_kid, rotate FROM room_key_state WHERE server_id = ?`),
+  setRoomKeyCurrent: db.prepare(`INSERT INTO room_key_state (server_id, current_kid, rotate) VALUES (?, ?, 0) ON CONFLICT(server_id) DO UPDATE SET current_kid = excluded.current_kid, rotate = 0, updated_at = strftime('%s', 'now')`),
+  setRoomKeyRotate: db.prepare(`INSERT INTO room_key_state (server_id, current_kid, rotate) VALUES (?, NULL, ?) ON CONFLICT(server_id) DO UPDATE SET rotate = excluded.rotate, updated_at = strftime('%s', 'now')`),
+  getRoomKeysForUser: db.prepare(`SELECT kid, wrapped, wrapped_by FROM room_keys WHERE server_id = ? AND user_id = ? ORDER BY created_at, rowid`),
+  roomKeyKnown: db.prepare(`SELECT 1 AS yes FROM room_keys WHERE server_id = ? AND kid = ? LIMIT 1`),
+  addRoomKeyEnvelope: db.prepare(`INSERT OR IGNORE INTO room_keys (server_id, kid, user_id, wrapped, wrapped_by) VALUES (?, ?, ?, ?, ?)`),
+  roomKeyHolders: db.prepare(`SELECT user_id FROM room_keys WHERE server_id = ? AND kid = ?`),
+  deleteRoomKeys: db.prepare(`DELETE FROM room_keys WHERE server_id = ?`),
+  deleteRoomKeyState: db.prepare(`DELETE FROM room_key_state WHERE server_id = ?`),
   getSentFriendRequests: db.prepare(`
     SELECT fr.*, u.username AS receiver_username FROM friend_requests fr
     JOIN users u ON fr.receiver_id = u.id
@@ -1877,6 +1925,9 @@ module.exports = {
 
   deleteActiveServer: (serverId) => {
     statements.deleteActiveServer.run(serverId);
+    // the locked copies of the room's chat key go with the room
+    statements.deleteRoomKeys.run(serverId);
+    statements.deleteRoomKeyState.run(serverId);
   },
 
   // server members
@@ -2001,6 +2052,39 @@ module.exports = {
     statements.saveIntegration.run(userId, provider, atRest.seal(String(record.access_token || '')), record.refresh_token ? atRest.seal(String(record.refresh_token)) : '', Math.floor(Number(record.expires_at) || 0), String(record.account_name || '').slice(0, 120));
   },
   deleteIntegration: (userId, provider) => statements.deleteIntegration.run(userId, provider).changes > 0,
+
+  // ---- lists waiting to be imported (the songs are stored scrambled like other private text)
+  createPendingImport: (userId, record, keep = 20) => {
+    const id = `imp_${crypto.randomUUID()}`;
+    const tracks = Array.isArray(record.tracks) ? record.tracks : [];
+    statements.createPendingImport.run(id, userId, String(record.name || 'playlist').slice(0, 100), String(record.source || 'spotify').slice(0, 30), tracks.length, atRest.seal(JSON.stringify(tracks)));
+    statements.trimPendingImports.run(userId, userId, keep);
+    return { id, name: String(record.name || 'playlist').slice(0, 100), source: String(record.source || 'spotify').slice(0, 30), track_count: tracks.length, created_at: Math.floor(Date.now() / 1000) };
+  },
+  listPendingImports: (userId) => statements.listPendingImports.all(userId),
+  getPendingImport: (userId, id) => {
+    const row = statements.getPendingImport.get(String(id), userId);
+    if (!row) return null;
+    let tracks = [];
+    try { tracks = JSON.parse(atRest.open(row.tracks)); } catch (error) { tracks = []; }
+    return { id: row.id, name: row.name, source: row.source, track_count: row.track_count, created_at: row.created_at, tracks };
+  },
+  deletePendingImport: (userId, id) => statements.deletePendingImport.run(String(id), userId).changes > 0,
+  purgePendingImports: (maxAgeSeconds) => statements.purgePendingImports.run(Math.floor(Date.now() / 1000) - maxAgeSeconds).changes,
+
+  // ---- the key of a room's chat: who holds a locked copy of which key, and which one is current
+  getRoomKeyState: (serverId) => statements.getRoomKeyState.get(serverId) || { current_kid: null, rotate: 0 },
+  getRoomKeysForUser: (serverId, userId) => statements.getRoomKeysForUser.all(serverId, userId),
+  roomKeyKnown: (serverId, kid) => Boolean(statements.roomKeyKnown.get(serverId, kid)),
+  roomKeyHolderIds: (serverId, kid) => new Set(statements.roomKeyHolders.all(serverId, kid).map((row) => row.user_id)),
+  addRoomKeyEnvelopes: (serverId, kid, rows) => {
+    let added = 0;
+    rows.forEach((row) => { added += statements.addRoomKeyEnvelope.run(serverId, kid, row.user_id, row.wrapped, row.wrapped_by).changes; });
+    return added;
+  },
+  setRoomKeyCurrent: (serverId, kid) => statements.setRoomKeyCurrent.run(serverId, kid),
+  setRoomKeyRotate: (serverId, flag) => statements.setRoomKeyRotate.run(serverId, flag ? 1 : 0),
+  deleteRoomKeys: (serverId) => { statements.deleteRoomKeys.run(serverId); statements.deleteRoomKeyState.run(serverId); },
 
   // ---- listening stats
   recordListening: (userId, track, startedAt, endedAt) => recordListening(userId, track, startedAt, endedAt),

@@ -45,3 +45,5 @@ stop.bat
 build-web/
 build-split/
 update-files/
+
+build-desktop/

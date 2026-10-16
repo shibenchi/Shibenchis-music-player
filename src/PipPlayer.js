@@ -152,8 +152,8 @@ export default function PipPlayer({ nowPlaying }) {
 
   const thumbSources = [
     nowPlaying?.thumbnail,
-    nowPlaying?.videoId ? `https://img.youtube.com/vi/${nowPlaying.videoId}/mqdefault.jpg` : null,
-    nowPlaying?.videoId ? `https://img.youtube.com/vi/${nowPlaying.videoId}/default.jpg` : null
+    nowPlaying?.videoId && !String(nowPlaying.videoId).startsWith('local:') ? `https://img.youtube.com/vi/${nowPlaying.videoId}/mqdefault.jpg` : null,
+    nowPlaying?.videoId && !String(nowPlaying.videoId).startsWith('local:') ? `https://img.youtube.com/vi/${nowPlaying.videoId}/default.jpg` : null
   ].filter(Boolean);
 
   const color = nowPlaying?.themeColor;
