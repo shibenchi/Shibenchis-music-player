@@ -41,6 +41,7 @@ class MediaHelper private constructor(private val context: Context) {
     private const val FAST_LIMIT = 1_048_576L
     private const val RESOLVED_URL_TTL_MS = 3L * 60 * 60 * 1000
     private const val SEARCH_TTL_MS = 5L * 60 * 1000
+    private const val MIX_TTL_MS = 60L * 60 * 1000
     private const val UPDATE_EVERY_MS = 12L * 60 * 60 * 1000
     private val VIDEO_ID = Regex("^[A-Za-z0-9_-]{6,20}$")
     private val LIST_ID = Regex("^[A-Za-z0-9_-]{2,80}$")
@@ -90,6 +91,7 @@ class MediaHelper private constructor(private val context: Context) {
   private val resolving = ConcurrentHashMap<String, CompletableFuture<Resolved>>()
   private val downloading = ConcurrentHashMap<String, CompletableFuture<File>>()
   private val searches = ConcurrentHashMap<String, Pair<Long, JSONArray>>()
+  private val mixes = ConcurrentHashMap<String, Pair<Long, JSONArray>>()
 
   // while youtube is rate limiting this phone, background work (prefetch) backs off
   @Volatile private var cooldownUntil = 0L
@@ -298,6 +300,9 @@ class MediaHelper private constructor(private val context: Context) {
       "/api/version" -> sendJson(req, out, 200, JSONObject().put("version", "local-helper").put("mode", "helper"))
       "/api/status" -> sendJson(req, out, 200, JSONObject().put("ready", true).put("direct", true).put("ytdlp", ytdlpState))
       "/api/search" -> apiSearch(req, out)
+      // the page asks before it shows the discover button: an older helper answers 404 here
+      "/api/mix/status" -> sendJson(req, out, 200, JSONObject().put("ok", true).put("available", true))
+      "/api/mix" -> apiMix(req, out)
       "/api/playlist" -> apiPlaylist(req, out)
       "/api/info" -> apiInfo(req, out)
       "/api/prefetch" -> apiPrefetch(req, out)
@@ -447,6 +452,41 @@ class MediaHelper private constructor(private val context: Context) {
     noteYoutubeOk()
     if (results.length() > 0) searches[query] = System.currentTimeMillis() to results
     sendJson(req, out, 200, JSONObject().put("query", query).put("results", results))
+  }
+
+  // a song's youtube mix, for the discover button (see YouTubeDirect.mix). the same answer is kept for an hour, so asking again for the
+  // same song costs nothing. yt-dlp is the way out when the direct request fails, like for a search
+  private fun apiMix(req: Request, out: OutputStream) {
+    val id = req.query["videoId"]?.trim().orEmpty()
+    if (id.isEmpty()) throw Failure(400, "Missing videoId query parameter")
+    if (!VIDEO_ID.matches(id)) throw Failure(400, "Invalid videoId")
+    val limit = (req.query["limit"]?.toIntOrNull() ?: 40).coerceIn(5, 80)
+
+    val cached = mixes[id]
+    val all = if (cached != null && System.currentTimeMillis() - cached.first < MIX_TTL_MS) {
+      cached.second
+    } else {
+      val fresh = try {
+        YouTubeDirect.mix(id, 80).also { if (it.length() == 0) throw IOException("no mix") }
+      } catch (direct: Exception) {
+        Log.i(TAG, "direct mix failed (${direct.message}), using yt-dlp")
+        val raw = ytdlp("https://www.youtube.com/watch?v=$id&list=RD$id", "--dump-single-json", "--flat-playlist", "--no-warnings", "--playlist-end", "41")
+        val found = entriesToResults(parseJson(raw).optJSONArray("entries"), 80)
+        // the first entry of the list is the song itself
+        val others = JSONArray()
+        for (i in 0 until found.length()) {
+          val item = found.optJSONObject(i) ?: continue
+          if (item.optString("videoId") != id) others.put(item)
+        }
+        others
+      }
+      noteYoutubeOk()
+      if (fresh.length() > 0) mixes[id] = System.currentTimeMillis() to fresh
+      fresh
+    }
+    val items = JSONArray()
+    for (i in 0 until minOf(limit, all.length())) items.put(all.get(i))
+    sendJson(req, out, 200, JSONObject().put("videoId", id).put("items", items))
   }
 
   private fun apiPlaylist(req: Request, out: OutputStream) {

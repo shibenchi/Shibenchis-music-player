@@ -130,6 +130,41 @@ object YouTubeDirect {
     return results
   }
 
+  // the mix youtube builds from one song (its radio): the first page of what the watch page lists next to the player, about 25 songs. it is
+  // the same request the youtube web page makes, so it needs no key. the seed itself is left out, and so is anything without a length
+  // (a live stream). the app (discover) ranks and filters what comes back
+  fun mix(videoId: String, limit: Int): JSONArray {
+    val body = JSONObject()
+      .put("context", JSONObject().put("client", JSONObject().put("clientName", "WEB").put("clientVersion", WEB_VERSION).put("hl", "en").put("gl", "US")))
+      .put("videoId", videoId)
+      .put("playlistId", "RD$videoId")
+    val json = postJson("next", body, "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36")
+    val entries = json.optJSONObject("contents")
+      ?.optJSONObject("twoColumnWatchNextResults")
+      ?.optJSONObject("playlist")
+      ?.optJSONObject("playlist")
+      ?.optJSONArray("contents") ?: throw IOException("unexpected mix response")
+
+    val results = JSONArray()
+    for (i in 0 until entries.length()) {
+      if (results.length() >= limit) break
+      val v = entries.optJSONObject(i)?.optJSONObject("playlistPanelVideoRenderer") ?: continue
+      val id = v.optString("videoId")
+      val title = runsText(v.optJSONObject("title"))
+      val length = runsText(v.optJSONObject("lengthText"))
+      if (id.isEmpty() || id == videoId || title.isEmpty() || length.isEmpty()) continue
+      results.put(
+        JSONObject()
+          .put("videoId", id)
+          .put("title", title)
+          .put("author", runsText(v.optJSONObject("shortBylineText")))
+          .put("duration", clockToSeconds(length))
+          .put("thumbnail", "https://i.ytimg.com/vi/$id/hqdefault.jpg")
+      )
+    }
+    return results
+  }
+
   // the best audio-only link for a video. mp4 audio first (the player and the
   // offline files both want m4a), then whatever audio there is
   fun audio(videoId: String, only: String? = null): Audio {

@@ -5697,6 +5697,15 @@ export default function App({
     try {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       audioContextRef.current = audioContext;
+      // the song's sound goes through this context. when the system suspends it while the app is hidden (android does) the song goes
+      // silent: its clock, the progress bar and the widget carry on, the sound and the visualizer are gone. a context that stops while the
+      // song is not paused is started again (a song the system paused itself is paused on the element too, so it is left alone)
+      audioContext.onstatechange = () => {
+        const element = audioRef.current;
+        if (audioContext.state !== 'running' && element && !element.paused && !element.ended) {
+          audioContext.resume().catch(() => {});
+        }
+      };
 
       const source = audioContext.createMediaElementSource(audio);
 
@@ -6670,6 +6679,11 @@ export default function App({
     audio.addEventListener('loadedmetadata', onLoadedMetadata);
     audio.addEventListener('loadstart', onLoadStart);
     audio.addEventListener('waiting', onWaiting);
+    const onPlayingWake = () => {
+      const ctx = audioContextRef.current;
+      if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+    };
+    audio.addEventListener('playing', onPlayingWake);
     audio.addEventListener('canplay', onCanPlay);
     audio.addEventListener('stalled', onStalled);
 
@@ -6687,6 +6701,7 @@ export default function App({
       audio.removeEventListener('loadedmetadata', onLoadedMetadata);
       audio.removeEventListener('loadstart', onLoadStart);
       audio.removeEventListener('waiting', onWaiting);
+      audio.removeEventListener('playing', onPlayingWake);
       audio.removeEventListener('canplay', onCanPlay);
       audio.removeEventListener('stalled', onStalled);
       window.removeEventListener('pointermove', onPointerMove);
@@ -8502,11 +8517,29 @@ export default function App({
           audio.currentTime = saved.currentTime;
         }
         autoplayRef.current = true;
-        audio.play().catch((err) => {
-          console.warn('Audio play blocked:', err?.message || err);
-        });
+        // the audio context first: one the system suspended while the app was hidden plays nothing, and a play pressed on the widget
+        // or the notification has no tap on the page to wake it with (the song's clock and the progress bar moved, the sound and the
+        // visualizer did not). the player says playing only when the song really started
         setIsPlaying(true);
-        showNotification('playing', 'info');
+        (async () => {
+          initAudioContext();
+          const ctx = audioContextRef.current;
+          if (ctx && ctx.state !== 'running') {
+            try {
+              await ctx.resume();
+            } catch (err) {
+              addDebugLog('error', `AudioContext resume failed: ${err.message}`, { error: err }, true);
+            }
+          }
+          try {
+            await audio.play();
+            showNotification('playing', 'info');
+          } catch (err) {
+            console.warn('Audio play blocked:', err?.message || err);
+            autoplayRef.current = false;
+            setIsPlaying(false);
+          }
+        })();
       }
     }
   };
