@@ -8766,11 +8766,9 @@ export default function App({
         if (stopped || !running || !latest) return;
         setCurrentVersion(running);
         setLatestVersion(latest);
+        // the screens can be current while the app itself (what the installer put there) is older: the screens are swapped first, and
+        // after that the app is the only thing left to update. the bar used to look at the screens only, so that second step never came
         const newer = isNewerVersion(latest, running);
-        if (!newer) {
-          setVersionMismatch(false);
-          return;
-        }
 
         let kind = 'reload';
         if (isAndroidApp()) {
@@ -8812,6 +8810,11 @@ export default function App({
           } catch {
             // stays on the download page
           }
+        }
+        // nothing to offer: the screens are current and the app is not older (or has no installer to be updated with)
+        if (!newer && kind !== 'live' && kind !== 'install') {
+          if (!stopped) setVersionMismatch(false);
+          return;
         }
         // the bar appears with what its button will do, not with a guess that changes a moment later
         if (!stopped) {
