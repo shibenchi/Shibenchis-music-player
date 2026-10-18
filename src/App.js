@@ -1332,6 +1332,19 @@ const BUILT_VERSION = process.env.REACT_APP_VERSION || '';
 // where the installers are, for an update that can not be done from inside the app
 const RELEASES_URL = 'https://github.com/shibenchi/Shibenchis-music-player/releases/latest';
 
+// the page of the spotify helper is opened in the person's own browser, which has to be able to reach it. the pages of the phone app
+// live at an address that only exists inside the app (http://tauri.localhost): in the phone's browser that is "refused to connect",
+// so there the helper's page is opened from the club server (the address that answers, see socialApi), the same page, served there
+function spotifyHelperUrl() {
+  const path = '/?view=spotify-helper';
+  const own = typeof window !== 'undefined' ? window.location : null;
+  if (isAndroidApp() || (own && own.hostname === 'tauri.localhost')) {
+    const club = socialUrl(path);
+    if (/^https?:\/\//.test(club)) return club;
+  }
+  return `${own ? own.origin : ''}${path}`;
+}
+
 // the version of the installer that a signed update list offers for a platform ('android' or 'windows'), or '' when it has none. a
 // screens only release lists the installers of an earlier release (the entry says which, and so does the release address in it),
 // so what an app compares with its own version is this, not the version of the list: an app that has that installer is not asked
@@ -14509,7 +14522,7 @@ export default function App({
                             variant="outline-light"
                             size="sm"
                             data-get-helper
-                            onClick={() => openExternalUrl(`${window.location.origin}/?view=spotify-helper`)}
+                            onClick={() => openExternalUrl(spotifyHelperUrl())}
                             style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: `1px solid ${dimBorderColor(themeColor)}` }}
                           >
                             spotify helper
