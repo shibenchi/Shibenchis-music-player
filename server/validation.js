@@ -177,7 +177,11 @@ function createRateLimiter({ windowMs, max }) {
 
 // auth tokens for cross-origin clients. random, expiring, revocable.
 // (they used to be built from Math.random and lived forever)
-const AUTH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// a token that is used is renewed for the whole period again, so someone who opens the app now and then stays signed in (it used
+// to end seven days after the login whatever they did, which signed everybody out every week). renewing writes to the database,
+// so a token is renewed at most once an hour
+const AUTH_TOKEN_RENEW_AFTER_MS = 60 * 60 * 1000;
 
 // storage is optional: { save, get, remove, removeUser, removeExpired } keyed by the
 // sha256 of the token. with it, logins survive a restart of the server, without
@@ -238,6 +242,12 @@ function createAuthTokenStore(getStorage = null) {
         const store = storage();
         if (store) safely(() => store.remove(hashOf(token)));
         return null;
+      }
+      const now = Date.now();
+      if (entry.expiresAt - now < AUTH_TOKEN_TTL_MS - AUTH_TOKEN_RENEW_AFTER_MS) {
+        entry.expiresAt = now + AUTH_TOKEN_TTL_MS;
+        const store = storage();
+        if (store) safely(() => store.save(hashOf(token), entry.userId, entry.expiresAt));
       }
       return entry.userId;
     },

@@ -1332,6 +1332,23 @@ const BUILT_VERSION = process.env.REACT_APP_VERSION || '';
 // where the installers are, for an update that can not be done from inside the app
 const RELEASES_URL = 'https://github.com/shibenchi/Shibenchis-music-player/releases/latest';
 
+// the version of the installer that a signed update list offers for a platform ('android' or 'windows'), or '' when it has none. a
+// screens only release lists the installers of an earlier release (the entry says which, and so does the release address in it),
+// so what an app compares with its own version is this, not the version of the list: an app that has that installer is not asked
+// to install it again for every release
+function offeredInstallerVersion(envelopeText, platform) {
+  try {
+    const manifest = JSON.parse(JSON.parse(envelopeText).manifest);
+    const entry = manifest.installers && manifest.installers[platform];
+    if (!entry) return '';
+    if (entry.version) return String(entry.version);
+    const found = /\/download\/([^/]+)\//.exec(String(entry.url || ''));
+    return found ? found[1] : String(manifest.version || '');
+  } catch {
+    return '';
+  }
+}
+
 // is version a newer than version b ("1.4.11" against "1.4.10")
 function isNewerVersion(a, b) {
   const pa = String(a || '').split('.').map((part) => parseInt(part, 10) || 0);
@@ -8784,7 +8801,7 @@ export default function App({
                 if (verdict.ok && verdict.canApply && verdict.newer) {
                   kind = 'live';
                   updateEnvelopeRef.current = envelopeText;
-                } else if (verdict.ok && verdict.installer && typeof window.SmpNative.appInstallStart === 'function' && isNewerVersion(verdict.latest, window.SmpNative.appVersion())) {
+                } else if (verdict.ok && verdict.installer && typeof window.SmpNative.appInstallStart === 'function' && isNewerVersion(offeredInstallerVersion(envelopeText, 'android') || verdict.latest, window.SmpNative.appVersion())) {
                   // needs a new apk: the app downloads it from the github release and hands it to android
                   kind = 'install';
                   updateEnvelopeRef.current = envelopeText;
@@ -8805,7 +8822,18 @@ export default function App({
             if (response.ok && type.includes('application/json')) {
               const status = await response.json();
               if (status.canApply && status.newer) kind = 'live';
-              else if (status.installer && status.canInstall && status.installerNewer) kind = 'install';
+              else if (status.installer && status.canInstall) {
+                // the installer's own version against this app's, read from the signed list the club publishes (the local server only
+                // knows the version of the list, which is newer than the installer in a screens only release)
+                let offered = '';
+                try {
+                  const listed = await fetch(socialUrl('/api/update/manifest'), { cache: 'no-store' });
+                  if (listed.ok) offered = offeredInstallerVersion(await listed.text(), 'windows');
+                } catch {
+                  // the local server's own answer below
+                }
+                if (offered && status.shell ? isNewerVersion(offered, status.shell) : status.installerNewer) kind = 'install';
+              }
             }
           } catch {
             // stays on the download page

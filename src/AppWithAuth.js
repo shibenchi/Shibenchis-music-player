@@ -15,10 +15,13 @@ const api = {
     try {
       const res = await socialFetch('/api/auth/session', { signal: controller.signal });
       const contentType = res.headers.get('content-type');
-      if (!contentType || !contentType.includes('application/json')) {
-        return null;
+      const data = res.ok && contentType && contentType.includes('application/json') ? await res.json().catch(() => null) : null;
+      // only the account server saying "nobody is signed in" ({ ok: true, user: null }) signs someone out. an error page from the
+      // proxy while the server restarts, a 5xx or anything else that is not that answer is a server that could not be asked, and
+      // the caller keeps the person signed in (it used to count as signed out and wiped the login on the phone)
+      if (!data || data.ok !== true || !Object.prototype.hasOwnProperty.call(data, 'user')) {
+        throw new Error('the account server gave no usable answer');
       }
-      const data = await res.json();
       return data.user;
     } finally {
       clearTimeout(timer);

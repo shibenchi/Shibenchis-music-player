@@ -12,7 +12,10 @@
 // github release, size and hash), so an app can download one itself and check it against the
 // maker's signature before it is run. they are read from the files that are uploaded to the
 // release: SMP_MSI and SMP_APK name them, otherwise the usual places are tried. a bundle for a
-// release that has no new installer (screens only) simply has none listed
+// release that has no new installer (screens only) simply has none listed. SMP_INSTALLER_VERSION lists the installers of
+// an earlier release instead (their files are looked for under that version): a screens only release then still offers
+// the installer to apps that are behind on it, and each entry says which version it is, so an app that already has that
+// installer is not asked to install it again
 //
 // "smp.minShell" in package.json is the oldest installer the bundle can run on.
 // raise it to the current version whenever a change needs something that is not in
@@ -28,6 +31,7 @@ const pkg = require('../package.json');
 const buildDir = path.resolve(root, process.argv[2] || 'build');
 const outDir = path.resolve(root, process.argv[3] || 'update-files');
 const minShell = process.env.SMP_MIN_SHELL || (pkg.smp && pkg.smp.minShell) || pkg.version;
+const installerVersion = process.env.SMP_INSTALLER_VERSION || pkg.version;
 const keyFile = process.env.SMP_UPDATE_KEY || path.join(os.homedir(), '.smp-update-signing-key.pem');
 
 function fail(message) {
@@ -62,19 +66,20 @@ const files = names.map((name) => {
   return { path: name, size: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
 });
 
-// the installers of this version, as the github release will have them
+// the installers, as the github release will have them
 const RELEASE_DOWNLOADS = 'https://github.com/shibenchi/Shibenchis-Music-Player/releases/download/';
 const downloads = path.join(os.homedir(), 'Downloads');
 const candidates = {
-  windows: { file: process.env.SMP_MSI || path.join(downloads, `Shibenchi's Music Player_${pkg.version}_x64_en-US.msi`), asset: `Shibenchis-Music-Player_${pkg.version}_x64_en-US.msi` },
-  android: { file: process.env.SMP_APK || path.join(downloads, `shibenchi-music-player-${pkg.version}.apk`), asset: `Shibenchis-Music-Player_${pkg.version}.apk` }
+  windows: { file: process.env.SMP_MSI || path.join(downloads, `Shibenchi's Music Player_${installerVersion}_x64_en-US.msi`), asset: `Shibenchis-Music-Player_${installerVersion}_x64_en-US.msi` },
+  android: { file: process.env.SMP_APK || path.join(downloads, `shibenchi-music-player-${installerVersion}.apk`), asset: `Shibenchis-Music-Player_${installerVersion}.apk` }
 };
 const installers = {};
 for (const [platform, candidate] of Object.entries(candidates)) {
   if (!fs.existsSync(candidate.file)) continue;
   const bytes = fs.readFileSync(candidate.file);
   installers[platform] = {
-    url: `${RELEASE_DOWNLOADS}${pkg.version}/${candidate.asset}`,
+    version: installerVersion,
+    url: `${RELEASE_DOWNLOADS}${installerVersion}/${candidate.asset}`,
     size: bytes.length,
     sha256: crypto.createHash('sha256').update(bytes).digest('hex')
   };
@@ -92,4 +97,4 @@ fs.mkdirSync(outDir, { recursive: true });
 fs.writeFileSync(path.join(outDir, 'manifest.json'), JSON.stringify({ manifest, signature }));
 
 const total = files.reduce((sum, f) => sum + f.size, 0);
-console.log(`update bundle for ${pkg.version}: ${files.length} files, ${(total / 1024 / 1024).toFixed(1)} MB, minShell ${minShell}, installers listed: ${Object.keys(installers).join(', ') || 'none'} -> ${outDir}`);
+console.log(`update bundle for ${pkg.version}: ${files.length} files, ${(total / 1024 / 1024).toFixed(1)} MB, minShell ${minShell}, installers listed: ${Object.keys(installers).join(', ') || 'none'}${Object.keys(installers).length ? ` (version ${installerVersion})` : ''} -> ${outDir}`);
