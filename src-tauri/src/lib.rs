@@ -6,6 +6,9 @@
 // platform being compiled for.
 #[cfg(desktop)]
 mod desktop;
+// the windows side of the live wallpaper (empty on the other systems)
+#[cfg(desktop)]
+mod wallpaper_win;
 #[cfg(mobile)]
 mod mobile;
 

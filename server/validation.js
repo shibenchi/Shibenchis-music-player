@@ -145,6 +145,8 @@ function cleanClientId(raw) {
 // tiny fixed window limiter, keyed by whatever string you give it
 function createRateLimiter({ windowMs, max }) {
   const hits = new Map();
+  // a stress test of the whole server scales every limit up (the variable is not set anywhere else)
+  const factor = Math.max(1, Number(process.env.SMP_RATE_LIMIT_FACTOR) || 1);
 
   const sweep = setInterval(() => {
     const now = Date.now();
@@ -165,7 +167,7 @@ function createRateLimiter({ windowMs, max }) {
       }
       entry.count += 1;
       return {
-        allowed: entry.count <= max,
+        allowed: entry.count <= max * factor,
         retryAfterSec: Math.max(1, Math.ceil((entry.resetAt - now) / 1000))
       };
     },

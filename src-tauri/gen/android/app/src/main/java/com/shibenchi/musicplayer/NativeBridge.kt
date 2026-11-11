@@ -249,6 +249,10 @@ class NativeBridge(private val context: Context) {
       PlaybackService.sync(context)
       PlayerWidget.refresh(context)
       FloatingPlayer.sync(context)
+      // a paused or stopped song: the wallpaper draws its still picture (it only draws on frames and on this)
+      SmpWallpaperService.poke()
+      // a new theme color: the system hears about the colors of the wallpaper again
+      SmpWallpaperService.colorsMayHaveChanged()
       // the app going back out of sight when a button on the widget or the notification had to open it
       // to start the music
       if (NowPlaying.playing && !wasPlaying && SystemClock.elapsedRealtime() < Playback.minimizeUntil) {
@@ -322,10 +326,21 @@ class NativeBridge(private val context: Context) {
   // whether the mini player is showing, the page sends far fewer when it is not
   @JavascriptInterface
   fun vizFrame(text: String): Boolean {
-    if (!FloatingPlayer.isShowing()) return false
+    val wallpaper = SmpWallpaperService.isShowing()
+    if (!FloatingPlayer.isShowing() && !wallpaper) return false
     Viz.parse(text)
+    // the live wallpaper draws from the same frames, when it is on screen
+    if (wallpaper) SmpWallpaperService.poke()
     return true
   }
+
+  // the live wallpaper (the visualizer behind the icons): on when it is the wallpaper now, off when it is not, empty when the phone has
+  // no live wallpapers. it is only ever set on the system's own screen, opened by the next call
+  @JavascriptInterface
+  fun wallpaperStatus(): String = SmpWallpaperService.status(context)
+
+  @JavascriptInterface
+  fun openWallpaperPicker(): Boolean = SmpWallpaperService.openPicker(context)
 
   // opens the system screen where the person allows display over other apps for
   // this app. nothing is granted without them going through it

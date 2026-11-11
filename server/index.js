@@ -763,11 +763,15 @@ function sanitizeListeningState(listening) {
     return null;
   }
 
+  // the video the song is from, only so the wrapped story can show its thumbnail (a youtube id or nothing)
+  const videoId = /^[\w-]{11}$/.test(String(listening.video_id || '')) ? String(listening.video_id) : '';
+
   return {
     title,
     author,
     source,
     server_id: serverId || null,
+    video_id: videoId,
     is_playing: listening.is_playing !== false
   };
 }
@@ -1592,7 +1596,7 @@ app.get('/api/health', (req, res) => {
 // auth routes
 
 // register new user
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   try {
     const body = req.body || {};
 
@@ -1623,7 +1627,7 @@ app.post('/api/auth/register', (req, res) => {
     // create user
     let user;
     try {
-      user = db.createUser(username, password);
+      user = await db.createUser(username, password);
     } catch (createErr) {
       // two people registering the same name at the same moment
       if (String(createErr.code || '').startsWith('SQLITE_CONSTRAINT')) {
@@ -1655,7 +1659,7 @@ app.post('/api/auth/register', (req, res) => {
 });
 
 // login
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
     const fields = validation.readLoginFields(req.body);
     if (!fields.ok) {
@@ -1674,7 +1678,7 @@ app.post('/api/auth/login', (req, res) => {
       return tooManyAttempts(res, attemptLimit.retryAfterSec);
     }
 
-    const user = db.authenticateUser(username, password);
+    const user = await db.authenticateUser(username, password);
     if (!user) {
       return res.status(401).json({ error: 'Invalid username or password' });
     }
@@ -2201,16 +2205,19 @@ app.post('/api/servers/:serverId/collab-playlists/:playlistId/tracks-bulk', requ
     }
     const list = Array.isArray((req.body || {}).tracks) ? req.body.tracks.slice(0, 200) : [];
     const added = [];
-    list.forEach((track) => {
-      const videoId = track && (track.video_id || track.videoId);
-      if (!videoId || !track.title) return;
-      // a song of a file needs its file in the room, the others of the list go in all the same
-      if ((String(videoId).startsWith('local:') || track.source === 'local') && !(roomFiles.enabled && roomFiles.has(serverId, String(videoId)))) return;
-      added.push(db.addTrackToCollabPlaylist(
-        `cpt_${crypto.randomUUID()}`, playlistId, videoId, track.title, track.author,
-        track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url || track.externalUrl,
-        track.duration_ms || track.durationMs || 0, req.session.userId
-      ));
+    // all of them in one transaction: up to 200 songs, one write to the disk
+    db.runInTransaction(() => {
+      list.forEach((track) => {
+        const videoId = track && (track.video_id || track.videoId);
+        if (!videoId || !track.title) return;
+        // a song of a file needs its file in the room, the others of the list go in all the same
+        if ((String(videoId).startsWith('local:') || track.source === 'local') && !(roomFiles.enabled && roomFiles.has(serverId, String(videoId)))) return;
+        added.push(db.addTrackToCollabPlaylist(
+          `cpt_${crypto.randomUUID()}`, playlistId, videoId, track.title, track.author,
+          track.format || 'mp3', track.source || 'youtube', track.thumbnail, track.external_url || track.externalUrl,
+          track.duration_ms || track.durationMs || 0, req.session.userId
+        ));
+      });
     });
     if (added.length) broadcastCollab(serverId, { type: 'collab_playlist_tracks_added', playlistId, tracks: added });
     res.json({ ok: true, tracks: added });
@@ -2296,13 +2303,12 @@ app.put('/api/user/queue', requireAuth, (req, res) => {
       return res.status(400).json({ error: 'Queue must be an array' });
     }
 
-    // clear existing queue
-    db.clearUserQueue(req.session.userId);
+    if (queue.length > 10000) {
+      return res.status(400).json({ error: 'That queue is too long' });
+    }
 
-    // add all tracks from new queue
-    queue.forEach((track, index) => {
-      db.addToUserQueue(req.session.userId, track, index);
-    });
+    // the old queue goes and the new one comes in as one transaction (see replaceUserQueue)
+    db.replaceUserQueue(req.session.userId, queue);
 
     logToFile(`[QUEUE] Queue updated for user ${req.session.username}: ${queue.length} tracks`);
     res.json({ ok: true });
@@ -3059,7 +3065,9 @@ app.get('/api/users', requireAuth, (req, res) => {
     const usersWithStatus = allUsers.map((u) => {
       const livePresence = presenceMap.get(u.id);
       const onlineStatus = onlineStatusMap.get(u.id);
-      const isOnline = Boolean(livePresence || onlineIds.has(u.id));
+      // online means a connection is open right now. the stored flag is only a fallback for the order of the list: it stays set after a restart
+      // or a connection that was cut, which showed people as online with no device behind them
+      const isOnline = Boolean(livePresence);
 
       return {
         ...u,
@@ -3338,10 +3346,28 @@ app.get('/api/stats', requireAuth, (req, res) => {
     const range = STATS_RANGES.includes(req.query.range) ? req.query.range : 'week';
     flushListening(req.session.userId);
     res.set('Cache-Control', 'no-store');
-    res.json({ ok: true, stats: db.getListeningStats(req.session.userId, { range, offsetMin: Number(req.query.tz) || 0 }) });
+    const tz = Number(req.query.tz) || 0;
+    res.json({ ok: true, stats: db.getListeningStats(req.session.userId, { range, offsetMin: tz }), years: db.getListeningYears(req.session.userId, tz) });
   } catch (error) {
     logToFile(`[STATS] Get stats error: ${error.message}`, true);
     res.status(500).json({ error: 'Failed to get your stats' });
+  }
+});
+
+// the wrapped story of one calendar year: ?year=2026&tz=<minutes east of utc>. without a year it only lists the years that have listening
+app.get('/api/wrapped', requireAuth, (req, res) => {
+  try {
+    const tz = Number(req.query.tz) || 0;
+    flushListening(req.session.userId);
+    res.set('Cache-Control', 'no-store');
+    const years = db.getListeningYears(req.session.userId, tz);
+    if (req.query.year === undefined) return res.json({ ok: true, years });
+    const wrapped = db.getWrapped(req.session.userId, { year: req.query.year, offsetMin: tz });
+    if (!wrapped) return res.status(400).json({ error: 'That year does not work' });
+    return res.json({ ok: true, years, wrapped });
+  } catch (error) {
+    logToFile(`[STATS] Get wrapped error: ${error.message}`, true);
+    return res.status(500).json({ error: 'Failed to get your wrapped' });
   }
 });
 
@@ -3439,6 +3465,55 @@ app.put('/api/e2e/key', requireAuth, (req, res) => {
     created,
     key: { public_key: key.public_key, kid: key.kid, wrapped_private: key.wrapped_private, wrap_salt: key.wrap_salt, wrap_iv: key.wrap_iv, wrap_iters: key.wrap_iters }
   });
+});
+
+// the server does NOT keep the private half of the account key in any form it can open (there was a sealed copy for a day, it is gone, and these two
+// routes answer 410 for the apps that still call them). a device without the key gets it from another device of the same account, through the
+// mailbox below, and the server only sees public halves of one time keys and a locked blob
+app.get('/api/e2e/escrow', requireAuth, (req, res) => res.status(410).json({ error: 'The server no longer keeps a copy of the key' }));
+app.put('/api/e2e/escrow', requireAuth, (req, res) => res.status(410).json({ error: 'The server no longer keeps a copy of the key' }));
+
+const transferLimiter = validation.createRateLimiter({ windowMs: 10 * 60 * 1000, max: 30 });
+const transferPublic = (value) => {
+  let jwk = null;
+  try { jwk = JSON.parse(value); } catch { jwk = null; }
+  const text = (v) => typeof v === 'string' && v.length > 0 && v.length <= 64;
+  return jwk && jwk.kty === 'EC' && jwk.crv === 'P-256' && text(jwk.x) && text(jwk.y) && !jwk.d ? { kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y } : null;
+};
+
+// a device without the key asks for it: the public half of a one time key
+app.post('/api/e2e/transfer', requireAuth, (req, res) => {
+  const limit = transferLimiter.hit(req.session.userId);
+  if (!limit.allowed) return tooManyAttempts(res, limit.retryAfterSec);
+  const pub = transferPublic((req.body || {}).pub);
+  if (!pub) return res.status(400).json({ error: 'That is not a key' });
+  if (!db.getUserKey(req.session.userId)) return res.status(409).json({ error: 'This account has no key yet' });
+  const id = db.createTransfer(req.session.userId, JSON.stringify(pub));
+  // the account's devices that are open hear about it at once (the ones that have the key answer, the others ignore it)
+  sendToUser(req.session.userId, { type: 'e2e_transfer_request' });
+  res.json({ ok: true, id });
+});
+
+// a device that has the key: who is asking for it (asked when it starts, and when the event above comes)
+app.get('/api/e2e/transfer/pending', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, requests: db.pendingTransfers(req.session.userId).map((row) => ({ id: row.id, pub: row.requester_pub, created_at: row.created_at })) });
+});
+
+// the answer of that device: the account key locked for the asking device
+app.put('/api/e2e/transfer/:id', requireAuth, (req, res) => {
+  const wrapped = (req.body || {}).wrapped;
+  if (typeof wrapped !== 'string' || wrapped.length < 16 || wrapped.length > 8192) return res.status(400).json({ error: 'That is not a locked key' });
+  if (!db.answerTransfer(req.session.userId, req.params.id, wrapped)) return res.status(404).json({ error: 'No such request, or it was answered already' });
+  res.json({ ok: true });
+});
+
+// the asking device fetches the answer (once)
+app.get('/api/e2e/transfer/:id', requireAuth, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const taken = db.takeTransfer(req.session.userId, req.params.id);
+  if (!taken) return res.status(404).json({ error: 'No such request, or it ran out' });
+  res.json({ ok: true, wrapped: taken.wrapped });
 });
 
 // the public key of somebody, or none when that person has not turned private messages on (their app is older)
@@ -3880,6 +3955,40 @@ app.post('/api/servers/:serverId/kick/:userId', requireAuth, (req, res) => {
   }
 });
 
+// make a member of the room an admin of it, or take that away again (the room's owner, its admins and the site admins can)
+app.post('/api/servers/:serverId/admins/:userId', requireAuth, (req, res) => {
+  try {
+    const { serverId, userId } = req.params;
+    const server = db.getActiveServerById(serverId);
+    if (!server) {
+      return res.status(404).json({ error: 'Server not found' });
+    }
+
+    const allowed = server.host_id === req.session.userId || db.isServerAdmin(serverId, req.session.userId) || Boolean(req.session.isAdmin);
+    if (!allowed) {
+      return res.status(403).json({ error: 'Only server admins can change who is an admin' });
+    }
+    if (!db.isServerMember(serverId, userId)) {
+      return res.status(404).json({ error: 'That person is not in this server' });
+    }
+    // the person who made the room stays its admin
+    const wanted = Boolean((req.body || {}).isAdmin);
+    if (!wanted && server.host_id === userId) {
+      return res.status(400).json({ error: 'The owner of a server is always an admin' });
+    }
+
+    db.setServerMemberAdmin(serverId, userId, wanted);
+    logToFile(`[SERVERS] User ${userId} ${wanted ? 'made admin of' : 'removed as admin of'} server ${serverId} by ${req.session.username}`);
+    if (globalWss) {
+      broadcastServerMembers(serverId);
+    }
+    res.json({ ok: true, isAdmin: wanted });
+  } catch (error) {
+    logToFile(`[SERVERS] Change admin error: ${error.message}`, true);
+    res.status(500).json({ error: 'Failed to change admin' });
+  }
+});
+
 // get user's servers
 app.get('/api/servers/my', requireAuth, (req, res) => {
   try {
@@ -4221,6 +4330,13 @@ const heartbeat = setInterval(() => {
 }, HEARTBEAT_MS);
 if (heartbeat.unref) heartbeat.unref();
 
+// what kind of device a connection is on, from its user agent: for a connection that never says (an older app, a browser)
+function guessPlatform(request) {
+  const agent = String((request && request.headers && request.headers['user-agent']) || '');
+  if (!agent) return null;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(agent) ? 'mobile' : 'pc';
+}
+
 wss.on('connection', (ws, request) => {
   const clientId = require('crypto').randomBytes(8).toString('hex');
   const userId = request.session.userId;
@@ -4234,6 +4350,7 @@ wss.on('connection', (ws, request) => {
     username,
     serverId: currentServerId,
     listeningState: null,
+    platform: guessPlatform(request),
     syncMode: 'no' // the client reports its real mode right after connecting
   });
 
@@ -4325,6 +4442,29 @@ wss.on('connection', (ws, request) => {
             from: { clientId, device: nextDevice },
             state: nextState
           }, (other) => other.userId === userId, clientId);
+          break;
+        }
+
+        case 'device_viz_watch': {
+          // a device of the account that shows what another one plays asks it (every few seconds) for the bars of the sound, so a device
+          // that nobody looks at never has to send them
+          if (typeof data.to !== 'string' || data.to === clientId) break;
+          const target = wsClients.get(data.to);
+          if (target && target.userId === userId) sendWs(target.ws, { type: 'device_viz_watch', from: { clientId } });
+          break;
+        }
+
+        case 'device_viz': {
+          // the bars of what this device plays right now, to the one that asked for them: a short list of numbers 0 to 255
+          if (typeof data.to !== 'string' || data.to === clientId || !Array.isArray(data.bars)) break;
+          const stamp = Date.now();
+          if (client.lastViz && stamp - client.lastViz < 40) break;
+          client.lastViz = stamp;
+          const target = wsClients.get(data.to);
+          if (target && target.userId === userId) {
+            const bars = data.bars.slice(0, 64).map((value) => Math.max(0, Math.min(255, Math.round(Number(value) || 0))));
+            sendWs(target.ws, { type: 'device_viz', bars, from: { clientId } });
+          }
           break;
         }
 

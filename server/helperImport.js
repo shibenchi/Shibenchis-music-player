@@ -39,7 +39,7 @@ function createHelperImport({ app, db, requireAuth, validation, logToFile = () =
     next();
   };
 
-  app.post('/api/helper/login', (req, res) => {
+  app.post('/api/helper/login', async (req, res) => {
     try {
       const fields = validation.readLoginFields(req.body);
       if (!fields.ok) return res.status(400).json({ error: fields.error });
@@ -50,7 +50,7 @@ function createHelperImport({ app, db, requireAuth, validation, logToFile = () =
       const attemptKey = `${clientKey}|${username.toLowerCase()}`;
       const attemptLimit = loginAttemptLimiter.hit(attemptKey);
       if (!attemptLimit.allowed) return tooManyAttempts(res, attemptLimit.retryAfterSec);
-      const user = db.authenticateUser(username, password);
+      const user = await db.authenticateUser(username, password);
       if (!user) return res.status(401).json({ error: 'Invalid username or password' });
       loginAttemptLimiter.reset(attemptKey);
       // a few helper sign ins per account at a time, the oldest one goes

@@ -163,8 +163,8 @@ object FloatingPlayer {
     main.post {
       try {
         if (Viz.frame == null) {
-          Viz.frame = VizFrame(NowPlaying.accent.let { c -> val hsv = FloatArray(3); Color.colorToHSV(c, hsv); hsv[0] }, 0.4f, false,
-            IntArray(24) { i -> 60 + ((Math.sin(i / 3.0) + 1) * 80).toInt() }, IntArray(96) { i -> 128 + (Math.sin(i / 6.0) * 60).toInt() }, android.os.SystemClock.elapsedRealtime())
+          Viz.frame = VizFrame(NowPlaying.accent.let { c -> val hsv = FloatArray(3); Color.colorToHSV(c, hsv); hsv[0] }, 0.4f, "bars", 0.3f, 0f, 0f, 0f, false, 0f, 0f, 0, 0, 0, 0.5f, -1f, -1f,
+            FloatArray(96) { i -> 0.25f + 0.3f * (Math.sin(i / 6.0).toFloat() + 1f) / 2f }, FloatArray(96) { i -> Math.sin(i / 6.0).toFloat() * 0.45f }, android.os.SystemClock.elapsedRealtime())
         }
         val view = FloatingCard(app)
         view.refresh(true)
@@ -206,64 +206,46 @@ object FloatingPlayer {
   }
 }
 
-// one frame of the page's audio analysis, handed over by the page a few times a second
-// while the mini player shows: 24 bars, 96 points of the waveform, the theme hue and
-// how hard the bass is hitting
-class VizFrame(val hue: Float, val bass: Float, val wave: Boolean, val bins: IntArray, val points: IntArray, val at: Long)
-
+// the frames of the page's audio analysis (see VizFrame in VizWire.kt), handed over by the page about thirty times a second while the
+// mini player or the wallpaper shows
 object Viz {
   @Volatile var frame: VizFrame? = null
+  // the drawing the page picked last, kept for a still picture while nothing plays
+  @Volatile var lastPreset = "bars"
   // only while the mini player is drawn into a picture to look at
   @Volatile var forceDraw = false
 
-  // "hue,bass,wave;b0,b1,...;w0,w1,..."
   fun parse(text: String) {
     try {
-      val parts = text.split(';')
-      if (parts.size < 3) return
-      val head = parts[0].split(',')
-      val bins = parts[1].split(',').map { it.trim().toIntOrNull() ?: 0 }.toIntArray()
-      val points = parts[2].split(',').map { it.trim().toIntOrNull() ?: 128 }.toIntArray()
-      frame = VizFrame(
-        head[0].toFloatOrNull() ?: 0f,
-        head.getOrNull(1)?.toFloatOrNull() ?: 0f,
-        head.getOrNull(2) == "1",
-        bins, points, android.os.SystemClock.elapsedRealtime()
-      )
+      val parsed = VizFrame.parse(text, android.os.SystemClock.elapsedRealtime()) ?: return
+      frame = parsed
+      lastPreset = parsed.preset
     } catch (e: Exception) {
       // a bad frame is just skipped
     }
   }
 }
 
-// the visualizer behind the controls, the same bars and wave the desktop mini player draws
+// the visualizer behind the controls: the drawing the app has picked (the same code as the background of the app, see VizPainter), drawn
+// 800 css pixels wide and scaled into the card
 internal class FloatingViz(context: Context) : View(context) {
-  private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-  private val path = Path()
+  private val gfx = AndroidGfx()
+  private val painter = VizPainter(gfx)
+  private val input = VizInput()
   private val corners = Path()
   private val density = resources.displayMetrics.density
-  // what is drawn eases towards the latest frame on every screen refresh, so the
-  // bars and the wave move smoothly even though the page only sends a frame about
-  // thirty times a second
-  private var shownBins = FloatArray(0)
-  private var shownPoints = FloatArray(0)
-  private var shownBass = 0f
-
-  private fun softCeiling(x: Float) = if (x <= 0.65f) x else 0.65f + 0.35f * Math.tanh(((x - 0.65f) / 0.35f).toDouble()).toFloat()
+  private var startedAt = 0L
+  private var lastDrawAt = 0L
+  private var fade = 0f
 
   override fun onDraw(canvas: Canvas) {
     val f = Viz.frame ?: return
-    if (!Viz.forceDraw && (!NowPlaying.playing || android.os.SystemClock.elapsedRealtime() - f.at > 700)) {
-      shownBins = FloatArray(0)
-      shownPoints = FloatArray(0)
+    val now = android.os.SystemClock.elapsedRealtime()
+    if (!Viz.forceDraw && (!NowPlaying.playing || now - f.at > 700)) {
+      lastDrawAt = 0L
+      fade = 0f
       return
     }
-    // ease towards the frame (the first one is taken as it is)
-    if (shownBins.size != f.bins.size) shownBins = FloatArray(f.bins.size) { f.bins[it].toFloat() }
-    if (shownPoints.size != f.points.size) shownPoints = FloatArray(f.points.size) { f.points[it].toFloat() }
-    for (i in shownBins.indices) shownBins[i] += (f.bins[i] - shownBins[i]) * 0.55f
-    for (i in shownPoints.indices) shownPoints[i] += (f.points[i] - shownPoints[i]) * 0.6f
-    shownBass += (f.bass - shownBass) * 0.55f
     if (!Viz.forceDraw) postInvalidateOnAnimation()
     val w = width.toFloat()
     val h = height.toFloat()
@@ -273,39 +255,20 @@ internal class FloatingViz(context: Context) : View(context) {
     val radius = 11f * density
     corners.addRoundRect(RectF(0f, 0f, w, h), radius, radius, Path.Direction.CW)
     canvas.clipPath(corners)
-    val color = ColorUtils.HSLToColor(floatArrayOf(((f.hue % 360f) + 360f) % 360f, 0.85f, 0.58f))
-    if (f.wave && f.points.size > 1) {
-      val mid = h / 2f
-      val swing = mid * 0.8f * (1f + shownBass * 0.9f)
-      val step = w / (shownPoints.size - 1)
-      path.reset()
-      for (i in shownPoints.indices) {
-        val y = mid + ((shownPoints[i] - 128f) / 128f) * swing
-        if (i == 0) path.moveTo(0f, y) else path.lineTo(i * step, y)
-      }
-      paint.style = Paint.Style.STROKE
-      paint.strokeJoin = Paint.Join.ROUND
-      paint.strokeWidth = (6f + shownBass * 6f) * density
-      paint.shader = null
-      paint.color = ColorUtils.setAlphaComponent(color, 46)
-      canvas.drawPath(path, paint)
-      paint.strokeWidth = 2f * density
-      paint.color = ColorUtils.setAlphaComponent(color, 204)
-      canvas.drawPath(path, paint)
-    } else if (f.bins.isNotEmpty()) {
-      val count = f.bins.size
-      val gap = 2f * density
-      val barWidth = w / count - gap
-      paint.style = Paint.Style.FILL
-      paint.shader = LinearGradient(0f, h, 0f, 0f, ColorUtils.setAlphaComponent(color, 150), ColorUtils.setAlphaComponent(color, 30), Shader.TileMode.CLAMP)
-      for (i in 0 until count) {
-        val bassWeight = Math.max(0f, 1f - i / (count * 0.3f))
-        val boosted = softCeiling((shownBins[i] / 255f) * (1f + shownBass * bassWeight * 2.5f))
-        val barHeight = Math.max(2f * density, boosted * h * 0.85f)
-        val x = i * (barWidth + gap)
-        canvas.drawRect(RectF(x, h - barHeight, x + barWidth, h), paint)
-      }
-      paint.shader = null
+    if (startedAt == 0L) startedAt = now
+    f.fill(input)
+    input.now = (now - startedAt).toFloat()
+    input.dt = if (lastDrawAt == 0L) 33f else (now - lastDrawAt).coerceIn(4L, 100L).toFloat()
+    fade = Math.min(1f, fade + 0.1f * input.dt / 33f)
+    input.fade = fade
+    input.insetTop = 0f
+    input.insetCenter = 0.5f
+    lastDrawAt = now
+    gfx.begin(canvas, w / 800f, w, h)
+    try {
+      painter.draw(f.preset, input)
+    } finally {
+      gfx.end()
     }
   }
 }
@@ -529,6 +492,12 @@ internal class FloatingCard(context: Context) : FrameLayout(context) {
     val buttons = LinearLayout(context).apply {
       orientation = LinearLayout.HORIZONTAL
       gravity = Gravity.CENTER
+      background = GradientDrawable().apply {
+        cornerRadius = dp(7f).toFloat()
+        setColor(0xB8000000.toInt())
+        setStroke(dp(1f), 0x38FFFFFF)
+      }
+      setPadding(dp(6f), 0, dp(6f), 0)
     }
     shuffle.show(R.drawable.ic_shuffle)
     prev.show(R.drawable.ic_prev)

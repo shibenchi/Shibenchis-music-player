@@ -199,6 +199,45 @@ export async function setMiniplayerEnabled(enabled) {
   });
 }
 
+// the live wallpaper of the computer app: a window behind the desktop icons that draws the visualizer (Wallpaper.js,
+// wallpaper_win.rs). windows only, the command does not exist on the other systems
+export async function setWallpaperEnabled(enabled) {
+  if (isAndroidApp()) return;
+  const api = await loadApi();
+  if (!api) return;
+  api.invoke('set_wallpaper_enabled', { enabled }).catch((err) => {
+    frontendLog('tauriApi', `setWallpaperEnabled FAILED: ${err?.message || err}`);
+  });
+}
+
+// the picture of the sound for the wallpaper window, about 30 a second while a song plays (see wallpaperFrame.js).
+// the window not being there is the normal case when the wallpaper is off, so a refusal is not logged
+export async function sendWallpaperFrame(frame) {
+  const api = await loadApi();
+  if (!api) return;
+  api.emitTo('wallpaper', 'wallpaper-frame', frame).catch(() => {});
+}
+
+// what the wallpaper side says: 'ready' (its page just opened and wants the state of the sound) and 'visible' (true: the desktop is
+// on screen, false: a window covers it or the screen is locked, so nothing needs to be sent). returns an unsubscribe fn
+export function onWallpaperSignal(callback) {
+  const unlistens = [];
+  let cancelled = false;
+  loadApi().then((api) => {
+    if (!api || cancelled) return;
+    ['wallpaper-ready', 'wallpaper-visible'].forEach((name) => {
+      api.listen(name, (event) => callback(name === 'wallpaper-ready' ? 'ready' : 'visible', event.payload)).then((fn) => {
+        if (cancelled) fn();
+        else unlistens.push(fn);
+      });
+    });
+  });
+  return () => {
+    cancelled = true;
+    unlistens.splice(0).forEach((fn) => fn());
+  };
+}
+
 export async function toggleMiniplayer() {
   const api = await loadApi();
   if (!api) {
@@ -306,10 +345,30 @@ export async function sendVisualizerFrame(frame) {
 }
 
 // returns an unsubscribe fn (async since listen() itself is async)
-export function onMiniplayerControl(callback) {
-  let unlisten = null;
-  let cancelled = false;
+// the presses of the mini player (and, on the phone, of the notification, the widget and the floating player). ONE listener for the whole page that
+// hands every press to whoever is subscribed. before, every subscription made a listener of its own and the app subscribes again at every render: after a
+// while one press arrived as two to six presses, an even number of toggles is no toggle at all, and the mini player's pause did nothing
+const miniControlCallbacks = new Set();
+let miniControlListening = false;
+let lastMiniPress = { key: '', at: 0 };
+function ensureMiniControlListener() {
+  if (miniControlListening) return;
+  miniControlListening = true;
+  loadApi().then((api) => {
+    if (!api) { miniControlListening = false; return; }
+    return api.listen('miniplayer-control', (event) => {
+      frontendLog('tauriApi', `onMiniplayerControl: received ${event.payload}`);
+      // the same press twice within a few milliseconds is one press (a plain button press never comes twice that fast)
+      const key = typeof event.payload === 'string' ? event.payload : '';
+      const now = Date.now();
+      if (key && key === lastMiniPress.key && now - lastMiniPress.at < 80) return;
+      lastMiniPress = { key, at: now };
+      miniControlCallbacks.forEach((callback) => callback(event.payload));
+    }).catch(() => { miniControlListening = false; });
+  }).catch(() => { miniControlListening = false; });
+}
 
+export function onMiniplayerControl(callback) {
   // on android the notification, the widget and the floating player send their
   // button presses here, and they map onto the same actions the desktop mini
   // player sends
@@ -319,20 +378,11 @@ export function onMiniplayerControl(callback) {
   };
   if (typeof window !== 'undefined') window.__smpNativeCommand = nativeCommand;
 
-  loadApi().then((api) => {
-    if (!api || cancelled) return;
-    api.listen('miniplayer-control', (event) => {
-      frontendLog('tauriApi', `onMiniplayerControl: received ${event.payload}`);
-      callback(event.payload);
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
-  });
+  miniControlCallbacks.add(callback);
+  ensureMiniControlListener();
 
   return () => {
-    cancelled = true;
-    if (unlisten) unlisten();
+    miniControlCallbacks.delete(callback);
     if (typeof window !== 'undefined' && window.__smpNativeCommand === nativeCommand) delete window.__smpNativeCommand;
   };
 }

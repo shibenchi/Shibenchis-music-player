@@ -7,15 +7,27 @@ import { createE2e, e2eSupported } from './e2e';
 // password itself if this did not work out
 async function setupPrivateMessages(userId, password) {
   if (!e2eSupported() || !userId) return;
-  try {
-    const api = {
-      get: async (path) => (await socialFetch(path)).json(),
-      put: async (path, body) => (await socialFetch(path, { method: 'PUT', body: JSON.stringify(body) })).json()
-    };
-    await createE2e({ userId, api }).setup(password);
-    window.dispatchEvent(new Event('smp-e2e-changed'));
-  } catch {
-    // asked for later
+  const api = {
+    // an answer that is not a real one (an error page, a failed call) is an error here, not "this account has no key yet"
+    get: async (path) => {
+      const res = await socialFetch(path);
+      if (!res.ok) throw new Error('could not read ' + path);
+      return res.json();
+    },
+    put: async (path, body) => (await socialFetch(path, { method: 'PUT', body: JSON.stringify(body) })).json()
+  };
+  // the password is only at hand now, so a call that the network drops is tried again a little later instead of leaving the
+  // messages locked until the person types the password again. a password that does not open the key is not tried again
+  for (const wait of [0, 3000, 10000]) {
+    if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      await createE2e({ userId, api }).setup(password);
+      window.dispatchEvent(new Event('smp-e2e-changed'));
+      return;
+    } catch (error) {
+      if (/wrong password|does not match/.test((error && error.message) || '')) return;
+      // tried again, then asked for later
+    }
   }
 }
 

@@ -4,12 +4,30 @@ import { Container, Form, Button, Card, ListGroup, Modal, Dropdown } from 'react
 import AuthForm from './AuthForm';
 import { CLIENT_ID, getSocialWsUrl, isSocialEndpoint, onSocialBaseChange, retargetSocialBase, socialUrl } from './socialApi';
 import PipPlayer from './PipPlayer';
+import LayoutEditor from './LayoutEditor';
+import ChangesModal from './ChangesModal';
+import { getUiScale, setUiScale, stepUiScale, scalePercent } from './uiScale';
+import { makeEntry, loadHistory, saveHistory, pushEntry, dropEntry, undoOnPlaylists, undoOnQueue, keysOf } from './undoHistory';
 import Marquee from './Marquee';
+import RemoteBars from './RemoteBars';
+import LyricsMode from './LyricsMode';
+import { loadDominantColor } from './thumbColor';
+import ColorPicker from './ColorPicker';
+import { identifyTrack } from './songIdentity';
+import Wrapped from './Wrapped';
+import demoWrapped from './wrappedDemo';
+import { buildTrackIndex } from './wrappedThumbs';
 import { applyAppIconColor } from './appIcon';
-import { isAndroidApp, onPictureInPicture, isTauriApp, sendNowPlaying, sendVisualizerFrame, onMiniplayerControl, onMiniplayerReady, saveFileWithDialog, getDefaultDownloadsDir, chooseDownloadsFolder, saveFileToFolder, applyShortcutPrefs, frontendLog, openExternalUrl, pickTextFile, setMiniplayerEnabled } from './tauriApi';
+import { isAndroidApp, onPictureInPicture, isTauriApp, sendNowPlaying, sendVisualizerFrame, onMiniplayerControl, onMiniplayerReady, saveFileWithDialog, getDefaultDownloadsDir, chooseDownloadsFolder, saveFileToFolder, applyShortcutPrefs, frontendLog, openExternalUrl, pickTextFile, setMiniplayerEnabled, setWallpaperEnabled, sendWallpaperFrame, onWallpaperSignal } from './tauriApi';
+import { buildSpectrum, buildWave, packFrame } from './wallpaperFrame';
 import { createE2e, e2eSupported, isEnvelope, isRoomEnvelope } from './e2e';
-import { DISCOVER_AHEAD, aheadCount, pickSeeds, rankCandidates, trimReservoir } from './discover';
-import { createBeatDetector } from './beat';
+import { DISCOVER_AHEAD, aheadCount, pickSeeds, rankCandidates, trimReservoir, loadAdded, saveAdded } from './discover';
+import { visibleInterval } from './visibleInterval';
+import { steadyInterval } from './steadyTimer';
+import { explainFailure } from './playbackWhy';
+import { createVizDrive } from './vizDrive';
+import { barAmp } from './barScale';
+import { createVisualizerRenderers } from './vizRenderers';
 import { pickWithRecencyPenalty, recordPlayed } from './shuffle';
 import { AUDIO_ACCEPT, addLocalFile, clearLocalFiles, getLocalFileRecord, isLocalTrack, localCoverUrl, localFileIds, localFileSizes, localFileUrl, looksLikeAudio, refreshLocalFiles, saveLocalBlob, subscribeLocalFiles } from './localAudio';
 import { fetchBlob, sendFile } from './roomFiles';
@@ -325,6 +343,34 @@ function writeLocalJSON(key, value) {
   }
 }
 
+// where the player was in the song it was on, kept on the device next to the queue (music_queue_state), so closing the app and opening it
+// again lands on the same song at the same second. it is only used for the song that the remembered queue points at
+const RESUME_SAVE_MS = 5000;
+const RESUME_MIN_SECONDS = 3;
+const RESUME_END_MARGIN = 3;
+function resumeKey(uid) {
+  return `music_resume:${uid || 'guest'}`;
+}
+function writeResume(uid, videoId, time, duration) {
+  if (!videoId || !Number.isFinite(time) || time < 0) return;
+  writeLocalJSON(resumeKey(uid), { videoId, time, duration: Number.isFinite(duration) ? duration : 0, at: Date.now() });
+}
+function clearResume(uid) {
+  try { localStorage.removeItem(resumeKey(uid)); } catch { /* nothing to clear */ }
+}
+function rememberedSpot(uid) {
+  const state = readLocalJSON(`music_queue_state:${uid || 'guest'}`, null);
+  const spot = readLocalJSON(resumeKey(uid), null);
+  const track = state && Array.isArray(state.queue) && typeof state.playIndex === 'number' ? state.queue[state.playIndex] : null;
+  if (!track || !spot || spot.videoId !== track.videoId) return null;
+  const time = Number(spot.time);
+  const duration = Number(spot.duration) || 0;
+  // the first seconds are not worth a jump, and a song that was almost over starts again from the top
+  if (!Number.isFinite(time) || time < RESUME_MIN_SECONDS) return null;
+  if (duration > 0 && time > duration - RESUME_END_MARGIN) return null;
+  return { videoId: spot.videoId, currentTime: time, duration };
+}
+
 function getCached(key) {
   const item = SEARCH_CACHE.get(key);
   if (item && Date.now() - item.timestamp < CACHE_TTL) {
@@ -343,7 +389,10 @@ function setCached(key, data) {
 }
 
 
-const EQ_PRESETS = {
+// the presets move every band half as far from flat as the first version did. the bands stack (a preset peaked at 12 dB on top of the
+// music), and the old amounts pushed loud tracks past full scale, so they clipped. the sliders still go from -12 to 12
+const EQ_PRESET_STRENGTH = 0.5;
+const EQ_PRESET_SHAPES = {
   flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
   bass: [8, 6, 4, 2, 0, 0, 0, 0, 0, 0],
   treble: [0, 0, 0, 0, 2, 4, 6, 8, 8, 8],
@@ -355,6 +404,9 @@ const EQ_PRESETS = {
   classical: [6, 5, 4, 3, 2, 2, 3, 4, 5, 6],
   electronic: [7, 5, 3, 2, 1, 3, 5, 7, 8, 7]
 };
+const EQ_PRESETS = Object.fromEntries(
+  Object.entries(EQ_PRESET_SHAPES).map(([name, bands]) => [name, bands.map((db) => db * EQ_PRESET_STRENGTH)])
+);
 
 const VISUALIZER_PRESETS = [
   { key: 'none', label: 'background', description: 'no animation, just the plain background' },
@@ -366,9 +418,8 @@ const VISUALIZER_PRESETS = [
   { key: 'pulseGrid', label: 'pulse grid', description: 'a grid that lights up with the spectrum' },
   { key: 'network', label: 'network', description: 'drifting nodes connected by lines' },
   { key: 'mirrorSpectrum', label: 'mirror spectrum', description: 'bars mirrored above and below center' },
-  { key: 'orbit', label: 'orbit', description: 'dots orbiting the center, pulsing with bass' },
-  { key: 'flowField', label: 'flow field', description: 'smooth flowing wavy bands' },
-  { key: 'minimalPulse', label: 'minimal pulse', description: 'a single clean pulsing ring' }
+  { key: 'minimalPulse', label: 'minimal pulse', description: 'a single clean pulsing ring' },
+  { key: 'runner', label: 'corridor', description: 'a wire corridor lit softly from its walls, the lines thin out and blur with distance and a ring passes on every beat' }
 ];
 
 const REPEAT_MODES = {
@@ -453,6 +504,12 @@ function TrackThumbnail({ track, className, alt }) {
       onError={() => setTier((t) => t + 1)}
     />
   );
+}
+
+// a song name inside a toast, cut off when it is long
+function clipText(text, max = 40) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  return clean.length > max ? clean.slice(0, max - 3) + '...' : clean;
 }
 
 // icon buttons using the exact same rgb for both border and icon made the
@@ -659,10 +716,14 @@ function devicePlatform() {
 
 // a phone and a computer next to a name. each one is lit while that person has the app open on
 // that kind of device, so one lit, both lit or none lit is easy to see
-function PlatformIcons({ platforms }) {
+function PlatformIcons({ platforms, online = false }) {
   const has = (kind) => Array.isArray(platforms) && platforms.includes(kind);
   const lit = '#22c55e';
   const dim = '#4b5563';
+  // online but nothing known about the device (an older app): one green dot, the two grey icons would say the person is not here
+  if (online && !has('mobile') && !has('pc')) {
+    return <span title="online" data-online-dot style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: lit, marginLeft: '7px', verticalAlign: 'middle' }} />;
+  }
   let title = 'not on a phone or a computer';
   if (has('mobile') && has('pc')) title = 'on a phone and a computer';
   else if (has('mobile')) title = 'on a phone';
@@ -792,6 +853,20 @@ function toIsoTimestamp(value) {
 }
 
 const E2E_LOCKED_NOTE = '[private message, unlock your messages to read it]';
+const E2E_OPENING_NOTE = '[private message, opening it]';
+// every note a message can carry instead of its text (the app's own and the ones the server hands to an app that says it can not open them)
+const isNoteText = (value) => typeof value === 'string' && /^\[private (room )?message[^\]]*\]$/.test(value);
+// what a device remembered of its chats, without the notes (see isNoteText)
+const dropNotesFromMessages = (byConversation) => {
+  if (!byConversation || typeof byConversation !== 'object') return {};
+  const out = {};
+  Object.keys(byConversation).forEach((key) => {
+    const list = Array.isArray(byConversation[key]) ? byConversation[key].filter((message) => !(message && isNoteText(message.message))) : [];
+    if (list.length) out[key] = list;
+  });
+  return out;
+};
+const dropNotesFromList = (list) => (Array.isArray(list) ? list.map((entry) => (entry && isNoteText(entry.last_message) ? { ...entry, last_message: '' } : entry)) : []);
 const E2E_UNREADABLE_NOTE = '[private message that can not be opened]';
 const E2E_CHANGED_NOTE = '[private message, their security key changed]';
 const ROOM_LOCKED_NOTE = '[private room message, unlock your messages to read it]';
@@ -984,23 +1059,82 @@ async function probeLocalHelper(force = false) {
   return _localHelperProbe;
 }
 
-// is this video still on YouTube? the page asks YouTube itself: 'gone' when it says there is no such video, 'there' for
-// any other answer, 'offline' when nothing answers (a bad connection is not taken for a missing song)
-async function probeYoutube(videoId) {
-  if (!/^[\w-]{11}$/.test(String(videoId || ''))) return 'there';
+// what youtube's own oembed answers for a video: whether anything answered at all, and the status
+async function oembedStatus(videoId) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 4000);
   try {
     const response = await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId), { signal: controller.signal, cache: 'no-store' });
-    return response.status === 404 ? 'gone' : 'there';
+    return { reachable: true, status: response.status };
   } catch {
-    return 'offline';
+    return { reachable: false, status: 0 };
   } finally {
     clearTimeout(timer);
   }
 }
 
+// is this video still on YouTube? reachable: did youtube answer at all. video: 'gone' only when youtube says there is no such video AND
+// answers fine for a video that is always there (a network that answers 404 to everything, a filter or a login page, is not a missing
+// song), 'there' for any other answer, 'unknown' when it could not be told
+const CONTROL_VIDEO = 'dQw4w9WgXcQ';
+async function probeYoutubeDetailed(videoId) {
+  if (!/^[\w-]{11}$/.test(String(videoId || ''))) return { reachable: true, video: 'unknown' };
+  const first = await oembedStatus(videoId);
+  if (!first.reachable) return { reachable: false, video: 'unknown' };
+  if (first.status !== 404) return { reachable: true, video: 'there' };
+  const control = await oembedStatus(CONTROL_VIDEO);
+  if (control.reachable && control.status === 200) return { reachable: true, video: 'gone' };
+  return { reachable: control.reachable, video: 'unknown' };
+}
+
+// 'gone' | 'there' | 'offline' (a bad connection is not taken for a missing song)
+async function probeYoutube(videoId) {
+  const detail = await probeYoutubeDetailed(videoId);
+  return detail.video === 'gone' ? 'gone' : detail.reachable ? 'there' : 'offline';
+}
+
+// asks the audio helper for one byte of the song and reads what it answers: it gives the audio, it refuses with a reason (the helper puts a
+// status, a code and a sentence in its answer), it does not answer, or it takes too long
+async function probeStream(videoId) {
+  let url;
+  try {
+    url = await resolveMediaUrl('/api/stream?videoId=' + encodeURIComponent(videoId));
+  } catch (error) {
+    return { state: 'unreachable', helperDown: true, message: error && error.message };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: controller.signal, cache: 'no-store' });
+    if (response.ok) {
+      try { await response.arrayBuffer(); } catch { /* the one byte is not needed */ }
+      return { state: 'ok', status: response.status };
+    }
+    let data = {};
+    try { data = JSON.parse(await response.text()); } catch { data = {}; }
+    return { state: 'http', status: response.status, code: data.code || '', message: data.error || response.statusText || '', retryAfterSec: data.retryAfterSec };
+  } catch (error) {
+    if (error && error.name === 'AbortError') return { state: 'timeout' };
+    const helperUp = await probeLocalHelper(true).catch(() => false);
+    return { state: 'unreachable', helperDown: !helperUp };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// a song would not load: look at the connection, youtube, the video and the audio helper at the same moment and say what is wrong
+async function diagnoseSong(videoId) {
+  const internet = networkConfirmedDown || (typeof navigator !== 'undefined' && navigator.onLine === false) ? 'down' : 'up';
+  const [youtube, helper] = await Promise.all([probeYoutubeDetailed(videoId), probeStream(videoId)]);
+  return explainFailure({ internet, youtube, helper, phone: isAndroidApp() });
+}
+
 async function resolveApiTarget(url) {
+  // Android starts its loopback helper in MainActivity before the WebView loads;
+  // don't spend a probe request delaying every cold play before using it.
+  if (isMediaEndpoint(url) && isAndroidApp()) {
+    return { url: `${LOCAL_HELPER_URL}${url}`, usingLocalHelper: true };
+  }
   if (isMediaEndpoint(url) && await probeLocalHelper()) {
     return {
       url: `${LOCAL_HELPER_URL}${url}`,
@@ -1345,6 +1479,9 @@ function spotifyHelperUrl() {
   return `${own ? own.origin : ''}${path}`;
 }
 
+// how long the unlock button waits for the server before it says that it is not answering
+const UNLOCK_WAIT_MS = 20000;
+
 // the version of the installer that a signed update list offers for a platform ('android' or 'windows'), or '' when it has none. a
 // screens only release lists the installers of an earlier release (the entry says which, and so does the release address in it),
 // so what an app compares with its own version is this, not the version of the list: an app that has that installer is not asked
@@ -1427,9 +1564,11 @@ function ResizableListGroup({ storageKey, defaultHeight, minHeight = 120, childr
   const startDrag = (event) => {
     event.preventDefault();
     const startY = event.clientY;
+    // pointer and box sizes are in screen pixels, the height written below is in interface pixels (bigger or smaller with the ui size)
+    const zoom = getUiScale() || 1;
     // start from the height it is showing now, not the stored max, so a short
     // list does not jump on the first move
-    const startHeight = Math.max(minHeight, listRef.current ? listRef.current.getBoundingClientRect().height : height);
+    const startHeight = Math.max(minHeight, listRef.current ? listRef.current.getBoundingClientRect().height / zoom : height);
     let latest = startHeight;
 
     // the height is written as it changes, so it is the one that was left even when the release is never seen
@@ -1442,7 +1581,7 @@ function ResizableListGroup({ storageKey, defaultHeight, minHeight = 120, childr
       }
     };
     const onMove = (moveEvent) => {
-      latest = Math.max(minHeight, Math.min(2400, startHeight + (moveEvent.clientY - startY)));
+      latest = Math.max(minHeight, Math.min(2400, startHeight + (moveEvent.clientY - startY) / zoom));
       setHeight(latest);
       remember();
     };
@@ -1797,10 +1936,35 @@ const QueueList = React.memo(function QueueList({
   discoverOn = false,
   onToggleDiscover = null
 }) {
+  // the search above the list: songs whose title or artist has every word typed. the rows keep their real place in the queue
+  // (idx), so playing, removing and the playing mark work the same with the list filtered
+  const [filter, setFilter] = useState('');
+  const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  const shown = words.length
+    ? queue.map((item, idx) => ({ item, idx })).filter(({ item }) => {
+      const hay = `${item.title || ''} ${item.author || ''}`.toLowerCase();
+      return words.every((word) => hay.includes(word));
+    })
+    : queue.map((item, idx) => ({ item, idx }));
   return (
     <>
+      <Form.Control
+        type="text"
+        data-queue-search
+        value={filter}
+        placeholder="queue search"
+        onChange={(event) => setFilter(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') setFilter('');
+          if (event.key === 'Enter' && shown.length) onPlayTrack(shown[0].idx);
+        }}
+        spellCheck={false}
+        autoComplete="off"
+        className="modern-input"
+        style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '8px' }}
+      />
       <ResizableListGroup storageKey="queue" defaultHeight={240}>
-        {queue.map((item, idx) => (
+        {shown.map(({ item, idx }) => (
           <QueueRow
             key={`${item.videoId || idx}-${idx}`}
             item={item}
@@ -1926,7 +2090,12 @@ const QueueList = React.memo(function QueueList({
         <Button
           variant="outline-light"
           size="sm"
-          onClick={(event) => jumpToPlayingRow(event.currentTarget)}
+          onClick={(event) => {
+            const button = event.currentTarget;
+            // a search that hides the playing song is cleared first, so there is a row to scroll to
+            if (words.length) { setFilter(''); setTimeout(() => jumpToPlayingRow(button), 80); return; }
+            jumpToPlayingRow(button);
+          }}
           disabled={currentIndex < 0 || currentIndex >= queue.length}
           title="scroll the queue to the song that is playing"
           style={{
@@ -1942,7 +2111,7 @@ const QueueList = React.memo(function QueueList({
           jump to playing
         </Button>
         <div className="text-muted small text-end" style={{ fontSize: '11px' }}>
-          {queue.length} {queue.length === 1 ? 'song' : 'songs'}
+          {words.length ? `${shown.length} of ${queue.length}` : `${queue.length} ${queue.length === 1 ? 'song' : 'songs'}`}
         </div>
       </div>
     </>
@@ -1954,6 +2123,8 @@ export default function App({
   themeColor: parentThemeColor,
   debugMode: parentDebugMode,
   onThemeColorChange,
+  onAutoThemeColor,
+  baseThemeColor,
   onDebugModeToggle,
   hideListening = false,
   onHideListeningToggle,
@@ -1983,7 +2154,11 @@ export default function App({
   const [videoInfo, setVideoInfo] = useState(null);
   const [queue, setQueue] = useState(() => readLocalJSON(`music_queue_state:${user?.id || 'guest'}`, {}).queue || []);
 
-  const [currentIndex, setCurrentIndex] = useState(-1);
+  // the queue's highlighted row starts on the song the player opens on
+  const [currentIndex, setCurrentIndex] = useState(() => {
+    const remembered = readLocalJSON(`music_queue_state:${user?.id || 'guest'}`, {}).playIndex;
+    return typeof remembered === 'number' && remembered >= 0 ? remembered : -1;
+  });
 
   const [isQueueRunning, setIsQueueRunning] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
@@ -2011,7 +2186,11 @@ export default function App({
   const [shuffle, setShuffle] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).shuffle ?? false);
   const [repeatMode, setRepeatMode] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).repeatMode ?? 'off');
   const [volume, setVolume] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).volume ?? 1);
-  const [trackProgress, setTrackProgress] = useState({ current: 0, duration: 0 });
+  // the bar opens where the last song stopped (the song itself is the one the remembered queue points at)
+  const [trackProgress, setTrackProgress] = useState(() => {
+    const spot = rememberedSpot(user?.id);
+    return spot ? { current: spot.currentTime, duration: spot.duration } : { current: 0, duration: 0 };
+  });
   const [currentTrack, setCurrentTrack] = useState(null);
   const [isMuted, setIsMuted] = useState(() => readLocalJSON(`music_player_prefs:${user?.id || 'guest'}`, {}).isMuted ?? false);
 
@@ -2023,8 +2202,10 @@ export default function App({
 
   // the app icon follows the theme color: the home screen shortcut on the phone,
   // the window on the computer, the tab in a browser
+  // it waits a moment so a slider that is still moving does not redraw it at every step. on the computer that is a fraction of a
+  // second, the phone's home screen shortcut is a system call that android may limit, so it keeps the longer wait
   useEffect(() => {
-    const timer = setTimeout(() => { applyAppIconColor(themeColor); }, 600);
+    const timer = setTimeout(() => { applyAppIconColor(themeColor); }, isAndroidApp() ? 600 : 120);
     return () => clearTimeout(timer);
   }, [themeColor.r, themeColor.g, themeColor.b]);
 
@@ -2082,6 +2263,19 @@ export default function App({
   const shibbyOpenRef = useRef(() => false);
   const keepOfferRef = useRef(() => {});
   const unavailableIdsRef = useRef(new Set());
+  // a song discover added becomes one of the person's own once they show they like it (see where it is set, next to discoverRef)
+  const keepDiscoverRef = useRef(() => {});
+  // the ids discover added on this device that were not kept (loaded from the device's own storage the first time it is needed)
+  const discoverAddedRef = useRef(null);
+  const discoverAdded = () => {
+    if (!discoverAddedRef.current) discoverAddedRef.current = loadAdded(typeof window !== 'undefined' ? window.localStorage : { getItem: () => null });
+    return discoverAddedRef.current;
+  };
+  // a song that would not load, once YouTube was asked about it: what to do (see failedLoadRef below), and which songs were tried again lately
+  const failedLoadRef = useRef(() => false);
+  // the last cause that was said in a popup for the whole queue (no connection, the helper down, a robot check), and when
+  const causeNoticeRef = useRef({ kind: '', at: 0 });
+  const retriedLoadRef = useRef(new Map());
 
   
   const [suggestions, setSuggestions] = useState([]);
@@ -2094,6 +2288,9 @@ export default function App({
   // where a song that is not playing yet is stuck: waking the audio helper,
   // finding the song on youtube, loading its first part, or buffering later on
   const [bufferStage, setBufferStage] = useState('');
+  // what is known about a song that is loading: seconds of it already loaded ahead of the spot, how fast the loaded part grows (seconds of
+  // song per second, 1 is the speed it plays at), how long nothing has changed, how many times it was asked for again
+  const [loadInfo, setLoadInfo] = useState(null);
   // what the player says while it waits, in terms of what it is waiting for
   // this text is for a process that is hanging, so it says nothing for the first
   // few seconds: waiting to start, the helper answering or the first part arriving
@@ -2107,15 +2304,25 @@ export default function App({
     if (shared && preparing) return describeSyncWaiting(waiting, currentUserId, seconds);
     switch (stage) {
       case 'helper':
-        return `the audio helper is slow to answer... ${seconds}s`;
+        return `waiting for the audio helper, ${seconds}s`;
       case 'source':
         if (seconds < 4) return 'finding the song on youtube...';
-        if (seconds < 12) return `youtube is slow to answer, still finding the song... ${seconds}s`;
-        return `youtube is still not answering well, trying again... ${seconds}s`;
+        if (seconds < 12) return `youtube is slow to answer, ${seconds}s`;
+        return `error: no answer from youtube in ${seconds}s, still trying`;
       case 'start':
-        return seconds < 8 ? 'loading the first part of the song...' : `slow connection, still loading the first part... ${seconds}s`;
-      case 'buffering':
-        return `slow connection, buffering... ${seconds}s`;
+      case 'buffering': {
+        const tries = loadInfo && loadInfo.retry > 0 ? ` (try ${loadInfo.retry} of 3)` : '';
+        if (loadInfo && loadInfo.quiet >= 6) {
+          return loadInfo.retry >= 3
+            ? `error: nothing arrived for ${loadInfo.quiet}s after 3 tries`
+            : `nothing arrived for ${loadInfo.quiet}s, asking again in ${Math.max(1, 10 - loadInfo.quiet)}s${tries}`;
+        }
+        if (stage === 'start' && seconds < 8) return 'loading the first part of the song...';
+        if (loadInfo && loadInfo.rate !== null) {
+          return `slow connection: ${Math.round(loadInfo.ahead)}s loaded, arriving at ${loadInfo.rate.toFixed(1)}x (needs 1x)${tries}`;
+        }
+        return stage === 'start' ? `still loading, ${seconds}s${tries}` : `buffering, ${seconds}s${tries}`;
+      }
       default:
         return `still getting audio ready... ${seconds}s`;
     }
@@ -2157,7 +2364,12 @@ export default function App({
   const [eqEnabled, setEqEnabled] = useState(() => readLocalJSON(`music_eq:${user?.id || 'guest'}`, {}).eqEnabled ?? false);
   const [eqValues, setEqValues] = useState(() => readLocalJSON(`music_eq:${user?.id || 'guest'}`, {}).eqValues ?? EQ_PRESETS.flat);
   const [selectedPreset, setSelectedPreset] = useState(() => readLocalJSON(`music_eq:${user?.id || 'guest'}`, {}).selectedPreset ?? 'flat');
-  const [visualizerPreset, setVisualizerPreset] = useState(() => localStorage.getItem(`music_visualizer_preset:${user?.id || 'guest'}`) || 'wave');
+  // a saved drawing that no longer exists (orbit and flow field were taken out) becomes the particles
+  const [visualizerPreset, setVisualizerPreset] = useState(() => {
+    const saved = localStorage.getItem(`music_visualizer_preset:${user?.id || 'guest'}`);
+    if (!saved) return 'wave';
+    return VISUALIZER_PRESETS.some((preset) => preset.key === saved) ? saved : 'particles';
+  });
 
   
   const [showToast, setShowToast] = useState(null);
@@ -2309,6 +2521,9 @@ export default function App({
   }, []);
   const [otherDevices, setOtherDevices] = useState({});
   const deviceCommandRef = useRef(() => {});
+  // the bars of what another device plays (it sends them while this one asks, see RemoteBars.js) and who is asking this device for its own
+  const remoteBarsRef = useRef(null);
+  const vizWatchersRef = useRef(new Map());
   const [, setRemoteTick] = useState(0);
   // the other device that is playing (or the one that changed last), with where
   // it has got to by now
@@ -2332,8 +2547,7 @@ export default function App({
   const remotePlaying = Boolean(remoteNow && remoteNow.playing);
   useEffect(() => {
     if (!remotePlaying) return undefined;
-    const timer = setInterval(() => setRemoteTick((tick) => tick + 1), 1000);
-    return () => clearInterval(timer);
+    return visibleInterval(() => setRemoteTick((tick) => tick + 1), 1000);
   }, [remotePlaying]);
   const [allUsers, setAllUsers] = useState([]);
   const [friendsList, setFriendsList] = useState([]);
@@ -2345,11 +2559,21 @@ export default function App({
   const [statsBoard, setStatsBoard] = useState([]);
   const [statsFailed, setStatsFailed] = useState(false);
   const [statsRetry, setStatsRetry] = useState(0);
+  // the years that have listening in them (each one has a wrapped), the wrapped story that is open ({ year, data }), and the year being fetched
+  const [statsYears, setStatsYears] = useState([]);
+  const [wrappedView, setWrappedView] = useState(null);
+  const [wrappedLoading, setWrappedLoading] = useState(null);
+  const versionTapsRef = useRef({ count: 0, at: 0 });
+  const [undoHistory, setUndoHistory] = useState(() => loadHistory(window.localStorage, `music_undo:${user?.id || 'guest'}`));
+  const undoHistoryRef = useRef(undoHistory);
+  const [showChanges, setShowChanges] = useState(false);
+  // the size of the interface: ctrl and plus or minus on a computer (uiScale.js), a setting on the phone
+  const [uiScaleNow, setUiScaleNow] = useState(() => getUiScale());
   const [friendRequestActionIds, setFriendRequestActionIds] = useState([]);
   const [conversationList, setConversationList] = useState(() => {
     const stored = localStorage.getItem(`music_conversation_list:${user?.id || 'guest'}`);
     try {
-      return stored ? JSON.parse(stored) : [];
+      return stored ? dropNotesFromList(JSON.parse(stored)) : [];
     } catch {
       return [];
     }
@@ -2366,7 +2590,7 @@ export default function App({
   const [dmMessages, setDmMessages] = useState(() => {
     const stored = localStorage.getItem(`music_dm_messages:${user?.id || 'guest'}`);
     try {
-      return stored ? JSON.parse(stored) : {};
+      return stored ? dropNotesFromMessages(JSON.parse(stored)) : {};
     } catch {
       return {};
     }
@@ -2409,7 +2633,6 @@ export default function App({
   const [showLayoutEditor, setShowLayoutEditor] = useState(false);
   const [layoutEditorTab, setLayoutEditorTab] = useState('main');
   const [layoutDraft, setLayoutDraft] = useState(null);
-  const [draggedTile, setDraggedTile] = useState(null);
   const [draggingPanel, setDraggingPanel] = useState(null);
   const [activeDropColumn, setActiveDropColumn] = useState('');
   const [deleteUserConfirm, setDeleteUserConfirm] = useState(null); // { userId, username }
@@ -2601,6 +2824,11 @@ export default function App({
   const suggestionTimer = useRef(null);
   const latestSearchId = useRef(0);
   const audioRef = useRef(null);
+  // is this the desktop app (answered a moment after the page opens, see isTauriApp), for the loops that cannot wait for a render
+  const isTauriDesktopRef = useRef(false);
+  const [isTauriDesktop, setIsTauriDesktop] = useState(false);
+  // false until the answer to "is this the desktop app" is in, the update check waits for it
+  const [tauriKnown, setTauriKnown] = useState(false);
   const personalProgressBarRef = useRef(null);
   const sharedProgressBarRef = useRef(null);
   const scrubbingRef = useRef(false);
@@ -2611,6 +2839,9 @@ export default function App({
   const analyserRef = useRef(null);
   // a second analyser that does not smooth, only for finding the kick drum (see beat.js)
   const beatAnalyserRef = useRef(null);
+  // the kick and tempo follower of the visualizers. it lives here and not in the drawing effect because that effect starts over for every
+  // theme color step, and a tempo takes a few seconds to find
+  const vizDriveRef = useRef(null);
   const playbackSourceRef = useRef('personal');
   const playbackQueueRef = useRef([]);
   const channelQueueRef = useRef(channelQueue);
@@ -2625,6 +2856,8 @@ export default function App({
   // the player that floats over other apps (phone): ready, needs_permission or off.
   // read again when the app comes back, the permission is given on a system screen
   const [floatingStatus, setFloatingStatus] = useState('');
+  // the live wallpaper of the phone: on (it is the wallpaper), off, or empty (this phone has no live wallpapers, or an older app)
+  const [phoneWallpaper, setPhoneWallpaper] = useState('');
   // the mini player window of the desktop app: on by default, can be switched off
   const [miniPlayerOn, setMiniPlayerOn] = useState(() => {
     try { return window.localStorage.getItem('music_miniplayer') !== 'off'; } catch { return true; }
@@ -2633,6 +2866,38 @@ export default function App({
     try { window.localStorage.setItem('music_miniplayer', miniPlayerOn ? 'on' : 'off'); } catch { /* not remembered */ }
     setMiniplayerEnabled(miniPlayerOn);
   }, [miniPlayerOn]);
+  // the live wallpaper of the computer app (windows): the visualizer behind the desktop icons, off until it is switched on
+  const [wallpaperOn, setWallpaperOn] = useState(() => {
+    try { return window.localStorage.getItem('music_wallpaper') === 'on'; } catch { return false; }
+  });
+  const wallpaperOnRef = useRef(wallpaperOn);
+  wallpaperOnRef.current = wallpaperOn;
+  // false while a window covers the desktop or the screen is locked (the wallpaper side says so): nothing is sent then
+  const wallpaperShownRef = useRef(true);
+  // a wallpaper window that just opened or came back on screen wants the state of the sound even when nothing plays
+  const wallpaperNeedsFrameRef = useRef(true);
+  const wallpaperAskedRef = useRef(false);
+  useEffect(() => {
+    try { window.localStorage.setItem('music_wallpaper', wallpaperOn ? 'on' : 'off'); } catch { /* not remembered */ }
+    // a computer that never had it on is asked nothing (an older installer does not have the command)
+    if (!wallpaperOn && !wallpaperAskedRef.current) return;
+    wallpaperAskedRef.current = true;
+    wallpaperShownRef.current = true;
+    wallpaperNeedsFrameRef.current = true;
+    setWallpaperEnabled(wallpaperOn);
+  }, [wallpaperOn]);
+  useEffect(() => {
+    if (!wallpaperOn) return undefined;
+    return onWallpaperSignal((kind, payload) => {
+      if (kind === 'visible') {
+        wallpaperShownRef.current = payload !== false;
+        if (payload !== false) wallpaperNeedsFrameRef.current = true;
+      } else {
+        wallpaperShownRef.current = true;
+        wallpaperNeedsFrameRef.current = true;
+      }
+    });
+  }, [wallpaperOn]);
   useEffect(() => {
     if (!isAndroidApp()) return undefined;
     const read = () => {
@@ -2640,6 +2905,12 @@ export default function App({
         setFloatingStatus(window.SmpNative.floatingStatus ? String(window.SmpNative.floatingStatus()) : '');
       } catch {
         setFloatingStatus('');
+      }
+      // the live wallpaper of the phone: set on the system's own screen, so it is looked at again whenever the app comes back
+      try {
+        setPhoneWallpaper(window.SmpNative.wallpaperStatus ? String(window.SmpNative.wallpaperStatus()) : '');
+      } catch {
+        setPhoneWallpaper('');
       }
     };
     read();
@@ -2664,9 +2935,14 @@ export default function App({
   // device is not sent straight back
   const lastSyncedPlaylistsRef = useRef('');
   const lastSyncedQueueRef = useRef('');
+  const queueSyncInFlightRef = useRef(0);
+  const queueSyncChainRef = useRef(Promise.resolve());
   // true from the moment of a local edit until it has been saved. an update from
   // another device that lands in that window waits, the local edit goes first
   const playlistSyncPendingRef = useRef(false);
+  const playlistSyncInFlightRef = useRef(0);
+  const playlistSyncTimerActiveRef = useRef(false);
+  const playlistSyncChainRef = useRef(Promise.resolve());
   const queueSyncPendingRef = useRef(false);
   const accountChangeHandlerRef = useRef(() => {});
   const lastAccountLoadAtRef = useRef(0);
@@ -2674,14 +2950,22 @@ export default function App({
   const [syncTick, setSyncTick] = useState(0);
   const volumeRef = useRef(volume);
   const isMutedRef = useRef(isMuted);
-  const MAX_STREAM_RETRIES = 3;
+  // more tries than before, and waiting longer between them (see onStalled): the campus wifi changes the phone's address about once a
+  // minute and a song that was being streamed from the old address needs more than seven seconds to come back
+  const MAX_STREAM_RETRIES = 5;
   // tracks whether the local client recently errored - used to prevent cascading skips from shared sync
   const localStreamErrorRef = useRef(false);
   const localStreamErrorTimerRef = useRef(null);
   // tracks the previous shared player is_playing state - used to detect pause→resume transitions
   const prevSharedPlayingRef = useRef(false);
   // personal player state persistence - saves the last paused position for resume
-  const personalPlayerStateRef = useRef({ videoId: null, currentTime: 0, duration: 0 });
+  // the first play after the app opens starts the remembered song at the remembered second (playTrackAtIndex reads this)
+  const personalPlayerStateRef = useRef(null);
+  if (personalPlayerStateRef.current === null) {
+    personalPlayerStateRef.current = rememberedSpot(user?.id) || { videoId: null, currentTime: 0, duration: 0 };
+  }
+  const resumeUserRef = useRef(user?.id);
+  resumeUserRef.current = user?.id;
   // the song the solo player was on. the solo card keeps showing it, paused, while
   // this device is listening to the room instead
   const lastSoloTrackRef = useRef(null);
@@ -2760,6 +3044,65 @@ export default function App({
     nativeConsoleRef.current[consoleMethod](`[frontend:${entry.category}] ${entry.message}`, entry.details || '');
   }, [appendDebugEntry, debugMode]);
 
+  // a song that says "loading" but does not move: no data arrives and nothing says so (no error, and the stalled event does not come
+  // three times), so the player sat on "loading the first part of the song..." for minutes. while the player is waiting, the element is
+  // looked at every two seconds, and when its position, its buffered data and its state have not changed for ten seconds the song is
+  // asked for again, from where it was. a few tries, then the failure paths that were already there take over
+  useEffect(() => {
+    if (!isBuffering) return undefined;
+    const audio = audioRef.current;
+    if (!audio) return undefined;
+    let last = '';
+    let since = Date.now();
+    const timer = setInterval(() => {
+      if (!audio.getAttribute('src') || playbackSourceRef.current === 'shared') { last = ''; since = Date.now(); return; }
+      if (audio.paused && !autoplayRef.current) { last = ''; since = Date.now(); return; }
+      const end = audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : -1;
+      const signature = `${audio.currentTime.toFixed(1)}|${end.toFixed(1)}|${audio.readyState}|${audio.networkState}`;
+      if (signature !== last) { last = signature; since = Date.now(); return; }
+      if (Date.now() - since < 10000) return;
+      since = Date.now();
+      // nothing was ever loaded: the timeout set when the song was started is on it
+      if (audio.readyState === 0) return;
+      const retryCount = audio._streamRetryCount || 0;
+      if (retryCount >= MAX_STREAM_RETRIES) return;
+      audio._streamRetryCount = retryCount + 1;
+      const resumeAt = audio.currentTime;
+      addDebugLog('error', `loading but nothing moved for 10 s, asking for the song again (${audio._streamRetryCount}/${MAX_STREAM_RETRIES})`, { videoId: currentTrackRef.current && currentTrackRef.current.videoId, resumeAt, readyState: audio.readyState, networkState: audio.networkState }, true);
+      audio._pendingStartTime = resumeAt > 0 ? resumeAt : null;
+      const retrySrc = audio.dataset.lastSrc || audio.src;
+      if (!retrySrc) return;
+      audio.src = retrySrc;
+      audio.dataset.lastSrc = retrySrc;
+      audio.load();
+      last = '';
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [isBuffering, addDebugLog]);
+
+  // what is known about a loading song, once a second, for the text under the controls
+  useEffect(() => {
+    if (!isBuffering) { setLoadInfo(null); return undefined; }
+    const audio = audioRef.current;
+    if (!audio) return undefined;
+    const samples = []; // [time, seconds of the song loaded]
+    let lastSignature = '';
+    let changedAt = Date.now();
+    const timer = setInterval(() => {
+      if (!audio.getAttribute('src')) { setLoadInfo(null); return; }
+      const end = audio.buffered.length ? audio.buffered.end(audio.buffered.length - 1) : 0;
+      const now = Date.now();
+      const signature = `${audio.currentTime.toFixed(1)}|${end.toFixed(1)}|${audio.readyState}`;
+      if (signature !== lastSignature) { lastSignature = signature; changedAt = now; }
+      samples.push([now, end]);
+      while (samples.length > 1 && now - samples[0][0] > 6000) samples.shift();
+      const first = samples[0];
+      const rate = samples.length > 3 && now - first[0] >= 3000 ? Math.max(0, (end - first[1]) / ((now - first[0]) / 1000)) : null;
+      setLoadInfo({ ahead: Math.max(0, end - audio.currentTime), rate, quiet: Math.floor((now - changedAt) / 1000), retry: audio._streamRetryCount || 0 });
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isBuffering]);
+
   const logClient = useCallback((message, details = null, important = false) => {
     addDebugLog('client', message, details, important);
   }, [addDebugLog]);
@@ -2783,14 +3126,15 @@ export default function App({
     const el = debugConsoleRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
+    const zoom = getUiScale() || 1;
     const startX = e.clientX;
     const startY = e.clientY;
-    const startLeft = rect.left;
-    const startTop = rect.top;
+    const startLeft = rect.left / zoom;
+    const startTop = rect.top / zoom;
     const handleMove = (moveEvent) => {
       setDebugConsolePos({
-        x: startLeft + (moveEvent.clientX - startX),
-        y: startTop + (moveEvent.clientY - startY)
+        x: startLeft + (moveEvent.clientX - startX) / zoom,
+        y: startTop + (moveEvent.clientY - startY) / zoom
       });
     };
     const handleUp = () => {
@@ -2802,7 +3146,7 @@ export default function App({
   }, []);
   const debugConsoleButtonStyle = {
     background: '#000',
-    color: '#c0c0c0',
+    color: '#fff',
     border: '1px solid #808080',
     borderRadius: 0,
     padding: '4px 8px',
@@ -2813,12 +3157,62 @@ export default function App({
 
   // one timer for the toast on screen: an older toast's timer used to take a newer toast away early
   const toastTimerRef = useRef(null);
-  const showNotification = useCallback((message, variant = 'info') => {
-    setShowToast({ message, variant });
+  // action: { label, run } puts a button in the toast (undo), and the toast stays long enough to press it
+  const showNotification = useCallback((rawMessage, variant = 'info', action = null) => {
+    // every error reads the same: "error: " and then what went wrong, short
+    const message = variant === 'error' && typeof rawMessage === 'string' && !/^error:/i.test(rawMessage) ? 'error: ' + rawMessage : rawMessage;
+    setShowToast({ message, variant, action });
     clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = setTimeout(() => setShowToast(null), 3000);
+    toastTimerRef.current = setTimeout(() => setShowToast(null), action ? 8000 : 3000);
     addDebugLog('ui', `toast: ${variant}`, { message }, variant === 'error');
   }, [addDebugLog]);
+
+  // ---- recent changes: playlist and queue changes are written down so they can be taken back (undoHistory.js). the toast of a change has
+  // an undo button, ctrl+z takes back the last one, and settings has the whole list
+  const undoStorageKey = `music_undo:${user?.id || 'guest'}`;
+  const undoStorageKeyRef = useRef(undoStorageKey);
+  undoStorageKeyRef.current = undoStorageKey;
+  const commitHistory = useCallback((next) => {
+    undoHistoryRef.current = next;
+    setUndoHistory(next);
+    saveHistory(window.localStorage, undoStorageKeyRef.current, next);
+  }, []);
+  const undoChangeRef = useRef(() => {});
+  const undoActionFor = useCallback((entry) => ({ label: 'undo', run: () => undoChangeRef.current(entry.id) }), []);
+  const recordChange = useCallback((kind, label, data) => {
+    const entry = makeEntry(kind, label, data);
+    commitHistory(pushEntry(undoHistoryRef.current, entry));
+    return entry;
+  }, [commitHistory]);
+  useEffect(() => {
+    const loaded = loadHistory(window.localStorage, undoStorageKey);
+    undoHistoryRef.current = loaded;
+    setUndoHistory(loaded);
+  }, [undoStorageKey]);
+  // the size changed (the keys, or the phone setting): the setting follows it, and a computer says what it is now
+  useEffect(() => {
+    const onScale = (event) => {
+      setUiScaleNow(event.detail);
+      if (!isAndroidApp()) showNotification(`size ${scalePercent(event.detail)}`, 'info');
+    };
+    window.addEventListener('smp-ui-scale', onScale);
+    return () => window.removeEventListener('smp-ui-scale', onScale);
+  }, [showNotification]);
+  // ctrl+z takes back the last change, unless the cursor is in a text box (that one has its own undo)
+  useEffect(() => {
+    const onKey = (event) => {
+      if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || String(event.key).toLowerCase() !== 'z') return;
+      const target = event.target;
+      const tag = target && target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (target && target.isContentEditable)) return;
+      const latest = undoHistoryRef.current[0];
+      if (!latest) return;
+      event.preventDefault();
+      undoChangeRef.current(latest.id);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // the phone has no mini player until the app is allowed to display over other apps.
   // said once, the first time something plays
@@ -2904,8 +3298,9 @@ export default function App({
           thumbnail: currentTrack.thumbnail || '',
           source: playbackSource,
           playing: isPlaying,
-          position: audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
-          duration: audio && Number.isFinite(audio.duration) ? audio.duration : 0
+          // the app just opened on the remembered song: nothing is loaded yet, so the position is the remembered one
+          position: audio && audio.src && Number.isFinite(audio.currentTime) ? audio.currentTime : (personalPlayerStateRef.current.videoId === currentTrack.videoId ? personalPlayerStateRef.current.currentTime : 0),
+          duration: audio && audio.src && Number.isFinite(audio.duration) ? audio.duration : (personalPlayerStateRef.current.videoId === currentTrack.videoId ? personalPlayerStateRef.current.duration : 0)
         } : null
       }));
     };
@@ -2915,6 +3310,122 @@ export default function App({
     return () => clearInterval(timer);
   }, [isConnected, user, currentTrack, isPlaying, playbackSource, deviceInfo]);
 
+  // this device shows what another one plays: it asks that device for the bars of its sound every few seconds, for as long as it is looking
+  const remoteClientIdNow = remoteNow ? remoteNow.clientId : '';
+  useEffect(() => {
+    if (!isConnected || !remotePlaying || !remoteClientIdNow) return undefined;
+    const ask = () => {
+      const socket = wsRef.current;
+      if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'device_viz_watch', to: remoteClientIdNow }));
+    };
+    ask();
+    return visibleInterval(ask, 4000);
+  }, [isConnected, remotePlaying, remoteClientIdNow]);
+
+  // and this device plays something that another one shows: while one asks, the bars of the sound go out about ten times a second (the same
+  // analyser and the same bar positions as the drawings, 32 bars, one byte each). the timer only runs while somebody watches (the request
+  // starts it, nobody asking for nine seconds stops it) and it is one that keeps its pace with the screen off: with the phone in a pocket the
+  // ordinary timers of a hidden page slow to one tick a second and then one a minute, and the other device saw bars that never moved
+  const vizKickRef = useRef(() => {});
+  useEffect(() => {
+    if (!isConnected || !isPlaying) { vizKickRef.current = () => {}; return undefined; }
+    let bytes = null;
+    let stop = null;
+    let turn = 0;
+    const send = () => {
+      const watchers = vizWatchersRef.current;
+      const now = Date.now();
+      watchers.forEach((until, id) => { if (until < now) watchers.delete(id); });
+      if (!watchers.size) {
+        if (stop) { stop(); stop = null; }
+        return;
+      }
+      const socket = wsRef.current;
+      const analyser = analyserRef.current;
+      if (!analyser || !socket || socket.readyState !== WebSocket.OPEN) return;
+      if (!bytes || bytes.length !== analyser.frequencyBinCount) bytes = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(bytes);
+      // one watcher at a time, in turn (the server lets a device send a bars message every 40 ms at the most, whoever it goes to)
+      const ids = Array.from(watchers.keys());
+      const slot = turn % Math.max(2, ids.length);
+      turn += 1;
+      if (slot >= ids.length) return;
+      const rate = audioContextRef.current ? audioContextRef.current.sampleRate : 44100;
+      const bars = [];
+      for (let i = 0; i < 32; i += 1) bars.push(Math.round(Math.max(0, Math.min(1, barAmp(i, 32, bytes, rate))) * 255));
+      socket.send(JSON.stringify({ type: 'device_viz', to: ids[slot], bars }));
+    };
+    vizKickRef.current = () => { if (!stop) stop = steadyInterval(send, 45); };
+    if (vizWatchersRef.current.size) vizKickRef.current();
+    return () => {
+      vizKickRef.current = () => {};
+      if (stop) { stop(); stop = null; }
+    };
+  }, [isConnected, isPlaying]);
+
+  // ---- the lyrics screen (LyricsMode.js) and the thumbnail color setting
+  const [showLyrics, setShowLyrics] = useState(false);
+  const [themeFromArt, setThemeFromArt] = useState(() => {
+    try { return window.localStorage.getItem('music_theme_from_art') === 'on'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('music_theme_from_art', themeFromArt ? 'on' : 'off'); } catch { /* kept for this visit */ }
+  }, [themeFromArt]);
+  // "real artist": a song uploaded by somebody who is not the artist is credited to the artist and its real title in what the player tells the server it listens to
+  // (the stats, the friends). found by the title of the song and its length, off by default (it asks LRCLIB and iTunes about every song that plays)
+  const [creditReal, setCreditReal] = useState(() => {
+    try { return window.localStorage.getItem('music_real_artist') === 'on'; } catch { return false; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem('music_real_artist', creditReal ? 'on' : 'off'); } catch { /* kept for this visit */ }
+  }, [creditReal]);
+  const [identities, setIdentities] = useState({});
+  const creditLength = trackProgress && trackProgress.duration > 0 ? Math.round(trackProgress.duration) : 0;
+  const creditVideoId = currentTrack ? currentTrack.videoId : '';
+  useEffect(() => {
+    if (!creditReal || !currentTrack || isLocalTrack(currentTrack) || !creditLength) return undefined;
+    if (identities[creditVideoId] !== undefined) return undefined;
+    let alive = true;
+    identifyTrack(currentTrack, creditLength).then((found) => {
+      if (!alive) return;
+      setIdentities((all) => (all[creditVideoId] !== undefined ? all : { ...all, [creditVideoId]: found || null }));
+    });
+    return () => { alive = false; };
+  }, [creditReal, creditVideoId, creditLength]);
+
+  // with the setting on, the theme color is the most prevalent color of the thumbnail of the song that plays (the pictures it tries are the ones the card
+  // shows). a picture with no color in it, or one that can not be read, leaves the color that was chosen. off: the chosen color is back
+  // the color chosen with the slider (under the thumbnail color): the thumbnail's color is made to lean on it
+  const baseColorRef = useRef(baseThemeColor || null);
+  baseColorRef.current = baseThemeColor || null;
+  const artVideoId = currentTrack ? currentTrack.videoId : '';
+  const artThumb = currentTrack ? currentTrack.thumbnail : '';
+  useEffect(() => {
+    if (!onAutoThemeColor) return undefined;
+    if (!themeFromArt || !currentTrack) { onAutoThemeColor(null); return undefined; }
+    let alive = true;
+    const timer = setTimeout(async () => {
+      const local = isLocalTrack(currentTrack);
+      let urls = [];
+      if (local) {
+        try { urls = [await localCoverUrl(currentTrack.videoId)].filter(Boolean); } catch { urls = []; }
+      } else {
+        urls = [
+          getTrackThumbnail(currentTrack),
+          currentTrack.videoId ? `https://img.youtube.com/vi/${currentTrack.videoId}/hqdefault.jpg` : null,
+          currentTrack.videoId ? `https://img.youtube.com/vi/${currentTrack.videoId}/mqdefault.jpg` : null
+        ].filter(Boolean);
+      }
+      for (const url of urls) {
+        const color = await loadDominantColor(url, baseColorRef.current);
+        if (!alive) return;
+        if (color) { onAutoThemeColor(color); return; }
+      }
+      if (alive) onAutoThemeColor(null);
+    }, 150);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [themeFromArt, artVideoId, artThumb, onAutoThemeColor, baseThemeColor && baseThemeColor.r, baseThemeColor && baseThemeColor.g, baseThemeColor && baseThemeColor.b]);
+
   // ---- private (end to end encrypted) direct messages, see e2e.js
   // off: not signed in, or this app can not do it. locked: this device does not have the account's key yet, the
   // password brings it. ready: messages are locked and opened here
@@ -2923,6 +3434,8 @@ export default function App({
   const [e2ePassword, setE2ePassword] = useState('');
   const [e2eBusy, setE2eBusy] = useState(false);
   const e2eRef = useRef(null);
+  const e2eStateRef = useRef('off');
+  e2eStateRef.current = e2eState;
   useEffect(() => {
     // signing in set the key up in the background
     const again = () => setE2eEpoch((n) => n + 1);
@@ -2940,19 +3453,65 @@ export default function App({
       userId: currentUserId,
       api: {
         get: (path) => fetchJson(path),
-        put: (path, body) => fetchJson(path, { method: 'PUT', body: JSON.stringify(body) })
+        put: (path, body) => fetchJson(path, { method: 'PUT', body: JSON.stringify(body) }),
+        post: (path, body) => fetchJson(path, { method: 'POST', body: JSON.stringify(body) })
       }
     });
     e2eRef.current = e2e;
+    // the key reaches a device that does not have it from another device of the account (nothing is typed): the device asks, a device that has
+    // the key answers, and the server only passes locked data on (see e2e.js, requestKey). the password box is only for when no device answers
+    let stopTimers = [];
     if (!e2e.ready) {
-      setE2eState('locked');
-      return () => { cancelled = true; };
+      setE2eState('opening');
+      let handle = null;
+      let handleAt = 0;
+      let busy = false;
+      // window.__smpOpenWaitMs is only for the tests
+      const giveUpAt = setTimeout(() => { if (!cancelled && !e2e.ready) setE2eState('locked'); }, Number(window.__smpOpenWaitMs) || 45000);
+      stopTimers.push(() => clearTimeout(giveUpAt));
+      const ask = async () => {
+        if (busy || cancelled || e2e.ready) return;
+        busy = true;
+        try {
+          if (!handle || Date.now() - handleAt > 13 * 60 * 1000) {
+            handle = await e2e.requestKey();
+            handleAt = Date.now();
+          }
+          const got = await e2e.collectKey(handle);
+          if (got && !cancelled) {
+            stopTimers.forEach((stop) => stop());
+            stopTimers = [];
+            setE2eState('ready');
+          }
+        } catch (error) {
+          handle = null;
+          // the account has no key at all yet: nothing can answer, the password makes the first one
+          if (error && error.status === 409 && !cancelled) setE2eState('locked');
+        }
+        busy = false;
+      };
+      stopTimers.push(visibleInterval(ask, 3000));
+      return () => { cancelled = true; stopTimers.forEach((stop) => stop()); };
     }
+    // this device has the key: it answers the devices that ask for it, when it starts, when one asks (the server says so over the socket) and now and then
+    let answering = false;
+    const answer = () => {
+      if (answering || cancelled || !e2e.ready) return;
+      answering = true;
+      e2e.answerRequests().catch(() => { /* asked again */ }).then(() => { answering = false; });
+    };
+    const onRequest = () => answer();
+    window.addEventListener('smp-e2e-transfer', onRequest);
+    let stopAnswer = null;
     e2e.check()
-      .then((ok) => { if (!cancelled) setE2eState(ok ? 'ready' : 'locked'); })
+      .then((ok) => {
+        if (cancelled) return;
+        setE2eState(ok ? 'ready' : 'locked');
+        if (ok) stopAnswer = visibleInterval(answer, 60000);
+      })
       // no connection: the device keeps working with the key it has
       .catch(() => { if (!cancelled) setE2eState('ready'); });
-    return () => { cancelled = true; };
+    return () => { cancelled = true; window.removeEventListener('smp-e2e-transfer', onRequest); if (stopAnswer) stopAnswer(); };
   }, [currentUserId, e2eEpoch]);
 
   // ---- private room chat (see roomKeys.js on the server): the room has one key and every member holds a locked copy of it, the
@@ -3090,6 +3649,7 @@ export default function App({
         const mine = await fetchJson('/api/stats?range=' + statsRange + '&tz=' + tz);
         if (cancelled) return;
         setStatsData(mine.stats || null);
+        setStatsYears(Array.isArray(mine.years) ? mine.years : []);
         setStatsFailed(!mine.stats);
       } catch (error) {
         // the numbers on screen stay, and when there are none yet the page says so
@@ -3100,6 +3660,27 @@ export default function App({
     const timer = setInterval(load, 30000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [activeTab, currentUserId, statsRange, statsRetry]);
+
+  const openWrapped = async (year) => {
+    if (wrappedLoading !== null) return;
+    setWrappedLoading(year);
+    try {
+      const result = await fetchJson('/api/wrapped?year=' + year + '&tz=' + (-new Date().getTimezoneOffset()));
+      if (result && result.wrapped && result.wrapped.totals.seconds > 0) setWrappedView({ year, data: result.wrapped });
+      else showNotification('nothing played in ' + year, 'error');
+    } catch (error) {
+      showNotification('could not load your ' + year + ' wrapped', 'error');
+    } finally {
+      setWrappedLoading(null);
+    }
+  };
+
+  // the songs this device knows, for the pictures in the wrapped story (the server only has the video of what was played lately)
+  const wrappedKnownLists = () => [queue, ...(Array.isArray(playlists) ? playlists.map((playlist) => playlist.tracks) : []), currentTrack ? [currentTrack] : []];
+  const wrappedIndex = useMemo(
+    () => (wrappedView ? buildTrackIndex([queue, ...(Array.isArray(playlists) ? playlists.map((playlist) => playlist.tracks) : []), currentTrack ? [currentTrack] : []]) : null),
+    [wrappedView, queue, playlists, currentTrack]
+  );
 
   // signing out: the opened copies of the messages go from this device together with the key
   const hadUserRef = useRef(false);
@@ -3121,7 +3702,7 @@ export default function App({
   const openDirectRecord = useCallback(async (record) => {
     if (!record || !isEnvelope(record.message)) return record;
     const e2e = e2eRef.current;
-    if (!e2e || !e2e.ready) return { ...record, message: E2E_LOCKED_NOTE };
+    if (!e2e || !e2e.ready) return { ...record, message: e2eStateRef.current === 'opening' ? E2E_OPENING_NOTE : E2E_LOCKED_NOTE };
     try {
       return { ...record, message: await e2e.decrypt(record.message, record.sender_id, record.receiver_id) };
     } catch (error) {
@@ -3135,13 +3716,28 @@ export default function App({
     const e2e = e2eRef.current;
     if (!e2e || !e2ePassword || e2eBusy) return;
     setE2eBusy(true);
+    // the locked key comes from the server, a call that can hang on a bad connection. a button that stays busy for ever does nothing
+    // and says nothing, so after a while it says so and can be pressed again (and if the server does answer later, it opens then)
+    const work = e2e.setup(e2ePassword);
+    let timer = null;
+    const slow = new Promise((resolve) => { timer = setTimeout(() => resolve('slow'), UNLOCK_WAIT_MS); });
     try {
-      await e2e.setup(e2ePassword);
-      setE2ePassword('');
-      setE2eState('ready');
+      const outcome = await Promise.race([work.then(() => 'done'), slow]);
+      if (outcome === 'slow') {
+        showNotification('the server is not answering, try again in a bit', 'warning');
+        work.then(() => {
+          if (e2eRef.current === e2e) { setE2ePassword(''); setE2eState('ready'); }
+        }).catch(() => {});
+      } else {
+        setE2ePassword('');
+        setE2eState('ready');
+        // the key is on this device now: the effect hands the sealed copy in, so the next device needs no password
+        window.dispatchEvent(new Event('smp-e2e-changed'));
+      }
     } catch (error) {
       showNotification(/wrong password/.test((error && error.message) || '') ? 'wrong password' : 'could not unlock, try again in a bit', 'warning');
     }
+    clearTimeout(timer);
     setE2eBusy(false);
   }, [e2eBusy, e2ePassword, showNotification]);
 
@@ -3349,6 +3945,10 @@ export default function App({
       console.warn('Conversation load error:', error);
     }
   }, [addDebugLog, currentUserId]);
+  const loadConversationMessagesRef = useRef(loadConversationMessages);
+  loadConversationMessagesRef.current = loadConversationMessages;
+  const refreshConversationsRef = useRef(refreshConversations);
+  refreshConversationsRef.current = refreshConversations;
 
   const loadChannelState = useCallback(async (channelId) => {
     if (!currentUserId || !channelId) {
@@ -3656,6 +4256,10 @@ export default function App({
     } else if (e2eState === 'locked') {
       showNotification('enter your password under the messages to unlock private messages', 'warning');
       return;
+    } else if (e2eState === 'opening') {
+      // the key is on its way from another device of the account: a message is not sent in the clear meanwhile
+      showNotification('your messages are opening, try again in a moment', 'info');
+      return;
     }
 
     const clientMessageId = `dm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3848,7 +4452,7 @@ export default function App({
       if (newChannelPrivate && data.server && !data.server.is_private) {
         try { await fetchJson(`/api/servers/${encodeURIComponent(data.server.id)}`, { method: 'DELETE' }); } catch { /* it is still only a public channel */ }
         await refreshChannels();
-        showNotification('this server has not been updated for private channels yet, so nothing was created', 'warning');
+        showNotification('server has no private channels yet', 'error');
         return;
       }
       setNewChannelName('');
@@ -3949,7 +4553,10 @@ export default function App({
       await refreshChannels();
       showNotification(isAdmin ? 'member promoted' : 'member demoted', 'success');
     } catch (error) {
-      showNotification(error.message || 'failed to update admin', 'warning');
+      // a server from before this route existed answers with a page (404), not a message: say what is going on instead of showing it
+      const known = error && error.responseData && error.responseData.error;
+      const old = error && (error.status === 404 || error.status === 405) && !known;
+      showNotification(known || (old ? 'the club server has not been updated for this yet' : (error && error.message && error.message.length < 80 ? error.message : 'failed to update admin')), 'warning');
     }
   }, [currentChannelId, loadChannelState, refreshChannels, showNotification]);
 
@@ -4283,31 +4890,39 @@ export default function App({
 
     const body = serializePlaylistsForSync(playlists);
     const bodyJson = JSON.stringify(body);
-    // nothing new to save: this is what the account already has
-    if (bodyJson === lastSyncedPlaylistsRef.current) {
+    // nothing new to save: this is what the account already has. (not while a save is still on its way: a change that is taken back
+    // before that save is done looks like "what the account has" but the account is about to get the other one)
+    if (bodyJson === lastSyncedPlaylistsRef.current && !playlistSyncInFlightRef.current) {
       playlistSyncPendingRef.current = false;
       return;
     }
     playlistSyncPendingRef.current = true;
+    playlistSyncTimerActiveRef.current = true;
 
-    const syncTimer = setTimeout(async () => {
-      try {
-        await fetchJson('/api/user/playlists-sync', {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ playlists: body })
-        });
-        lastSyncedPlaylistsRef.current = bodyJson;
-      } catch (error) {
-        console.warn('Playlist sync save error:', error);
-      } finally {
-        playlistSyncPendingRef.current = false;
-      }
+    const syncTimer = setTimeout(() => {
+      playlistSyncTimerActiveRef.current = false;
+      // saves go one after the other, so the account ends up with the last one whatever the network does
+      playlistSyncInFlightRef.current += 1;
+      playlistSyncChainRef.current = playlistSyncChainRef.current.then(async () => {
+        try {
+          await fetchJson('/api/user/playlists-sync', {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ playlists: body })
+          });
+          lastSyncedPlaylistsRef.current = bodyJson;
+        } catch (error) {
+          console.warn('Playlist sync save error:', error);
+        } finally {
+          playlistSyncInFlightRef.current -= 1;
+          if (!playlistSyncInFlightRef.current && !playlistSyncTimerActiveRef.current) playlistSyncPendingRef.current = false;
+        }
+      });
     }, 300);
 
-    return () => clearTimeout(syncTimer);
+    return () => { clearTimeout(syncTimer); playlistSyncTimerActiveRef.current = false; };
   }, [user, playlists, syncTick]);
 
   useEffect(() => {
@@ -4326,6 +4941,27 @@ export default function App({
         lastSyncedQueueRef.current = JSON.stringify(nextQueue);
         lastAccountLoadAtRef.current = Date.now();
         setQueue(nextQueue);
+        queueRef.current = nextQueue;
+        // the queue this device remembered from the last time can be an older one (it was changed on another device since), and the
+        // song on the player was taken from it. a song that is no longer in the account's queue is not left on the player, it moves
+        // to where it is now, or to the song that took its place. a song that is already playing is left alone, and so is a device
+        // that had nothing on the player (nothing is picked for it)
+        const audio = audioRef.current;
+        if (playbackSourceRef.current !== 'shared' && !(audio && audio.src) && (currentTrackRef.current || playIndexRef.current >= 0)) {
+          const shown = currentTrackRef.current;
+          let at = shown ? nextQueue.findIndex((track) => track.videoId === shown.videoId) : -1;
+          if (at < 0) at = nextQueue.length ? Math.min(Math.max(playIndexRef.current, 0), nextQueue.length - 1) : -1;
+          playIndexRef.current = at;
+          setPlayIndex(at);
+          setCurrentIndex(at);
+          if (at < 0) setCurrentTrack(null);
+          else if (!shown || shown.videoId !== nextQueue[at].videoId) setCurrentTrack(nextQueue[at]);
+          // a different song is on the player now: the second that was remembered belonged to the one that left
+          if (at < 0 || !shown || shown.videoId !== nextQueue[at].videoId) {
+            setTrackProgress({ current: 0, duration: 0 });
+            personalPlayerStateRef.current = { videoId: null, currentTime: 0, duration: 0 };
+          }
+        }
       } catch (error) {
         // no connection: the queue that was saved on this device stays
         console.warn('Queue sync load error:', error);
@@ -4350,36 +4986,43 @@ export default function App({
 
     const normalizedQueue = serializeQueueForSync(queue);
     const queueJson = JSON.stringify(normalizedQueue);
-    // nothing new to save: this is what the account already has
-    if (queueJson === lastSyncedQueueRef.current) {
+    // nothing new to save: this is what the account already has (not while a save is still on its way, see the playlists)
+    if (queueJson === lastSyncedQueueRef.current && !queueSyncInFlightRef.current) {
       queueSyncPendingRef.current = false;
       return true;
     }
     queueSyncPendingRef.current = true;
+    queueSyncInFlightRef.current += 1;
 
-    try {
-      await fetchJson('/api/user/queue', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          queue: normalizedQueue
-        })
-      });
-      lastSyncedQueueRef.current = queueJson;
-      queueSyncPendingRef.current = false;
-      return true;
-    } catch (error) {
-      queueSyncPendingRef.current = false;
-      console.warn('Queue sync save error:', error);
-      addDebugLog('warn', 'personal queue save failed', {
-        reason,
-        error: error.message || String(error),
-        queueLength: normalizedQueue.length
-      }, true);
-      return false;
-    }
+    // saves go one after the other, so the account ends up with the last one
+    const run = queueSyncChainRef.current.then(async () => {
+      try {
+        await fetchJson('/api/user/queue', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            queue: normalizedQueue
+          })
+        });
+        lastSyncedQueueRef.current = queueJson;
+        return true;
+      } catch (error) {
+        console.warn('Queue sync save error:', error);
+        addDebugLog('warn', 'personal queue save failed', {
+          reason,
+          error: error.message || String(error),
+          queueLength: normalizedQueue.length
+        }, true);
+        return false;
+      } finally {
+        queueSyncInFlightRef.current -= 1;
+        if (!queueSyncInFlightRef.current) queueSyncPendingRef.current = false;
+      }
+    });
+    queueSyncChainRef.current = run.catch(() => {});
+    return run;
   }, [addDebugLog, queue, user]);
 
   useEffect(() => {
@@ -4506,10 +5149,8 @@ export default function App({
       localStorage.removeItem('music_playIndex');
       localStorage.removeItem('music_source');
       localStorage.removeItem('music_youtube_queue');
-      setCurrentIndex(-1);
-      setPlayIndex(-1);
-      playIndexRef.current = -1;
-      setCurrentTrack(null);
+      // the song the player was on is NOT reset here: the remembered queue and the place in it (music_queue_state) were read when the
+      // app opened, and this used to put the place back to -1 on every start, so the first play began with the first song of the queue
     } catch (err) {
       console.error('Failed to load from localStorage:', err);
     }
@@ -4764,7 +5405,7 @@ export default function App({
     } catch {}
     try {
       const storedDm = localStorage.getItem(`music_dm_messages:${currentUserId}`);
-      const dm = storedDm ? JSON.parse(storedDm) : null;
+      const dm = storedDm ? dropNotesFromMessages(JSON.parse(storedDm)) : null;
       if (dm) {
         setDmMessages(dm);
       }
@@ -4993,6 +5634,15 @@ export default function App({
               break;
 
             case 'direct_message': {
+              // the server handed this message over as a note (it did not know yet that this device can open it): fetched again, which says so
+              if (data.message && isNoteText(data.message.message) && /update the app/.test(data.message.message)) {
+                const peerId = data.message.sender_id === currentUserId ? data.message.receiver_id : data.message.sender_id;
+                if (peerId) {
+                  loadConversationMessagesRef.current(peerId);
+                  refreshConversationsRef.current();
+                }
+                break;
+              }
               openDirectRecordRef.current(data.message).then((opened) => {
                 const delivered = pushDirectMessage(opened);
                 if (
@@ -5008,6 +5658,7 @@ export default function App({
             }
 
             case 'direct_message_ack':
+              if (isAndroidApp()) break;
               openDirectRecordRef.current(data.message).then((opened) => pushDirectMessage(opened, { clientMessageId: data.clientMessageId }));
               break;
 
@@ -5109,6 +5760,24 @@ export default function App({
 
             case 'device_command':
               deviceCommandRef.current(data.command);
+              break;
+
+            case 'device_viz':
+              // the bars of what the other device hears
+              if (data.from && data.from.clientId && Array.isArray(data.bars)) remoteBarsRef.current = { bars: data.bars, at: performance.now(), from: data.from.clientId };
+              break;
+
+            case 'e2e_transfer_request':
+              // another device of the account asks for the key of the private messages: a device that has it answers
+              window.dispatchEvent(new Event('smp-e2e-transfer'));
+              break;
+
+            case 'device_viz_watch':
+              // another device of the account shows this one's sound and asks for the bars, for the next few seconds
+              if (data.from && data.from.clientId) {
+                vizWatchersRef.current.set(data.from.clientId, Date.now() + 9000);
+                vizKickRef.current();
+              }
               break;
 
             case 'server_queue_updated':
@@ -5462,11 +6131,13 @@ export default function App({
     const eq = readLocalJSON(`music_eq:${uid}`, null);
     if (eq) {
       if (typeof eq.eqEnabled === 'boolean') setEqEnabled(eq.eqEnabled);
-      if (Array.isArray(eq.eqValues)) setEqValues(eq.eqValues);
+      // a saved preset comes back from the table above, so one saved before the reduction does not keep its old, bigger amounts
+      if (typeof eq.selectedPreset === 'string' && EQ_PRESETS[eq.selectedPreset]) setEqValues(EQ_PRESETS[eq.selectedPreset]);
+      else if (Array.isArray(eq.eqValues)) setEqValues(eq.eqValues);
       if (typeof eq.selectedPreset === 'string') setSelectedPreset(eq.selectedPreset);
     }
     const savedVisualizerPreset = localStorage.getItem(`music_visualizer_preset:${uid}`);
-    if (savedVisualizerPreset) setVisualizerPreset(savedVisualizerPreset);
+    if (savedVisualizerPreset) setVisualizerPreset(VISUALIZER_PRESETS.some((preset) => preset.key === savedVisualizerPreset) ? savedVisualizerPreset : 'particles');
   }, [user?.id]);
 
   // persist the personal queue + where playback is in it - this is what
@@ -5748,7 +6419,9 @@ export default function App({
       // real detail across the low end instead of just mid/treble - still
       // under 100ms per analysis window so its not noticeable, cant even tell
       analyser.fftSize = 4096;
-      analyser.smoothingTimeConstant = 0.72;
+      // 0.4 (was 0.72): the bars fall in about half a second now (the drawings hold the fall themselves, see fallingBars in
+      // vizRenderers.js), at 0.72 the analyser alone kept them up for a second and a half and the bars looked soft and slow
+      analyser.smoothingTimeConstant = 0.4;
       // the default range tops out at -30dB, and loud music sits above that
       // for the bass bins, so they read as a flat 255 and every bar slammed
       // into the ceiling. a higher max leaves headroom so loud parts still
@@ -5835,6 +6508,23 @@ export default function App({
     });
   }, [eqValues, eqEnabled]);
 
+  // ctrl + h: everything but the visualizer goes away, and comes back on the next press. the keys (the player, the shortcuts) keep working meanwhile
+  const [uiHidden, setUiHidden] = useState(false);
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && (e.key === 'h' || e.key === 'H')) {
+        e.preventDefault();
+        setUiHidden((hidden) => !hidden);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+  useEffect(() => {
+    document.body.classList.toggle('smp-ui-hidden', uiHidden);
+    return () => document.body.classList.remove('smp-ui-hidden');
+  }, [uiHidden]);
+
   const playTrackAtIndex = useCallback(async (index, trackList = null, options = {}) => {
     console.log('[PLAYTRACK] playTrackAtIndex called', { index, trackList: !!trackList, options });
     shibbyRef.current = null;
@@ -5882,10 +6572,10 @@ export default function App({
 
     const rawItem = list[index];
     const track = normalizeTrack(rawItem);
+    const audio = audioRef.current;
+    if (audio) audio.dataset.trackVideoId = String(track.videoId || '');
     if (nextSource !== 'shared') recordPlayed(soloHistoryRef.current, track.videoId);
     const rawVideoId = rawItem?.videoId || rawItem?.video_id || rawItem?.id || '(none)';
-    
-    const audio = audioRef.current;
     
     const savedState = personalPlayerStateRef.current;
     const shouldRestorePosition = shouldRestoreSavedPosition
@@ -5942,10 +6632,10 @@ export default function App({
       setIsPlaying(false);
       setIsBuffering(false);
       if (savedLeft) {
-        showNotification(`you are offline and "${track.title}" is not saved, skipping to a saved song`, 'warning');
+        showNotification(`offline and "${clipText(track.title)}" is not saved, skipped`, 'error');
         setTimeout(() => handleNextRef.current(), 400);
       } else {
-        showNotification('you are offline and none of these songs are saved. connect to the internet, or save songs for offline first', 'warning');
+        showNotification('offline and none of these songs are saved', 'error');
       }
       return;
     }
@@ -6038,7 +6728,7 @@ export default function App({
           return;
         }
         addDebugLog('error', `stream url resolve failed: ${error.message}`, { videoId: track.videoId }, true);
-        showNotification(`failed to load: ${track.title}`, 'error');
+        showNotification(`could not load "${clipText(track.title)}"`, 'error');
         setIsPlaying(false);
         setIsBuffering(false);
         return;
@@ -6080,12 +6770,18 @@ export default function App({
           setIsPlaying(false);
           setIsBuffering(false);
 
-          const giveUp = () => {
-            showNotification(`failed to load: ${track.title}`, 'error');
+          const giveUp = (why = null) => {
+            showNotification(why ? `"${clipText(track.title)}": ${why.short}` : `could not load "${clipText(track.title)}"`, 'error');
             audio._consecutiveFailures = (audio._consecutiveFailures || 0) + 1;
+            // a cause that is the same for every song (no connection, the helper down, a robot check) is not worth trying the next song for
+            if (why && ['network', 'helper', 'botcheck'].includes(why.kind)) {
+              audio._consecutiveFailures = 0;
+              showNotification(`${why.short}, queue stopped`, 'error');
+              return;
+            }
             if (audio._consecutiveFailures >= 3) {
               audio._consecutiveFailures = 0;
-              showNotification('stopped: 3 songs in a row would not load. check your connection', 'error');
+              showNotification(`3 songs in a row failed${why ? ', ' + why.short : ''}, queue stopped`, 'error');
               return;
             }
             // only skip if nothing else was started in the meantime, or this
@@ -6097,9 +6793,9 @@ export default function App({
           };
           // online, Shibby asks what to do with a song that will not load. with no connection (or in a room) it is the plain way
           if (nextSource !== 'shared') {
-            probeYoutube(track.videoId).then((state) => {
+            diagnoseSong(track.videoId).then((why) => {
               if (requestSerial !== playRequestSerialRef.current) return;
-              if (state !== 'offline' && shibbyOpenRef.current(track)) {
+              if (failedLoadRef.current(track, why)) {
                 audio.pause();
                 audio.removeAttribute('src');
                 delete audio.dataset.lastSrc;
@@ -6107,7 +6803,7 @@ export default function App({
                 audio._consecutiveFailures = 0;
                 return;
               }
-              giveUp();
+              giveUp(why);
             });
           } else {
             giveUp();
@@ -6133,7 +6829,7 @@ export default function App({
         audio.load();
         setIsPlaying(false);
         setIsBuffering(false);
-        shibbyOpenRef.current(track);
+        shibbyOpenRef.current(track, explainFailure({ internet: 'up', youtube: { reachable: true, video: 'gone' } }));
       }, 6000);
     }
 
@@ -6184,7 +6880,7 @@ export default function App({
         // an autoplay-policy block, where the element never errored at
         // all) still gets its own toast
         if (shouldNotify && !audio.error) {
-          showNotification(`playback failed: ${track.title}`, 'error');
+          showNotification(`playback failed: "${clipText(track.title)}"`, 'error');
         }
         setIsPlaying(false);
         setIsBuffering(false);
@@ -6279,10 +6975,34 @@ export default function App({
     // throttle progress updates so time ticks dont rerender the whole app nonstop
     let lastProgressMs = 0;
     const PROGRESS_THROTTLE_MS = 250;
+    // on the phone with the screen off (or the app in the background) nobody sees the bar, and the notification, widget and floating
+    // player move by themselves from the position they were last given, which is refreshed at least every ten seconds. so the page
+    // only reports every five seconds then, instead of redrawing the whole app four times a second for nothing
+    const HIDDEN_PROGRESS_THROTTLE_MS = 5000;
+
+    // the second the song is at, written to the device every few seconds (not on every tick: the tick comes four times a second), when
+    // it is paused, and when the page goes away, so the next start can open on it
+    let lastSpotMs = 0;
+    const saveSpot = (force) => {
+      if (playbackSourceRef.current === 'shared') return;
+      const track = currentTrackRef.current;
+      if (!track || !track.videoId || !audio.src) return;
+      const time = audio.currentTime;
+      if (!Number.isFinite(time) || !(audio.duration > 0)) return;
+      const now = Date.now();
+      if (!force && now - lastSpotMs < RESUME_SAVE_MS) return;
+      lastSpotMs = now;
+      writeResume(resumeUserRef.current, track.videoId, time, audio.duration);
+    };
+    const onPageHide = () => {
+      if (document.visibilityState === 'hidden' || document.visibilityState === undefined) saveSpot(true);
+    };
 
     const onTimeUpdate = () => {
+      saveSpot(false);
       const now = Date.now();
-      if (now - lastProgressMs < PROGRESS_THROTTLE_MS) return;
+      const throttle = isAndroidApp() && document.visibilityState === 'hidden' ? HIDDEN_PROGRESS_THROTTLE_MS : PROGRESS_THROTTLE_MS;
+      if (now - lastProgressMs < throttle) return;
       lastProgressMs = now;
       // a stray timeupdate CAN still fire right after an error handler tears
       // the element down (removeAttribute('src') + .load()), and at that
@@ -6337,6 +7057,7 @@ export default function App({
           currentTime: audio.currentTime,
           duration: audio.duration || 0
         };
+        saveSpot(true);
       }
       if (audio.currentTime > 0 && !audio.ended) {
         setIsPlaying(false);
@@ -6346,8 +7067,11 @@ export default function App({
     const onEnded = () => {
       // clear the saved solo spot when a track really finishes
       personalPlayerStateRef.current = { videoId: null, currentTime: 0, duration: 0 };
+      clearResume(resumeUserRef.current);
       setIsPlaying(false);
       setIsBuffering(false);
+      // heard to the end: a song discover added is theirs now
+      if (playbackSourceRef.current !== 'shared') keepDiscoverRef.current(currentTrackRef.current && currentTrackRef.current.videoId);
       if (repeatMode === 'one' && playbackSourceRef.current !== 'shared') {
         audio.currentTime = 0;
         audio.play().catch(() => {});
@@ -6450,7 +7174,7 @@ export default function App({
       const message = error ? `Playback error (${error.code}): ${error.message}` : 'Playback failed';
       addDebugLog('error', message, { videoId: currentTrack?.videoId, code: errorCode }, true);
       if (audio._streamRetryCount >= MAX_STREAM_RETRIES) {
-        showNotification(`stream failed after ${MAX_STREAM_RETRIES} retries: ${currentTrack?.title || 'track'}`, 'error');
+        showNotification(`stream failed after ${MAX_STREAM_RETRIES} retries: "${clipText(currentTrack?.title || 'track')}"`, 'error');
         addDebugLog('error', `stream failed after ${MAX_STREAM_RETRIES} retries: ${currentTrack?.title}`, {
           videoId: currentTrack?.videoId,
           shared: playbackSourceRef.current === 'shared'
@@ -6498,7 +7222,7 @@ export default function App({
       audio._consecutiveFailures = (audio._consecutiveFailures || 0) + 1;
       if (audio._consecutiveFailures >= 3) {
         addDebugLog('error', `${audio._consecutiveFailures} tracks failed in a row, stopping playback`, null, true);
-        showNotification('multiple tracks failed - check if local helper is running', 'error');
+        showNotification('3 songs in a row failed, is the audio helper running?', 'error');
         audio._consecutiveFailures = 0;
         return;
       }
@@ -6514,7 +7238,7 @@ export default function App({
       // is) is not "a slow connection": Shibby asks what to do with it. with no connection at all, or when nobody
       // can see a popup, it is the plain way: say so, and move on
       if (errorCode === 4 && playedSeconds < 1 && isLocalTrack(currentTrack)) {
-        showNotification(`"${currentTrack?.title || 'that file'}" could not be played on this device, skipping it`, 'warning');
+        showNotification(`"${clipText(currentTrack?.title || 'that file')}" can't be played on this device, skipped`, 'error');
         setTimeout(() => {
           if (failedSerial !== playRequestSerialRef.current) return;
           handleNextRef.current();
@@ -6523,13 +7247,22 @@ export default function App({
       }
       if (errorCode === 4 && playedSeconds < 1) {
         const refused = currentTrack;
-        probeYoutube(refused && refused.videoId).then((state) => {
+        diagnoseSong(refused && refused.videoId).then((why) => {
           if (failedSerial !== playRequestSerialRef.current) return;
-          if (state !== 'offline' && shibbyOpenRef.current(refused)) {
+          if (failedLoadRef.current(refused, why)) {
             audio._consecutiveFailures = 0;
             return;
           }
-          showNotification(`"${refused?.title || 'that song'}" is not available on youtube, skipping it`, 'warning');
+          const name = refused?.title || 'that song';
+          // the same cause for every song of the queue: stop here, and say it, instead of skipping through all of them
+          if (['network', 'helper', 'botcheck'].includes(why.kind)) {
+            showNotification(`"${clipText(name)}": ${why.short}, queue stopped`, 'error');
+            audio.pause();
+            setIsPlaying(false);
+            setIsBuffering(false);
+            return;
+          }
+          showNotification(`"${clipText(name)}": ${why.short}, skipped`, 'error');
           setTimeout(() => {
             if (failedSerial !== playRequestSerialRef.current) return;
             handleNextRef.current();
@@ -6547,6 +7280,7 @@ export default function App({
     };
 
     const onLoadedMetadata = () => {
+      audio.dataset.loadedTrackVideoId = audio.dataset.trackVideoId || '';
       let pendingStartTime = 0;
       if (typeof audio._pendingStartTime === 'number' && Number.isFinite(audio._pendingStartTime)) {
         const nextTime = audio.duration
@@ -6626,7 +7360,7 @@ export default function App({
         const retryCount = audio._streamRetryCount || 0;
         if (retryCount < MAX_STREAM_RETRIES) {
           audio._streamRetryCount = retryCount + 1;
-          const delayMs = Math.min(1000 * Math.pow(2, retryCount), 4000);
+          const delayMs = Math.min(1000 * Math.pow(2, retryCount), 8000);
           const resumeAt = audio.currentTime;
           addDebugLog('error', `stream stalled 3 times, retrying (${audio._streamRetryCount}/${MAX_STREAM_RETRIES})`, { videoId: currentTrack?.videoId, resumeAt }, true);
           // same position-preservation trick as the error-retry path above
@@ -6646,23 +7380,15 @@ export default function App({
             videoId: currentTrack?.videoId,
             shared: playbackSourceRef.current === 'shared'
           }, true);
-          showNotification(`stream stalled: ${currentTrack?.title}`, 'error');
+          showNotification(`stream stalled: "${clipText(currentTrack?.title)}"`, 'error');
           delete audio.dataset.requestedSharedTrackId;
           if (playbackSourceRef.current === 'shared') {
             scheduleSharedPlaybackRecovery('stream stall');
-          } else if (audio.currentTime > 3) {
-            // stalled partway through a song: stop here and keep the spot
-            // instead of skipping. play picks it back up from the same place
-            personalPlayerStateRef.current = {
-              videoId: currentTrack?.videoId || null,
-              currentTime: audio.currentTime,
-              duration: audio.duration || 0
-            };
-            audio.pause();
-            setIsPlaying(false);
-            setIsBuffering(false);
-            addDebugLog('playback', 'stream stalled mid song, staying on this track instead of skipping', { videoId: currentTrack?.videoId }, true);
           } else {
+            // a song that stalls for good used to stop right there and wait for somebody to skip it, which is no help with the phone in a
+            // pocket and only the mini player in reach. now it moves on to the next one by itself (the count of failed loads in a row still
+            // stops a run of songs that all fail)
+            addDebugLog('playback', 'stream stalled for good, moving on to the next song', { videoId: currentTrack?.videoId, at: audio.currentTime }, true);
             const stalledSerial = playRequestSerialRef.current;
             setTimeout(() => {
               if (stalledSerial !== playRequestSerialRef.current) return;
@@ -6721,8 +7447,12 @@ export default function App({
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', onPointerUp);
     window.addEventListener('blur', onPointerUp);
+    window.addEventListener('pagehide', onPageHide);
+    document.addEventListener('visibilitychange', onPageHide);
 
     return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      document.removeEventListener('visibilitychange', onPageHide);
       audio.removeEventListener('timeupdate', onTimeUpdate);
       audio.removeEventListener('playing', onPlaying);
       audio.removeEventListener('pause', onPause);
@@ -6754,7 +7484,8 @@ export default function App({
     if (!canvas) return;
 
     const ctx = canvas.getContext('2d');
-    let animationFrameId;
+    let animationFrameId = 0;
+    let idleTimerId = 0;
 
     const rgbToHue = (r, g, b) => {
       r /= 255; g /= 255; b /= 255;
@@ -6772,50 +7503,18 @@ export default function App({
     };
 
     const baseHue = rgbToHue(themeColor.r, themeColor.g, themeColor.b);
+    // the theme color's own saturation and lightness (0 to 100), so the drawings are that color and not a paler one
+    const [themeSat, themeLight] = (() => {
+      const r = themeColor.r / 255; const g = themeColor.g / 255; const b = themeColor.b / 255;
+      const max = Math.max(r, g, b); const min = Math.min(r, g, b);
+      const l = (max + min) / 2;
+      const s = max === min ? 0 : (max - min) / (1 - Math.abs(2 * l - 1));
+      return [Math.round(s * 100), Math.round(l * 100)];
+    })();
 
-    // fft bins are linearly spaced in hz, but pitch/octaves (and where
-    // music actually puts its energy) are logarithmic - sampling bins
-    // linearly across the bar count crams the entire audible low/mid range
-    // into a handful of bars on the left and leaves most of the display
-    // showing near-silent 5-20khz content. this maps bar position to a
-    // log-spaced point between 20hz and 20khz (audible range, not the full
-    // nyquist range up to sampleRate/2) and converts that to the matching
-    // bin, so a log sweep - or just normal music - actually uses the whole
-    // width instead of sitting frozen at the left edge like before
-    const FREQ_MIN = 20;
-    const FREQ_MAX = 20000;
-    const hzToBin = (hz, dataArray) => {
-      const sampleRate = audioContextRef.current?.sampleRate || 44100;
-      const nyquist = sampleRate / 2;
-      const bin = Math.round((hz / nyquist) * dataArray.length);
-      return Math.min(dataArray.length - 1, Math.max(0, bin));
-    };
-    // returns the PEAK amplitude (0-1) across every bin between this bar's
-    // own frequency and the next bar's - NOT the average of that span. bar
-    // width in hz grows with frequency (thats the whole point of the log
-    // scale), so a high bar can span hundreds of bins while a low one spans
-    // only one or two. averaging that span meant a single sine tone sitting
-    // in a wide high-frequency bar got diluted by all the silent bins
-    // around it - a full-scale 15khz tone would show up as barely a
-    // flicker while the same tone at 200hz lit its (much narrower) bar up
-    // completely, purely because of how many mostly-empty neighbors it got
-    // averaged against. so dumb once i figured out why the highs always
-    // looked dead. peak instead of mean means a bar reflects whatevers
-    // actually loud inside its range, regardless of how wide that range is
-    const ampForBarRange = (barIndex, barCount, dataArray) => {
-      if (!dataArray) return 0;
-      const tStart = barIndex / barCount;
-      const tEnd = (barIndex + 1) / barCount;
-      const hzStart = FREQ_MIN * Math.pow(FREQ_MAX / FREQ_MIN, tStart);
-      const hzEnd = FREQ_MIN * Math.pow(FREQ_MAX / FREQ_MIN, tEnd);
-      const binStart = hzToBin(hzStart, dataArray);
-      const binEnd = Math.max(binStart, hzToBin(hzEnd, dataArray));
-      let peak = 0;
-      for (let b = binStart; b <= binEnd; b++) {
-        if (dataArray[b] > peak) peak = dataArray[b];
-      }
-      return peak / 255;
-    };
+    // how loud the index-th of count bars is, 0 to 1: where the bars sit on the frequency axis, how they are read between the analyser's
+    // bins and the tilt that lifts the highs are all in barScale.js (the grouping of equal bars in the bass came from there)
+    const ampForBarRange = (barIndex, barCount, dataArray) => barAmp(barIndex, barCount, dataArray, audioContextRef.current?.sampleRate || 44100);
 
     const resizeCanvas = () => {
       canvas.width = window.innerWidth;
@@ -6841,506 +7540,100 @@ export default function App({
     // lazily fills in whatever arrays it needs on its own first frame.
     const state = {};
 
-    // the kick drum, 0 to 1, from its own analyser (see beat.js). 0 when there is none
-    const readKick = (now) => {
-      const beatAnalyser = beatAnalyserRef.current;
-      if (!beatAnalyser) return 0;
-      if (!state.beat || state.beatBins !== beatAnalyser.frequencyBinCount) {
-        state.beat = createBeatDetector({ sampleRate: audioContextRef.current ? audioContextRef.current.sampleRate : 44100, fftSize: beatAnalyser.fftSize });
-        state.beatBins = beatAnalyser.frequencyBinCount;
-        state.beatBuffer = new Uint8Array(beatAnalyser.frequencyBinCount);
-      }
-      beatAnalyser.getByteFrequencyData(state.beatBuffer);
-      return state.beat.step(state.beatBuffer, now).kick;
-    };
-
-    const makeFloatParticles = (count) => {
-      const list = [];
-      for (let i = 0; i < count; i++) {
-        list.push({
-          x: Math.random() * canvas.width,
-          y: Math.random() * canvas.height,
-          vx: (Math.random() - 0.5) * 0.5,
-          vy: (Math.random() - 0.5) * 0.5,
-          baseRadius: Math.random() * 5 + 4,
-          radius: Math.random() * 5 + 4,
-          hueOffset: Math.random() * 60 - 30,
-          alpha: 0,
-          targetAlpha: Math.random() * 0.8 + 0.5
-        });
-      }
-      return list;
-    };
-
-    // --- preset renderers ----------------------------------------------
-    // each takes the same per-frame audio snapshot (f) and draws onto the
-    // full-screen canvas however it likes. f.baseHue ties every preset's
-    // palette back to the user's theme color, so switching color re-tints
-    // whichever animation is active.
-
-    const renderParticles = (f) => {
-      if (!state.particles) state.particles = makeFloatParticles(60);
-      // splitting particles into a bass zone and a treble zone caused a
-      // visible "wall" right at the halfway line - a particle rising from
-      // the bass half into the treble half would abruptly switch which
-      // level drives it, and since treble is usually way quieter than bass,
-      // itd suddenly lose speed and shrink right at that boundary. looked
-      // so weird. one straightforward pulse/rise for every particle now -
-      // no per-particle branching, so no discontinuity - but folds in bass
-      // alongside volume so the particles visibly swell and speed up
-      // together with the bottom glow instead of moving on an unrelated signal
-      const pulseFactor = f.isPlaying ? (0.3 + f.volumeLevel * 0.8 + f.bassPulse * 3.2) : 1;
-
-      // the whole background lights up from the bottom on a kick, fading as it falls away
-      if (f.isPlaying && f.bassPulse > 0.02) {
-        const flash = ctx.createRadialGradient(canvas.width / 2, canvas.height, 0, canvas.width / 2, canvas.height, canvas.height * 1.1);
-        flash.addColorStop(0, `hsla(${f.baseHue}, 85%, 55%, ${f.bassPulse * 0.24})`);
-        flash.addColorStop(1, `hsla(${f.baseHue}, 85%, 45%, 0)`);
-        ctx.fillStyle = flash;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-      }
-
-      state.particles.forEach((particle) => {
-        const volumeRise = f.isPlaying ? (f.volumeLevel * 0.6 + f.bassPulse * 3.2) : 0;
-        particle.x += particle.vx;
-        particle.y += particle.vy - volumeRise;
-
-        if (particle.x < -50) particle.x = canvas.width + 50;
-        if (particle.x > canvas.width + 50) particle.x = -50;
-        if (particle.y < -50) particle.y = canvas.height + 50;
-        if (particle.y > canvas.height + 50) particle.y = -50;
-
-        const targetAlpha = f.isPlaying ? Math.min(1, particle.targetAlpha * (1 + f.bassPulse * 0.5)) * f.fadeProgress : 0;
-        const fadeSpeed = f.fadeProgress > 0.5 ? 0.05 : 0.08;
-        particle.alpha += (targetAlpha - particle.alpha) * fadeSpeed;
-
-        const targetRadius = particle.baseRadius * pulseFactor;
-        particle.radius += (targetRadius - particle.radius) * 0.28;
-
-        if (particle.alpha > 0.01) {
-          // mostly theme-tinted now (not the old random ±30° per-particle
-          // spread that made this look like a rainbow puked everywhere),
-          // but a small ±12° drift per particle keeps it from feeling like
-          // one flat color - plus a saturation/lightness bump so it reads
-          // as brighter and more alive against the dark background
-          const hue = (f.baseHue + particle.hueOffset * 0.2 + 360) % 360;
-          const gradient = ctx.createRadialGradient(particle.x, particle.y, 0, particle.x, particle.y, particle.radius * 0.8);
-          gradient.addColorStop(0, `hsla(${hue}, 100%, 70%, ${particle.alpha})`);
-          gradient.addColorStop(0.6, `hsla(${hue}, 95%, 60%, ${particle.alpha * 0.4})`);
-          gradient.addColorStop(1, `hsla(${hue}, 90%, 50%, 0)`);
-          ctx.beginPath();
-          ctx.arc(particle.x, particle.y, particle.radius * 0.8, 0, Math.PI * 2);
-          ctx.fillStyle = gradient;
-          ctx.fill();
-        }
+    // what the music is doing right now: the spectrum, the loudness, the kick and the tempo (see vizDrive.js). one reading per picture, no
+    // matter how many places ask
+    if (!vizDriveRef.current) vizDriveRef.current = createVizDrive();
+    const readSound = (now) => {
+      const sound = vizDriveRef.current.read({
+        analyser: analyserRef.current,
+        beatAnalyser: beatAnalyserRef.current,
+        rate: audioContextRef.current ? audioContextRef.current.sampleRate : 44100,
+        now
       });
-
-      if (f.isPlaying) {
-        // height itself pulses with bass too, not just opacity - makes the
-        // bottom glow visibly swell on hits instead of just brightening.
-        // a little bassLevel is blended in so the glow doesn't vanish to
-        // nothing between hits, but bassPulse (the actual hit) is what
-        // makes it swell
-        const glowHeight = canvas.height * (0.3 + f.bassLevel * 0.06 + f.bassPulse * 0.24);
-        const glowGradient = ctx.createLinearGradient(0, canvas.height - glowHeight, 0, canvas.height);
-        const glowIntensity = Math.min(1, f.bassLevel * 0.2 + f.bassPulse * 0.85 + f.volumeLevel * 0.08);
-        glowGradient.addColorStop(0, `hsla(${f.baseHue}, 70%, 50%, 0)`);
-        glowGradient.addColorStop(0.3, `hsla(${f.baseHue}, 70%, 50%, ${glowIntensity * 0.3})`);
-        glowGradient.addColorStop(0.6, `hsla(${f.baseHue}, 75%, 45%, ${glowIntensity * 0.5})`);
-        glowGradient.addColorStop(1, `hsla(${f.baseHue}, 80%, 40%, ${glowIntensity * 0.7})`);
-        ctx.fillStyle = glowGradient;
-        ctx.fillRect(0, canvas.height - glowHeight, canvas.width, glowHeight);
-      }
+      // window.__vizProbe is only for measuring (the tests set it): it is handed every reading
+      if (sound && typeof window !== 'undefined' && typeof window.__vizProbe === 'function') window.__vizProbe(sound);
+      return sound;
     };
-
-    // bends instead of clipping: untouched up to 0.65, then eases toward 1 so
-    // a loud passage keeps rising a little instead of going flat against a
-    // hard ceiling (the old Math.min(1, x) is why the tops looked chopped off)
-    const softCeiling = (x) => (x <= 0.65 ? x : 0.65 + 0.35 * Math.tanh((x - 0.65) / 0.35));
-
-    const renderBars = (f) => {
-      const barCount = 48;
-      const gap = 3;
-      const barWidth = canvas.width / barCount - gap;
-      for (let i = 0; i < barCount; i++) {
-        const raw = ampForBarRange(i, barCount, f.dataArray);
-        // extra boost stacked on top of the bar's own reading, strongest
-        // for the low (bass) bars and fading out toward the high end - a
-        // real bass hit should visibly slam past where the raw spectrum
-        // reading alone would put it, not just be "a bit taller than usual"
-        const bassWeight = Math.max(0, 1 - i / (barCount * 0.3));
-        const boosted = softCeiling(raw * (1 + f.bassPulse * bassWeight * 2.5));
-        const height = f.isPlaying ? Math.max(4, boosted * canvas.height * 0.8) : 4;
-        const x = i * (barWidth + gap);
-        const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - height);
-        gradient.addColorStop(0, `hsla(${f.baseHue}, 85%, 55%, 0.85)`);
-        gradient.addColorStop(1, `hsla(${f.baseHue}, 90%, 65%, 0.15)`);
-        ctx.fillStyle = gradient;
-        ctx.fillRect(x, canvas.height - height, barWidth, height);
+    // the song for the live wallpaper (it shows the title, the artist and the progress): sent with a frame when it changed and once a
+    // second, so the wallpaper can work out the position between them. nothing between is sent
+    const songForWallpaper = (now) => {
+      const track = currentTrackRef.current;
+      const audio = audioRef.current;
+      if (!track) {
+        if (!state.songSent) return undefined;
+        state.songSent = false;
+        state.songKey = '';
+        return { title: '', artist: '', position: 0, duration: 0, playing: false };
       }
+      const duration = audio && Number.isFinite(audio.duration) ? audio.duration : 0;
+      const key = `${track.title || ''}|${track.author || ''}|${Math.round(duration)}|${isPlaying ? 1 : 0}`;
+      if (key === state.songKey && now - (state.songSentAt || 0) < 1000) return undefined;
+      state.songKey = key;
+      state.songSentAt = now;
+      state.songSent = true;
+      return { title: track.title || '', artist: track.author || '', position: audio ? audio.currentTime || 0 : 0, duration, playing: isPlaying };
     };
+    // the snapshot the drawings get, made once and filled in again for every picture
+    const snapshot = { baseHue, sat: themeSat, light: themeLight, isPlaying: false, fadeProgress: 0, bassLevel: 0, bassPulse: 0, volumeLevel: 0, dataArray: null, timeData: null, soft: 0, beat: 0, bar: 0, bpm: 0, locked: false, phase: 0, period: 0, beatCount: 0, barCount: 0, beatInBar: 0, now: 0, dt: 33 };
 
-    const renderWave = (f) => {
-      if (!f.timeData) return;
-      // bass swells both the line's glow and how tall its swings read, so
-      // a heavy low end visibly punches the waveform outward instead of
-      // just being "in there somewhere" along with everything else
-      const bassBoost = f.isPlaying ? 1 + f.bassPulse * 0.9 : 0.05;
-      ctx.beginPath();
-      const midY = canvas.height / 2;
-      // every other sample is plenty, there are far more samples than pixels
-      const stride = 2;
-      const sliceWidth = (canvas.width / f.timeData.length) * stride;
-      let x = 0;
-      for (let i = 0; i < f.timeData.length; i += stride) {
-        const v = (f.timeData[i] - 128) / 128;
-        const y = midY + v * midY * 0.8 * bassBoost;
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-        x += sliceWidth;
-      }
-      // the glow is a wide faint stroke under the sharp one. shadowBlur gave
-      // the same look but blurs the whole path on the cpu every frame
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = 9 + f.bassPulse * 9;
-      ctx.strokeStyle = `hsla(${f.baseHue}, 85%, 60%, 0.14)`;
-      ctx.stroke();
-      ctx.lineWidth = 2.5;
-      ctx.strokeStyle = `hsla(${f.baseHue}, 85%, 60%, 0.9)`;
-      ctx.stroke();
-    };
+    const RENDERERS = createVisualizerRenderers({ canvas, ctx, state, ampForBarRange });
 
-    const renderRadial = (f) => {
-      // nothing playing -> nothing drawn, instead of the old static
-      // pinwheel just sitting there at rest length looking like its "on"
-      // when it isnt
-      if (!f.isPlaying) return;
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      const baseRadius = Math.min(canvas.width, canvas.height) * 0.15;
-      const spokes = 64;
-      if (state.radialAngle === undefined) state.radialAngle = 0;
-      state.radialAngle += 0.002 + f.bassPulse * 0.012;
-      for (let i = 0; i < spokes; i++) {
-        const angle = (i / spokes) * Math.PI * 2 + state.radialAngle;
-        const raw = ampForBarRange(i, spokes, f.dataArray);
-        // same "bass hits should visibly slam" boost bars gets, weighted
-        // toward the low-frequency spokes
-        const bassWeight = Math.max(0, 1 - i / (spokes * 0.3));
-        const boosted = softCeiling(raw * (1 + f.bassPulse * bassWeight * 2.5));
-        const len = baseRadius * 0.3 + boosted * baseRadius * 1.4;
-        const x1 = cx + Math.cos(angle) * baseRadius;
-        const y1 = cy + Math.sin(angle) * baseRadius;
-        const x2 = cx + Math.cos(angle) * (baseRadius + len);
-        const y2 = cy + Math.sin(angle) * (baseRadius + len);
-        // same hue all the way around, but lightness drifts smoothly with
-        // angle so it doesn't read as one flat blob - no hard color jumps
-        // to fade, just a soft brightness wave.
-        const lightness = 55 + Math.sin(angle * 3) * 15;
-        ctx.strokeStyle = `hsla(${f.baseHue}, 85%, ${lightness}%, 0.8)`;
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
-      }
-    };
-
-    const renderStarfield = (f) => {
-      if (!state.stars) {
-        state.stars = Array.from({ length: 120 }, () => ({
-          x: (Math.random() - 0.5) * canvas.width,
-          y: (Math.random() - 0.5) * canvas.height,
-          z: Math.random() * canvas.width
-        }));
-      }
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      // bass drives most of the warp-speed feeling now instead of overall
-      // volume - a bassy hit should visibly throw stars past the camera
-      const speed = f.isPlaying ? 2 + f.volumeLevel * 4 + f.bassPulse * 16 : 1;
-      state.stars.forEach((star) => {
-        star.z -= speed;
-        if (star.z <= 1) {
-          star.x = (Math.random() - 0.5) * canvas.width;
-          star.y = (Math.random() - 0.5) * canvas.height;
-          star.z = canvas.width;
-        }
-        const k = 128 / star.z;
-        const sx = star.x * k + cx;
-        const sy = star.y * k + cy;
-        if (sx < 0 || sx > canvas.width || sy < 0 || sy > canvas.height) return;
-        const size = Math.max(0.5, (1 - star.z / canvas.width) * 3);
-        const hue = (f.baseHue + (star.z % 40)) % 360;
-        ctx.fillStyle = `hsla(${hue}, 80%, 70%, ${Math.min(1, (1 - star.z / canvas.width) * 1.2)})`;
-        ctx.beginPath();
-        ctx.arc(sx, sy, size, 0, Math.PI * 2);
-        ctx.fill();
-      });
-    };
-
-    const renderPulseGrid = (f) => {
-      const cols = 20;
-      const rows = 12;
-      const cellW = canvas.width / cols;
-      const cellH = canvas.height / rows;
-      const colAmps = Array.from({ length: cols }, (_, col) => ampForBarRange(col, cols, f.dataArray));
-      for (let row = 0; row < rows; row++) {
-        for (let col = 0; col < cols; col++) {
-          // bass columns (low index) get boosted same as bars/radial, so
-          // the left side of the grid visibly floods on a bass hit
-          const bassWeight = Math.max(0, 1 - col / (cols * 0.3));
-          const raw = Math.min(1, colAmps[col] * (1 + f.bassPulse * bassWeight * 2.5));
-          const rowFalloff = 1 - Math.abs(row - rows / 2) / (rows / 2);
-          const intensity = f.isPlaying ? raw * rowFalloff : rowFalloff * 0.05;
-          if (intensity < 0.03) continue;
-          ctx.fillStyle = `hsla(${f.baseHue}, 80%, 60%, ${intensity * 0.8})`;
-          const pad = 2;
-          ctx.fillRect(col * cellW + pad, row * cellH + pad, cellW - pad * 2, cellH - pad * 2);
-        }
-      }
-    };
-
-    const renderNetwork = (f) => {
-      if (!state.nodes) state.nodes = makeFloatParticles(80);
-      // bass is the dominant driver here (not volume) - a quiet bassy
-      // moment should still visibly swell/quicken the network, the way
-      // particles leans on bassLevel for its own pulse+rise
-      const pulseFactor = f.isPlaying ? (0.35 + f.bassPulse * 2.6) : 0.4;
-      // drift speed tracks the music, bass first - a small volume term is
-      // still in there so it's not completely inert on quiet/bassless
-      // audio, but bass is what should actually be felt
-      const speedMul = f.isPlaying ? 1 + f.bassPulse * 5 + f.volumeLevel * 0.6 : 1;
-      state.nodes.forEach((node) => {
-        node.x += node.vx * speedMul;
-        node.y += node.vy * speedMul;
-        if (node.x < 0) node.x = canvas.width;
-        if (node.x > canvas.width) node.x = 0;
-        if (node.y < 0) node.y = canvas.height;
-        if (node.y > canvas.height) node.y = 0;
-      });
-      // connection range swells with bass too, so the whole web visibly
-      // "expands" (more/longer links lighting up) on a hit, not just the
-      // individual node dots
-      const maxDist = 110 + f.bassPulse * 140;
-      for (let i = 0; i < state.nodes.length; i++) {
-        for (let j = i + 1; j < state.nodes.length; j++) {
-          const a = state.nodes[i];
-          const b = state.nodes[j];
-          const dist = Math.hypot(a.x - b.x, a.y - b.y);
-          if (dist < maxDist) {
-            const alpha = Math.min(0.95, (1 - dist / maxDist) * 0.5 * pulseFactor);
-            ctx.strokeStyle = `hsla(${f.baseHue}, 80%, ${65 + f.bassPulse * 15}%, ${alpha})`;
-            ctx.lineWidth = 1 + f.bassPulse * 0.8;
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
-          }
-        }
-      }
-      state.nodes.forEach((node) => {
-        ctx.fillStyle = `hsla(${f.baseHue}, 85%, ${65 + f.bassPulse * 20}%, 0.9)`;
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, 2 * pulseFactor + 1, 0, Math.PI * 2);
-        ctx.fill();
-      });
-    };
-
-    const renderMirrorSpectrum = (f) => {
-      const barCount = 64;
-      const gap = 2;
-      const barWidth = canvas.width / barCount - gap;
-      const midY = canvas.height / 2;
-
-      if (state.rippleTime === undefined) state.rippleTime = 0;
-      if (!state.ripples) state.ripples = [];
-      state.rippleTime += 0.03 + f.bassPulse * 0.05;
-
-      // ceiling is 0.34 of the screen height now (it was 0.26). softCeiling
-      // bends loud peaks instead of clipping them flat, and the analyser has
-      // more headroom, so normal loud music no longer sits pinned at the top
-      const heights = [];
-      const amps = [];
-      for (let i = 0; i < barCount; i++) {
-        const raw = ampForBarRange(i, barCount, f.dataArray);
-        amps.push(raw);
-        const bassWeight = Math.max(0, 1 - i / (barCount * 0.3));
-        const boosted = softCeiling(raw * (1 + f.bassPulse * bassWeight * 2.5));
-        heights.push(f.isPlaying ? Math.max(2, boosted * canvas.height * 0.34) : 2);
-      }
-
-      // the real spectrum, sharp
-      ctx.fillStyle = `hsla(${f.baseHue}, 85%, 60%, 0.75)`;
-      for (let i = 0; i < barCount; i++) {
-        ctx.fillRect(i * (barWidth + gap), midY - heights[i], barWidth, heights[i]);
-      }
-
-      // its reflection. drawn small and stretched back up, which softens the
-      // edges like a blur would. ctx.filter = blur() did the same thing but
-      // ran this preset at a few frames per second, canvas filters are very
-      // slow. a small per-bar horizontal wobble keeps it reading as water
-      const reflectScale = 0.25;
-      const reflectW = Math.max(1, Math.round(canvas.width * reflectScale));
-      const reflectH = Math.max(1, Math.round((canvas.height - midY) * reflectScale));
-      if (!state.reflect) {
-        state.reflect = document.createElement('canvas');
-        state.reflectCtx = state.reflect.getContext('2d');
-      }
-      if (state.reflect.width !== reflectW || state.reflect.height !== reflectH) {
-        state.reflect.width = reflectW;
-        state.reflect.height = reflectH;
-      }
-      const rctx = state.reflectCtx;
-      rctx.clearRect(0, 0, reflectW, reflectH);
-      rctx.fillStyle = `hsla(${f.baseHue}, 85%, 60%, 0.35)`;
-      for (let i = 0; i < barCount; i++) {
-        const wobble = Math.sin(state.rippleTime * 1.5 + i * 0.4) * 2;
-        rctx.fillRect((i * (barWidth + gap) + wobble) * reflectScale, 0, barWidth * reflectScale, heights[i] * reflectScale);
-      }
-      ctx.drawImage(state.reflect, 0, midY, canvas.width, canvas.height - midY);
-
-      // ripples follow the music: a ripple goes out when the sound itself
-      // jumps (a kick, a snare, any sudden hit in the low and mid range), not
-      // on a timer and not only on huge bass hits. flux is how much the
-      // spectrum rose since the last frame, and a hit is flux well above its
-      // own recent average, so it adapts to quiet and loud songs alike
-      if (!state.prevAmps) state.prevAmps = new Array(barCount).fill(0);
-      let flux = 0;
-      for (let i = 0; i < barCount; i++) {
-        const rise = amps[i] - state.prevAmps[i];
-        if (rise > 0) flux += rise * (i < barCount * 0.5 ? 1 : 0.4);
-        state.prevAmps[i] = amps[i];
-      }
-      if (state.fluxMean === undefined) { state.fluxMean = flux; state.fluxVar = 0; }
-      const fluxDev = flux - state.fluxMean;
-      state.fluxMean += fluxDev * 0.04;
-      state.fluxVar += (fluxDev * fluxDev - state.fluxVar) * 0.04;
-      const fluxLimit = state.fluxMean + 1.1 * Math.sqrt(state.fluxVar) + 0.25;
-      const nowMs = performance.now();
-      if (f.isPlaying && flux > fluxLimit && nowMs - (state.lastRippleMs ?? -9999) > 140 && state.ripples.length < 7) {
-        const strength = Math.min(1, 0.3 + (flux - fluxLimit) / (state.fluxMean + 0.8));
-        state.ripples.push({ life: 0, strength });
-        state.lastRippleMs = nowMs;
-      }
-      state.ripples = state.ripples.filter((ripple) => ripple.life < 1);
-      if (state.ripples.length) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(0, midY, canvas.width, canvas.height - midY);
-        ctx.clip();
-        state.ripples.forEach((ripple) => {
-          ripple.life += 0.012 + ripple.strength * 0.018;
-          const radius = ripple.life * canvas.width * (0.35 + ripple.strength * 0.25);
-          const alpha = (1 - ripple.life) * (0.15 + ripple.strength * 0.3);
-          ctx.strokeStyle = `hsla(${f.baseHue}, 80%, 75%, ${alpha})`;
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.ellipse(canvas.width / 2, midY, radius, radius * 0.15, 0, 0, Math.PI * 2);
-          ctx.stroke();
-        });
-        ctx.restore();
-      }
-    };
-
-    const renderOrbit = (f) => {
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      const orbiters = 8;
-      if (state.orbitAngle === undefined) state.orbitAngle = 0;
-      // old deltas (0.01 base, +0.02*volume) were so close together that
-      // the audio-driven part was basically invisible - spin is now mostly
-      // volume-driven instead of a near-constant idle crawl with a tiny
-      // bonus tacked on
-      const spinDelta = f.isPlaying ? 0.004 + f.volumeLevel * 0.09 : 0.004;
-      state.orbitAngle += spinDelta;
-      for (let i = 0; i < orbiters; i++) {
-        // bass swing was capped at +40% radius, barely readable against
-        // orbiters already 1.5-8.5x apart in base radius - +140% makes a
-        // bass hit visibly punch the whole ring outward.
-        const radius = (Math.min(canvas.width, canvas.height) * 0.08) * (i + 1.5) * (1 + f.bassPulse * 1.4);
-        const angle = state.orbitAngle * (i % 2 === 0 ? 1 : -1) + i;
-        const x = cx + Math.cos(angle) * radius;
-        const y = cy + Math.sin(angle) * radius * 0.6;
-        // mostly theme-tinted, small ±10° drift per orbiter plus a
-        // lightness stagger so they're visually distinct from each other
-        // instead of one flat color, with brighter/more saturated tones
-        // than before.
-        const hue = (f.baseHue + (i - orbiters / 2) * 2.5 + 360) % 360;
-        const lightness = 58 + (i % 4) * 8;
-        const size = f.isPlaying ? 4 + f.volumeLevel * 5 + f.bassPulse * 17 : 4;
-        ctx.fillStyle = `hsla(${hue}, 95%, ${lightness}%, 0.9)`;
-        ctx.beginPath();
-        ctx.arc(x, y, size, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    };
-
-    const renderFlowField = (f) => {
-      if (state.flowTime === undefined) state.flowTime = 0;
-      // used to be volume-only (bass had zero say in this one) - now bass
-      // is what really pushes the bands, volume just keeps it from being
-      // totally flat on quiet/bassless audio
-      state.flowTime += 0.02 + f.volumeLevel * 0.01 + f.bassPulse * 0.05;
-      const bands = 5;
-      for (let b = 0; b < bands; b++) {
-        const amplitude = (20 + f.volumeLevel * 15 + f.bassPulse * 65) * (1 - (b / bands) * 0.5);
-        const yOffset = canvas.height * ((b + 1) / (bands + 1));
-        const hue = (f.baseHue + b * 25) % 360;
-        ctx.strokeStyle = `hsla(${hue}, 80%, 60%, ${0.5 - b * 0.06})`;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        for (let x = 0; x <= canvas.width; x += 8) {
-          const y = yOffset + Math.sin(x * 0.01 + state.flowTime + b) * amplitude;
-          if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-      }
-    };
-
-    const renderMinimalPulse = (f) => {
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      const baseRadius = Math.min(canvas.width, canvas.height) * 0.08;
-      const pulse = f.isPlaying ? baseRadius * (1 + f.bassPulse * 1.8) : baseRadius;
-      const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, pulse * 2);
-      gradient.addColorStop(0, `hsla(${f.baseHue}, 85%, 60%, 0.5)`);
-      gradient.addColorStop(1, `hsla(${f.baseHue}, 85%, 60%, 0)`);
-      ctx.fillStyle = gradient;
-      ctx.beginPath();
-      ctx.arc(cx, cy, pulse * 2, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = `hsla(${f.baseHue}, 90%, 65%, 0.9)`;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(cx, cy, pulse, 0, Math.PI * 2);
-      ctx.stroke();
-    };
-
-    const RENDERERS = {
-      none: () => {},
-      particles: renderParticles,
-      bars: renderBars,
-      wave: renderWave,
-      radial: renderRadial,
-      starfield: renderStarfield,
-      pulseGrid: renderPulseGrid,
-      network: renderNetwork,
-      mirrorSpectrum: renderMirrorSpectrum,
-      orbit: renderOrbit,
-      flowField: renderFlowField,
-      minimalPulse: renderMinimalPulse
-    };
+    // one picture of the sound packed for another window (the mini player, the live wallpaper): 96 bars, the waveform and the tempo. s is a
+    // reading (the snapshot of the loop above, or what readSound gave), freq and time its spectrum and waveform
+    const packSound = (s, freq, time, playing, song) => packFrame({
+      baseHue,
+      sat: themeSat,
+      light: themeLight,
+      isPlaying: playing,
+      preset: visualizerPreset,
+      bassPulse: s.bassPulse,
+      bassLevel: s.bassLevel,
+      volumeLevel: s.volumeLevel,
+      soft: s.soft,
+      beat: s.beat,
+      bar: s.bar,
+      bpm: s.bpm,
+      locked: s.locked,
+      phase: s.phase,
+      period: s.period,
+      beatCount: s.beatCount,
+      barCount: s.barCount,
+      beatInBar: s.beatInBar,
+      song,
+      spec: buildSpectrum(freq, ampForBarRange),
+      wave: buildWave(time)
+    });
 
     // the desktop app can have a mini player window open that has no audio of
     // its own, so it is fed from here. nothing to feed on the web or the phone
-    const feedMiniplayer = isTauriApp() && !isAndroidApp();
+    // (isTauriApp() is an async function: its answer used to be taken here as it was, a promise, which is always true, so on the web too
+    // every frame built the frame for the mini player and handed it to code that does nothing there)
+    const feedMiniplayer = isTauriDesktopRef.current && !isAndroidApp();
+    // the live wallpaper window is fed from here too, when it is switched on and the desktop can be seen. read again at every frame
+    // (refs), so switching it on or off, or a window covering the desktop, takes effect without this effect starting over
+    const wantsWallpaper = () => wallpaperOnRef.current && wallpaperShownRef.current && isTauriDesktopRef.current && !isAndroidApp();
+
+    // how often the picture is drawn: about 30 a second, on the phone and on the computer. it was capped at roughly 74 on the computer (13.5 ms),
+    // which kept the graphics process of the app busy for a background that sits behind the controls (measured: the picture was most of what
+    // the app cost the computer while a song played). on a 120 or 144hz monitor the loop used to run at the full refresh rate before that.
+    // while nothing plays the background only drifts, ten a second is enough for that. window.__vizFrameMs is only for measuring
+    const PLAY_FRAME_MS = (typeof window !== 'undefined' && Number(window.__vizFrameMs)) || 30;
+    const IDLE_FRAME_MS = 100;
+    // the plain background draws nothing and the analysers are not read for it, unless the mini player or the picture in picture
+    // window wants frames (looked at a few times a second, they can open at any moment)
+    const WATCH_MS = 250;
 
     const animate = () => {
-      // cap at roughly 60fps. on a 120 or 144hz monitor this loop used to run
-      // at the full refresh rate, which is double the work for nothing, and
-      // it made the presets move faster there than on a 60hz screen
+      animationFrameId = 0;
       const frameNow = performance.now();
-      if (frameNow - (state.lastFrameAt || 0) < 13.5) {
+      const live = isPlaying || fadeTransitionRef.current.active;
+      if (visualizerPreset === 'none' && !(feedMiniplayer || isPipRef.current || wantsWallpaper())) {
+        if (state.drewBefore) { ctx.clearRect(0, 0, canvas.width, canvas.height); state.drewBefore = false; }
+        idleTimerId = setTimeout(() => { idleTimerId = 0; animationFrameId = requestAnimationFrame(animate); }, WATCH_MS);
+        return;
+      }
+      state.drewBefore = true;
+      if (live && frameNow - (state.lastFrameAt || 0) < PLAY_FRAME_MS) {
         animationFrameId = requestAnimationFrame(animate);
         return;
       }
@@ -7351,58 +7644,38 @@ export default function App({
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      const analyser = analyserRef.current;
-      let dataArray = null;
-      let timeData = null;
-      let bassLevel = 0;
-      let volumeLevel = 0;
-      let bassPulse = 0;
+      // the sound, read once: the spectrum and waveform, the loudness, the hit strength and the tempo (vizDrive.js)
+      const sound = analyserRef.current && isPlaying ? readSound(frameNow) : null;
+      const dataArray = sound ? sound.freq : null;
+      const timeData = sound ? sound.time : null;
+      const bassLevel = sound ? sound.bassLevel : 0;
+      const volumeLevel = sound ? sound.volumeLevel : 0;
+      const bassPulse = sound ? sound.bassPulse : 0;
+      const softPulse = sound ? sound.soft : 0;
 
-      if (analyser && isPlaying) {
-        // the two buffers are made once and refilled every frame, new ones
-        // each frame (6kb at 60fps) was constant garbage for the collector
-        if (!state.freqBuffer || state.freqBuffer.length !== analyser.frequencyBinCount) {
-          state.freqBuffer = new Uint8Array(analyser.frequencyBinCount);
-        }
-        if (!state.timeBuffer || state.timeBuffer.length !== analyser.fftSize) {
-          state.timeBuffer = new Uint8Array(analyser.fftSize);
-        }
-        dataArray = state.freqBuffer;
-        timeData = state.timeBuffer;
-        analyser.getByteFrequencyData(dataArray);
-        analyser.getByteTimeDomainData(timeData);
+      snapshot.isPlaying = isPlaying;
+      snapshot.fadeProgress = fadeProgress;
+      snapshot.dataArray = dataArray;
+      snapshot.timeData = timeData;
+      snapshot.bassLevel = bassLevel;
+      snapshot.volumeLevel = volumeLevel;
+      snapshot.bassPulse = bassPulse;
+      snapshot.soft = softPulse;
+      snapshot.beat = sound ? sound.beat : 0;
+      snapshot.bar = sound ? sound.bar : 0;
+      snapshot.bpm = sound ? sound.bpm : 0;
+      snapshot.locked = sound ? sound.locked : false;
+      snapshot.phase = sound ? sound.phase : 0;
+      snapshot.period = sound ? sound.period : 0;
+      snapshot.beatCount = sound ? sound.beatCount : snapshot.beatCount;
+      snapshot.barCount = sound ? sound.barCount : snapshot.barCount;
+      snapshot.beatInBar = sound ? sound.beatInBar : 0;
+      snapshot.dt = Math.min(100, Math.max(4, frameNow - (state.prevPictureAt || frameNow - 33)));
+      snapshot.now = frameNow;
+      state.prevPictureAt = frameNow;
 
-        const bassLength = Math.floor(dataArray.length * 0.1);
-        let bassSum = 0;
-        for (let i = 0; i < bassLength; i++) bassSum += dataArray[i];
-        bassLevel = bassSum / bassLength / 255;
-
-        let volumeSum = 0;
-        for (let i = 0; i < dataArray.length; i++) volumeSum += dataArray[i];
-        volumeLevel = volumeSum / dataArray.length / 255;
-
-        // bassLevel on its own turned out to be a bad "hit" signal - most
-        // mixed music sits with a lot of raw energy in the low end more or
-        // less constantly, so boosting straight off of it just made
-        // everything sit permanently maxed out instead of actually pumping
-        // with the beat. bassPulse tracks a slow-moving floor for the bass
-        // band and only lights up when the current instant pushes above
-        // it (fast attack, slow decay - the classic percussive-envelope
-        // shape) so a sustained bassline reads as "present" without being
-        // solid, and an actual kick/hit still visibly punches through
-        if (state.bassBaseline === undefined) state.bassBaseline = bassLevel;
-        state.bassBaseline += (bassLevel - state.bassBaseline) * 0.06;
-        // 4.2 (was 3.5) because the analyser range was widened above, which
-        // scales every level down a little
-        const onset = Math.max(0, bassLevel - state.bassBaseline) * 4.2;
-        state.bassPulse = Math.max(onset, (state.bassPulse || 0) * 0.85);
-        // the kick is found on its own analyser, which does not smooth: it hits on the frame of the drum and falls away fast. the older
-        // pulse (loud wide band hits) stays for what is not a kick drum
-        bassPulse = Math.min(1, Math.max(state.bassPulse, readKick(frameNow)));
-      }
-
-      const renderer = RENDERERS[visualizerPreset] || renderParticles;
-      renderer({ baseHue, isPlaying, fadeProgress, bassLevel, bassPulse, volumeLevel, dataArray, timeData });
+      const renderer = RENDERERS[visualizerPreset] || RENDERERS.particles;
+      renderer(snapshot);
 
       // downsampled copy for the miniplayer's own background visualizer -
       // it has no audio context of its own (nothing plays there), so this
@@ -7421,31 +7694,27 @@ export default function App({
       const feedFrames = feedMiniplayer || isPipRef.current;
       if (feedFrames && (isPlaying || state.miniWasPlaying !== false)) {
         state.miniWasPlaying = isPlaying;
-        let bins = null;
-        let wave = null;
-        if (dataArray) {
-          bins = new Array(24);
-          for (let i = 0; i < 24; i++) bins[i] = Math.round(ampForBarRange(i, 24, dataArray) * 255);
-        }
-        if (timeData) {
-          // 96 points from the first quarter of the buffer. the old 24 points
-          // were single samples picked far apart, which is not a waveform but
-          // noise (that is what read as "too dense"). a short slice at a fine
-          // step is a few smooth swings, which is what the main window shows
-          const points = 96;
-          const span = Math.floor(timeData.length / 4);
-          wave = new Array(points);
-          for (let i = 0; i < points; i++) wave[i] = timeData[Math.floor((i * span) / points)];
-        }
-        const frame = { baseHue, isPlaying, preset: visualizerPreset, bins, wave, bassPulse, volumeLevel };
+        // the picture of the sound the other windows draw from (the mini player, the floating window on the phone): the bars, the
+        // waveform and the tempo, the same drawing as the background (without the song: they have their own title and progress)
+        const packed = packSound(snapshot, dataArray, timeData, isPlaying, undefined);
+        if (isPipRef.current) window.__smpVizFrame = packed;
         if (feedMiniplayer) {
-          sendVisualizerFrame(frame);
+          sendVisualizerFrame(packed);
           state.lastMiniSentAt = performance.now();
         }
-        if (isPipRef.current) window.__smpVizFrame = frame;
       }
 
-      animationFrameId = requestAnimationFrame(animate);
+      // the live wallpaper window: 64 bars and 512 points of the wave, packed (see wallpaperFrame.js). while a song plays every drawing of
+      // this loop sends one. at rest only the first frame after it stopped goes out, and one more whenever the wallpaper asks for it
+      if (wantsWallpaper() && (isPlaying || state.wallWasPlaying !== false || wallpaperNeedsFrameRef.current)) {
+        state.wallWasPlaying = isPlaying;
+        wallpaperNeedsFrameRef.current = false;
+        sendWallpaperFrame(packSound(snapshot, dataArray, timeData, isPlaying, songForWallpaper(frameNow)));
+        state.lastWallSentAt = performance.now();
+      }
+
+      if (live) animationFrameId = requestAnimationFrame(animate);
+      else idleTimerId = setTimeout(() => { idleTimerId = 0; animationFrameId = requestAnimationFrame(animate); }, IDLE_FRAME_MS);
     };
 
     animate();
@@ -7458,52 +7727,48 @@ export default function App({
     const onPhone = isAndroidApp() && typeof window !== 'undefined' && window.SmpNative && typeof window.SmpNative.vizFrame === 'function';
     let fallbackTimer = null;
     if (isPlaying && (feedMiniplayer || onPhone)) {
-      const buildFrame = () => {
-        const analyser = analyserRef.current;
-        if (!analyser) return null;
-        if (!state.freqBuffer || state.freqBuffer.length !== analyser.frequencyBinCount) state.freqBuffer = new Uint8Array(analyser.frequencyBinCount);
-        if (!state.timeBuffer || state.timeBuffer.length !== analyser.fftSize) state.timeBuffer = new Uint8Array(analyser.fftSize);
-        const freq = state.freqBuffer;
-        const time = state.timeBuffer;
-        analyser.getByteFrequencyData(freq);
-        analyser.getByteTimeDomainData(time);
-        const bassLength = Math.max(1, Math.floor(freq.length * 0.1));
-        let bassSum = 0;
-        for (let i = 0; i < bassLength; i++) bassSum += freq[i];
-        const bassLevel = bassSum / bassLength / 255;
-        let volumeSum = 0;
-        for (let i = 0; i < freq.length; i++) volumeSum += freq[i];
-        if (state.bassBaseline === undefined) state.bassBaseline = bassLevel;
-        state.bassBaseline += (bassLevel - state.bassBaseline) * 0.06;
-        const onset = Math.max(0, bassLevel - state.bassBaseline) * 4.2;
-        state.bassPulse = Math.max(onset, (state.bassPulse || 0) * 0.85);
-        const pulse = Math.min(1, Math.max(state.bassPulse, readKick(performance.now())));
-        const bins = new Array(24);
-        for (let i = 0; i < 24; i++) bins[i] = Math.round(ampForBarRange(i, 24, freq) * 255);
+      // the phone's window gets one line of text: the theme hue, the hit, the drawing, the tempo numbers, the theme's saturation and
+      // lightness, then the 96 bars and 96 points of the waveform.
+      // "hue,bass,preset,soft,beat,bar,bpm,locked,phase,period,beats,bars,beatInBar,volume,saturation,lightness;b0,b1,...;w0,w1,..."
+      const buildPhoneText = (sound) => {
+        const spec = buildSpectrum(sound.freq, ampForBarRange);
+        const time = sound.time;
         const points = 96;
         const span = Math.floor(time.length / 4);
         const wave = new Array(points);
         for (let i = 0; i < points; i++) wave[i] = time[Math.floor((i * span) / points)];
-        return { baseHue, isPlaying: true, preset: visualizerPreset, bins, wave, bassPulse: pulse, volumeLevel: volumeSum / freq.length / 255 };
+        const n2 = (x) => (Number(x) || 0).toFixed(2);
+        const head = [Math.round(baseHue), n2(sound.bassPulse), visualizerPreset, n2(sound.soft), n2(sound.beat), n2(sound.bar), Math.round(sound.bpm || 0), sound.locked ? 1 : 0, n2(sound.phase), Math.round(sound.period || 0), Math.round(sound.beatCount || 0), Math.round(sound.barCount || 0), Math.round(sound.beatInBar || 0), n2(sound.volumeLevel), themeSat, themeLight];
+        return `${head.join(',')};${Array.prototype.join.call(spec, ',')};${wave.join(',')}`;
       };
       let fastTick = true;
       const tick = () => {
         if (feedMiniplayer) {
-          if (performance.now() - (state.lastMiniSentAt || 0) < 150) return;
-          const frame = buildFrame();
-          if (frame) {
-            sendVisualizerFrame(frame);
+          // the mini player wants a frame when the loop above has not sent one for a moment (about 22 a second), the wallpaper (a whole
+          // screen, it has to move smoothly) when it has not for a few frames. both come from one reading of the analysers
+          const now = performance.now();
+          const wantMini = now - (state.lastMiniSentAt || 0) >= 45;
+          const wantWall = wantsWallpaper() && now - (state.lastWallSentAt || 0) >= 45;
+          if (!wantMini && !wantWall) return;
+          const raw = readSound(performance.now());
+          if (!raw) return;
+          if (wantMini) {
+            sendVisualizerFrame(packSound(raw, raw.freq, raw.time, true, undefined));
             state.lastMiniSentAt = performance.now();
+          }
+          if (wantWall) {
+            wallpaperNeedsFrameRef.current = false;
+            sendWallpaperFrame(packSound(raw, raw.freq, raw.time, true, songForWallpaper(performance.now())));
+            state.lastWallSentAt = performance.now();
           }
           return;
         }
         // the phone: about thirty frames a second (the window smooths between them)
-        const frame = buildFrame();
-        if (!frame) return;
-        const text = `${Math.round(frame.baseHue)},${frame.bassPulse.toFixed(2)},${frame.preset === 'wave' ? 1 : 0};${frame.bins.join(',')};${frame.wave.join(',')}`;
+        const sound = readSound(performance.now());
+        if (!sound) return;
         let drawn = false;
         try {
-          drawn = Boolean(window.SmpNative.vizFrame(text));
+          drawn = Boolean(window.SmpNative.vizFrame(buildPhoneText(sound)));
         } catch {
           drawn = false;
         }
@@ -7521,11 +7786,14 @@ export default function App({
     return () => {
       window.removeEventListener('resize', resizeCanvas);
       cancelAnimationFrame(animationFrameId);
+      clearTimeout(idleTimerId);
       if (fallbackTimer) clearInterval(fallbackTimer);
     };
-  }, [isPlaying, themeColor, visualizerPreset]);
+    // isTauriDesktop: the feeds above (mini player, wallpaper) and their timer are decided when this starts, so it starts again when the
+    // answer to "is this the desktop app" arrives, a song that started a moment before it would never have fed them
+  }, [isPlaying, themeColor, visualizerPreset, isTauriDesktop]);
 
-  
+
   useEffect(() => {
     const fade = fadeTransitionRef.current;
     if (isPlaying) {
@@ -8531,12 +8799,32 @@ export default function App({
     } else {
       if (!audio.src) {
         autoplayRef.current = true;
-        const startIndex = playIndex >= 0 ? playIndex : 0;
-        const list = currentTracks.length > 0 ? currentTracks : queue;
-        // restoreSavedPosition so a track that stopped partway through (stream
-        // died) resumes from where it stopped, it only applies when the saved
-        // spot belongs to this same track
-        playTrackAtIndex(startIndex, list, { source: 'personal', restoreSavedPosition: true });
+        const startFromQueue = () => {
+          // read now, not from the render of the press: right after the app opens the account's queue may arrive in between
+          const queued = queueRef.current;
+          // the queue, and the open playlist only when the queue is empty (the playlist's songs are not what the position is a position in)
+          const list = queued.length > 0 ? queued : currentTracks;
+          const startIndex = list === queued ? Math.min(Math.max(playIndexRef.current, 0), list.length - 1) : 0;
+          // restoreSavedPosition so a track that stopped partway through (stream
+          // died) resumes from where it stopped, it only applies when the saved
+          // spot belongs to this same track
+          playTrackAtIndex(startIndex, list, { source: 'personal', restoreSavedPosition: true });
+        };
+        if (user && !queueSyncReadyRef.current) {
+          // right after the app opens the queue on the screen is the one this device remembered from last time, and the account's
+          // queue (which may have changed on another device) has not arrived yet: a play that comes in that moment waits for it
+          // (a few seconds at most, a server that does not answer does not keep the music from starting)
+          let waited = 0;
+          const timer = setInterval(() => {
+            waited += 100;
+            if (queueSyncReadyRef.current || waited >= 4000) {
+              clearInterval(timer);
+              startFromQueue();
+            }
+          }, 100);
+        } else {
+          startFromQueue();
+        }
       } else {
         // restore saved position for personal mode
         const saved = personalPlayerStateRef.current;
@@ -8643,12 +8931,11 @@ export default function App({
 
   // tauri miniplayer bridge - no-ops entirely outside tauri (browser/pwa),
   // see src/tauriApi.js
-  const [isTauriDesktop, setIsTauriDesktop] = useState(false);
-  // false until the answer to "is this the desktop app" is in, the update check waits for it
-  const [tauriKnown, setTauriKnown] = useState(false);
+  // (isTauriDesktop and tauriKnown are declared next to isTauriDesktopRef, the visualizer effect further up depends on isTauriDesktop)
   useEffect(() => {
     isTauriApp().then((v) => {
       frontendLog('main', `isTauriApp() resolved: ${v}`);
+      isTauriDesktopRef.current = Boolean(v);
       setIsTauriDesktop(v);
       setTauriKnown(true);
     });
@@ -8715,7 +9002,8 @@ export default function App({
     };
     const ownPlaying = Boolean(currentTrack && currentTrack.title && isPlaying);
     const remotePlayingNow = !ownPlaying && Boolean(remotePlaying && discordRemoteRef.current && discordRemoteRef.current.track && discordRemoteRef.current.track.title);
-    const ownPaused = Boolean(currentTrack && currentTrack.title) && !ownPlaying && !remotePlayingNow;
+    // paused means a song that was playing and stopped, not the one the app opened on (nothing is loaded in the player until it is played)
+    const ownPaused = Boolean(currentTrack && currentTrack.title) && Boolean(audioRef.current && audioRef.current.src) && !ownPlaying && !remotePlayingNow;
     if (!discordOn || hideListening || (!ownPlaying && !remotePlayingNow && !ownPaused)) {
       post({ clear: true });
       return undefined;
@@ -9329,6 +9617,8 @@ export default function App({
     setCurrentIndex(-1);
     setCurrentTrack(null);
     playIndexRef.current = -1;
+    personalPlayerStateRef.current = { videoId: null, currentTime: 0, duration: 0 };
+    clearResume(resumeUserRef.current);
     setPlayNextQueue([]);
   };
 
@@ -9390,6 +9680,7 @@ export default function App({
         currentTime: newTime,
         duration: audio.duration || 0
       };
+      writeResume(resumeUserRef.current, currentTrack?.videoId, newTime, audio.duration);
     }
   };
 
@@ -9434,12 +9725,15 @@ export default function App({
     const playlist = activePlaylists.find((item) => item.id === playlistId) || ensureTargetPlaylist('my queue');
 
     addDebugLog('playlist', `add all to "${playlist.name}": ${queue.length} tracks`);
+    const stamp = Date.now();
+    const added = queue.map((track, i) => ({ ...normalizeTrack(track), addedAt: stamp + i }));
     setPlaylists((prev) => prev.map((p) =>
       p.id === playlist.id
-        ? { ...p, tracks: [...p.tracks, ...queue.map((track) => ({ ...normalizeTrack(track), addedAt: Date.now() }))] }
+        ? { ...p, tracks: [...p.tracks, ...added] }
         : p
     ));
-    showNotification(`added ${queue.length} tracks to "${playlist.name}"`, 'success');
+    const entry = recordChange('tracks-added', `added ${added.length} song${added.length === 1 ? '' : 's'} to "${clipText(playlist.name)}"`, { playlistId: playlist.id, keys: keysOf(added) });
+    showNotification(`added ${queue.length} tracks to "${playlist.name}"`, 'success', undoActionFor(entry));
   };
 
   const loadPlaylistToQueue = () => {
@@ -9528,7 +9822,8 @@ export default function App({
     setCurrentPlaylistId(newPlaylist.id);
     setNewPlaylistName('');
     setShowPlaylistModal(false);
-    showNotification(`playlist "${newPlaylist.name}" created`, 'success');
+    const entry = recordChange('playlist-created', `created playlist "${clipText(newPlaylist.name)}"`, { playlistId: newPlaylist.id });
+    showNotification(`playlist "${newPlaylist.name}" created`, 'success', undoActionFor(entry));
   };
 
   const deletePlaylist = async (id) => {
@@ -9536,36 +9831,55 @@ export default function App({
       showNotification('cannot delete the last playlist', 'error');
       return;
     }
+    const gone = playlists.find((p) => p.id === id);
     const newPlaylists = playlists.filter((p) => p.id !== id);
     setPlaylists(newPlaylists);
     if (currentPlaylistId === id) {
       setCurrentPlaylistId(newPlaylists[0].id);
     }
-    showNotification('playlist deleted', 'success');
+    if (gone) {
+      const entry = recordChange('playlist-deleted', `deleted playlist "${clipText(gone.name)}" (${gone.tracks.length} song${gone.tracks.length === 1 ? '' : 's'})`, { playlist: gone, index: playlists.indexOf(gone) });
+      showNotification('playlist deleted', 'success', undoActionFor(entry));
+    } else {
+      showNotification('playlist deleted', 'success');
+    }
   };
 
   const renamePlaylist = async (id, newName) => {
+    const before = playlists.find((p) => p.id === id);
     setPlaylists(playlists.map((p) =>
       p.id === id ? { ...p, name: newName } : p
     ));
-    showNotification('playlist renamed', 'success');
+    if (before && before.name !== newName) {
+      const entry = recordChange('playlist-renamed', `renamed "${clipText(before.name)}" to "${clipText(newName)}"`, { playlistId: id, from: before.name, to: newName });
+      showNotification('playlist renamed', 'success', undoActionFor(entry));
+    } else {
+      showNotification('playlist renamed', 'success');
+    }
   };
 
   const addTrackToPlaylist = async (track, playlistId = currentPlaylistId) => {
     const playlist = activePlaylists.find((item) => item.id === playlistId);
     const normalizedTrack = normalizeTrack(track);
+    const addedAt = Date.now();
 
     addDebugLog('playlist', `add to "${playlist?.name}": ${track.title || track.videoId}`);
     setPlaylists(playlists.map((p) =>
       p.id === playlistId
-        ? { ...p, tracks: [...p.tracks, { ...normalizedTrack, addedAt: Date.now() }] }
+        ? { ...p, tracks: [...p.tracks, { ...normalizedTrack, ...(normalizedTrack.discover ? { discover: false } : {}), addedAt }] }
         : p
     ));
-    showNotification(`added to "${playlist?.name}"`, 'success');
+    if (playlist && normalizedTrack.videoId) {
+      const entry = recordChange('track-added', `added "${clipText(normalizedTrack.title)}" to "${clipText(playlist.name)}"`, { playlistId, videoId: normalizedTrack.videoId, addedAt });
+      showNotification(`added to "${playlist.name}"`, 'success', undoActionFor(entry));
+    } else {
+      showNotification(`added to "${playlist?.name}"`, 'success');
+    }
   };
 
   const removeTrackFromPlaylist = async (index) => {
     const track = currentTracks[index];
+    const playlist = activePlaylists.find((item) => item.id === currentPlaylistId);
 
     addDebugLog('playlist', `remove from "${currentPlaylistId}": ${track?.title || index}`);
     setPlaylists(playlists.map((p) =>
@@ -9573,17 +9887,28 @@ export default function App({
         ? { ...p, tracks: p.tracks.filter((_, i) => i !== index) }
         : p
     ));
-    showNotification('track removed from playlist', 'info');
+    if (track && playlist) {
+      const entry = recordChange('track-removed', `removed "${clipText(track.title)}" from "${clipText(playlist.name)}"`, { playlistId: currentPlaylistId, index, track, beforeKey: currentTracks[index + 1] ? keysOf([currentTracks[index + 1]])[0] : '', afterKey: currentTracks[index - 1] ? keysOf([currentTracks[index - 1]])[0] : '' });
+      showNotification('track removed from playlist', 'info', undoActionFor(entry));
+    } else {
+      showNotification('track removed from playlist', 'info');
+    }
   };
 
   const clearPlaylist = async () => {
     const playlist = activePlaylists.find((item) => item.id === currentPlaylistId);
 
     addDebugLog('playlist', `clear "${playlist?.name}" (${currentTracks.length} tracks)`);
+    const before = currentTracks.slice();
     setPlaylists(playlists.map((p) =>
       p.id === currentPlaylistId ? { ...p, tracks: [] } : p
     ));
-    showNotification('playlist cleared', 'info');
+    if (playlist && before.length) {
+      const entry = recordChange('playlist-cleared', `cleared "${clipText(playlist.name)}" (${before.length} song${before.length === 1 ? '' : 's'})`, { playlistId: currentPlaylistId, tracks: before });
+      showNotification('playlist cleared', 'info', undoActionFor(entry));
+    } else {
+      showNotification('playlist cleared', 'info');
+    }
   };
 
   // shared by every "save this text as a file" action (debug logs already
@@ -9720,6 +10045,34 @@ export default function App({
     return () => clearInterval(timer);
   }, [announceOn]);
 
+  // january 1st: the wrapped of the year that just ended opens by itself, once per account (it waits for the welcome window and Shibby's
+  // popups to be gone, and for the page to be on screen). a year with hardly anything in it is skipped. any year can be opened from the stats tab
+  useEffect(() => {
+    if (!currentUserId || offlineModeActive) return undefined;
+    let busy = false;
+    const check = async () => {
+      if (busy || announceBusyRef.current || document.visibilityState !== 'visible') return;
+      const now = new Date();
+      if (now.getMonth() !== 0 || now.getDate() !== 1) return;
+      const year = now.getFullYear() - 1;
+      const key = 'music_wrapped_seen:' + currentUserId;
+      try { if (window.localStorage.getItem(key) === String(year)) return; } catch { return; }
+      busy = true;
+      try {
+        const result = await fetchJson('/api/wrapped?year=' + year + '&tz=' + (-now.getTimezoneOffset()));
+        const wrapped = result && result.wrapped;
+        try { window.localStorage.setItem(key, String(year)); } catch { /* it comes again at the next check */ }
+        if (wrapped && wrapped.totals.seconds >= 300) setWrappedView((open) => open || { year, data: wrapped, auto: true });
+      } catch (error) {
+        // the server did not answer: the next check asks again
+      }
+      busy = false;
+    };
+    const first = setTimeout(check, 6000);
+    const timer = setInterval(check, 60000);
+    return () => { clearTimeout(first); clearInterval(timer); };
+  }, [currentUserId, offlineModeActive]);
+
   // ---- discover (see discover.js): keeps 10 songs ahead of the one that is playing. they come from youtube's mix of a few songs of the
   // queue and go into the queue like any song the person added. one that is taken out is not suggested again in this session
   const [discoverOn, setDiscoverOn] = useState(() => {
@@ -9743,6 +10096,16 @@ export default function App({
     return () => { stopped = true; };
   }, []);
   const discoverRef = useRef({ busy: false, reservoir: [], rejected: new Set(), seedUse: new Map(), retryAt: 0, told: false });
+  // discover asks YouTube about the songs the person chose, never about the ones it added itself (that made the taste drift). a song it
+  // added counts as theirs from the moment they show they like it: they play it by hand, hear it to the end, put it in a playlist or
+  // save it offline. the mark is simply taken off the song
+  keepDiscoverRef.current = (videoId) => {
+    if (!videoId) return;
+    const added = discoverAdded();
+    if (added.delete(videoId)) saveAdded(window.localStorage, added);
+    if (!queueRef.current.some((track) => track && track.discover && track.videoId === videoId)) return;
+    setQueue((prev) => prev.map((track) => (track && track.discover && track.videoId === videoId ? { ...track, discover: false } : track)));
+  };
   const [discoverTick, setDiscoverTick] = useState(0);
   useEffect(() => {
     if (!discoverOn || !discoverAvailable || playbackSource === 'shared' || offlineModeActive || !queue.length) return undefined;
@@ -9765,8 +10128,9 @@ export default function App({
         const context = { queue: live, ahead: live.slice(Math.max(here + 1, 0)), rejected: run.rejected, recent };
         let ranked = rankCandidates({ ...context, leftover: run.reservoir, mixes: [] });
         if (ranked.length < need) {
-          // one lookup when there is something left over, two (the song that plays and another) when starting from nothing
-          const seeds = pickSeeds({ queue: live, playIndex: here, seedUse: run.seedUse, max: ranked.length ? 1 : 2 });
+          // two lookups when there is something left over (a song that shows up in both is the best fit there is), three (different
+          // artists) when starting from nothing
+          const seeds = pickSeeds({ queue: live, playIndex: here, seedUse: run.seedUse, max: ranked.length ? 2 : 3, added: discoverAdded() });
           const mixes = await Promise.all(seeds.map(async (seed) => {
             run.seedUse.set(seed.videoId, (run.seedUse.get(seed.videoId) || 0) + 1);
             try {
@@ -9788,6 +10152,9 @@ export default function App({
         run.reservoir = trimReservoir(ranked.filter((item) => !chosen.includes(item)));
         if (chosen.length) {
           const fresh = chosen.map((item) => normalizeTrack({ videoId: item.videoId, title: item.title, author: item.author, durationMs: item.duration * 1000, source: 'youtube', discover: true }));
+          const added = discoverAdded();
+          fresh.forEach((track) => added.add(track.videoId));
+          saveAdded(window.localStorage, added);
           setQueue((prev) => {
             const have = new Set(prev.map((track) => track.videoId));
             const add = fresh.filter((track) => !have.has(track.videoId));
@@ -10347,6 +10714,7 @@ export default function App({
       return;
     }
     setQueue((prev) => [...prev, normalized]);
+    recordChange('queue-added', `added "${clipText(normalized.title)}" to the queue`, { videoIds: [normalized.videoId] });
     showNotification('added to queue', 'info');
     logClient('addTrackToQueue', { videoId: normalized.videoId, title: normalized.title });
   };
@@ -10538,7 +10906,8 @@ export default function App({
       showNotification('you cannot edit this playlist', 'warning');
       return;
     }
-    const trackId = playlist.tracks[index]?.id;
+    const removedTrack = playlist.tracks[index];
+    const trackId = removedTrack?.id;
     setPlaylists((prev) => prev.map((p) =>
       p.id === playlistId
         ? { ...p, tracks: p.tracks.filter((_, i) => i !== index) }
@@ -10554,7 +10923,12 @@ export default function App({
       showNotification('failed to remove track from collab playlist on server', 'error');
       console.error('Collab playlist remove track error:', err);
     }
-    showNotification('track removed', 'success');
+    if (removedTrack) {
+      const entry = recordChange('collab-track-removed', `removed "${clipText(removedTrack.title)}" from "${clipText(playlist.name)}"`, { serverId: currentChannelId, playlistId, track: removedTrack });
+      showNotification('track removed', 'success', undoActionFor(entry));
+    } else {
+      showNotification('track removed', 'success');
+    }
     try {
       wsRef.current?.send(JSON.stringify({
         type: 'collab_playlist_track_removed',
@@ -10727,6 +11101,10 @@ export default function App({
     logClient('removeFromQueue', { index, currentPlayIndex: playIndexRef.current });
     if (index < 0 || index >= queue.length) return;
     if (queue[index] && queue[index].discover) discoverRef.current.rejected.add(queue[index].videoId);
+    // a song the app suggested is not something to bring back, the rest can be
+    const undo = queue[index] && !queue[index].discover
+      ? undoActionFor(recordChange('queue-removed', `removed "${clipText(queue[index].title)}" from the queue`, { index, track: queue[index], beforeId: queue[index + 1] ? queue[index + 1].videoId : '', afterId: queue[index - 1] ? queue[index - 1].videoId : '' }))
+      : null;
 
     const next = queue.filter((_, i) => i !== index);
     const personalActive = playbackSourceRef.current !== 'shared';
@@ -10744,13 +11122,13 @@ export default function App({
 
     if (!next.length) {
       stopPersonalPlayback();
-      showNotification('removed from queue', 'info');
+      showNotification('removed from queue', 'info', undo);
       return;
     }
 
     if (removingCurrentTrack) {
       stopAndResetPlayback();
-      showNotification('current track removed from queue', 'info');
+      showNotification('current track removed from queue', 'info', undo);
       return;
     }
 
@@ -10766,22 +11144,62 @@ export default function App({
       if (!queueRunningRef.current) setCurrentIndex(shiftedIndex);
     }
 
-    showNotification('removed from queue', 'info');
+    showNotification('removed from queue', 'info', undo);
   };
 
   // a song of the queue that can not be played: Shibby says so and asks what to do with it. false when there is nobody
   // to look at a popup (the window is hidden) or the song is in a room, and the player carries on by itself
-  const reportUnavailable = (track) => {
+  // `why` is what explainFailure (playbackWhy.js) made of the checks: its kind (gone, blocked, botcheck, network, helper, slow, unknown), the
+  // sentence that says what is wrong and the lines of what was checked. a song that youtube says is gone or will not hand out is remembered
+  // so discover and the replacing do not offer it again
+  const reportUnavailable = (track, why) => {
     if (!track || !track.videoId || playbackSourceRef.current === 'shared' || (typeof document !== 'undefined' && document.hidden)) return false;
-    unavailableIdsRef.current.add(track.videoId);
-    const note = { videoId: track.videoId, title: track.title || 'this song', author: track.author || '', state: 'ask' };
+    const reason = why && why.kind ? why : explainFailure({});
+    if (reason.kind === 'gone' || reason.kind === 'blocked') unavailableIdsRef.current.add(track.videoId);
+    const note = { videoId: track.videoId, title: track.title || 'this song', author: track.author || '', state: 'ask', kind: reason.kind, text: reason.text, checked: reason.checked || [] };
     shibbyRef.current = note;
     setShibby(note);
     playNotifSound();
-    addDebugLog('playback', 'song is not available, asking what to do', { videoId: track.videoId, title: track.title }, true);
+    addDebugLog('playback', `song would not play (${reason.kind}): ${reason.short}`, { videoId: track.videoId, title: track.title, checked: reason.checked }, true);
     return true;
   };
   shibbyOpenRef.current = reportUnavailable;
+
+  // the song would not load and YouTube was asked about it. "gone" is the only thing that is called unavailable. a song YouTube still
+  // has failed because of the connection or a block that lasts a moment: it is tried once more without a word, and only when that
+  // fails too Shibby asks (a different question: try again, not "it is gone")
+  const tryLoadAgain = (track, force = false) => {
+    if (!track || !track.videoId || playbackSourceRef.current === 'shared') return false;
+    const last = retriedLoadRef.current.get(track.videoId) || 0;
+    if (!force && Date.now() - last < 3 * 60 * 1000) return false;
+    const list = queueRef.current;
+    const at = list.findIndex((item) => normalizeTrack(item).videoId === track.videoId);
+    if (at < 0) return false;
+    retriedLoadRef.current.set(track.videoId, Date.now());
+    addDebugLog('playback', 'song would not load, trying it again', { videoId: track.videoId, title: track.title }, true);
+    playTrackAtIndex(at, list, { source: 'personal', notify: false, stayOnFail: true });
+    return true;
+  };
+  failedLoadRef.current = (track, why) => {
+    const kind = why && why.kind;
+    // a cause that is the same for every song (no connection, the helper down, a robot check) is said once, not for every song of the queue:
+    // the same one within three minutes is left to the caller, which says it in a line and stops
+    if (kind === 'network' || kind === 'helper' || kind === 'botcheck') {
+      const last = causeNoticeRef.current;
+      if (last.kind === kind && Date.now() - last.at < 3 * 60 * 1000) return false;
+      causeNoticeRef.current = { kind, at: Date.now() };
+      return reportUnavailable(track, why);
+    }
+    // it loads now: one more try without a word, and only when that fails too is the person asked
+    if (kind === 'slow' && tryLoadAgain(track)) return true;
+    return reportUnavailable(track, why);
+  };
+  const shibbyRetry = () => {
+    const note = shibbyRef.current;
+    if (!note) return;
+    closeShibby();
+    tryLoadAgain({ videoId: note.videoId, title: note.title }, true);
+  };
 
   const closeShibby = () => {
     shibbyRef.current = null;
@@ -10856,10 +11274,56 @@ export default function App({
   };
 
   const clearQueue = () => {
+    const before = queue.filter((track) => !track.discover);
     setQueue([]);
     stopPersonalPlayback();
-    showNotification('queue cleared', 'info');
+    if (before.length) {
+      const entry = recordChange('queue-cleared', `cleared the queue (${before.length} song${before.length === 1 ? '' : 's'})`, { tracks: before });
+      showNotification('queue cleared', 'info', undoActionFor(entry));
+    } else {
+      showNotification('queue cleared', 'info');
+    }
   };
+
+  // takes one recent change back (the button in the toast, the recent changes window, ctrl+z). see undoHistory.js
+  const undoChange = (id) => {
+    const entry = undoHistoryRef.current.find((item) => item.id === id);
+    if (!entry) return;
+    const refuse = (reason) => showNotification(reason, 'warning');
+    const finish = () => {
+      commitHistory(dropEntry(undoHistoryRef.current, entry.id));
+      showNotification(`undone: ${entry.label}`, 'success');
+    };
+    if (entry.kind === 'collab-track-removed') {
+      if (!currentChannelId || currentChannelId !== entry.data.serverId) { refuse('join that room again first'); return; }
+      commitHistory(dropEntry(undoHistoryRef.current, entry.id));
+      addTrackToCollabPlaylist(entry.data.track, entry.data.playlistId);
+      return;
+    }
+    if (entry.kind === 'queue-removed' || entry.kind === 'queue-cleared') {
+      const personalActive = playbackSourceRef.current !== 'shared';
+      const result = undoOnQueue(queue, entry, personalActive ? playIndexRef.current : -1);
+      if (!result.ok) { refuse(result.reason); return; }
+      setQueue(result.queue);
+      if (personalActive && result.playIndex !== playIndexRef.current) {
+        playIndexRef.current = result.playIndex;
+        setPlayIndex(result.playIndex);
+        if (!queueRunningRef.current) setCurrentIndex(result.playIndex);
+      }
+      finish();
+      return;
+    }
+    const result = undoOnPlaylists(playlists, entry);
+    if (!result.ok) { refuse(result.reason); return; }
+    setPlaylists(result.playlists);
+    if (entry.kind === 'playlist-deleted' && result.playlistId) setCurrentPlaylistId(result.playlistId);
+    if (entry.kind === 'playlist-created' && currentPlaylistId === entry.data.playlistId) {
+      const rest = result.playlists.find((p) => p.type !== 'collab');
+      if (rest) setCurrentPlaylistId(rest.id);
+    }
+    finish();
+  };
+  undoChangeRef.current = undoChange;
 
   const fetchVideoInfo = async (videoId) => {
     addDebugLog('api', `fetching video info: ${videoId}`, null, true);
@@ -11045,6 +11509,7 @@ export default function App({
       addDebugLog('queue', `setQueue callback: adding ${videoId} at index ${next.length - 1}, queue size: ${next.length}`, { videoId, queueSize: next.length }, true);
       return next;
     });
+    recordChange('queue-added', `added "${clipText(normalizedItem?.title || 'a song')}" to the queue`, { videoIds: [videoId] });
     showNotification('fetching video info...', 'info');
     setQuery('');
     setSuggestions([]);
@@ -11089,6 +11554,7 @@ export default function App({
         return next;
       });
 
+      recordChange('queue-added', `added ${tracks.length} song${tracks.length === 1 ? '' : 's'} from a playlist to the queue`, { videoIds: tracks.map((t) => t.videoId) });
       showNotification(`added ${tracks.length} tracks from playlist`, 'success');
       setQuery('');
       setSuggestions([]);
@@ -11465,8 +11931,7 @@ export default function App({
   const [, setRoomTick] = useState(0);
   useEffect(() => {
     if (playbackSource === 'shared' || !channelPlayerState?.is_playing || activeTab !== 'collab') return undefined;
-    const timer = setInterval(() => setRoomTick((tick) => tick + 1), 1000);
-    return () => clearInterval(timer);
+    return visibleInterval(() => setRoomTick((tick) => tick + 1), 1000);
   }, [activeTab, channelPlayerState?.is_playing, playbackSource]);
   const sharedTrackProgress = playbackSource === 'shared'
     ? trackProgress
@@ -11478,7 +11943,7 @@ export default function App({
   const otherOnlineSharedMembers = onlineSharedMembers.filter((member) => member.user_id !== currentUserId);
   const sharedAudioStatus = (() => {
     if (!currentChannel) {
-      return { label: 'join a channel to use the shared player', tone: '#9ca3af' };
+      return { label: 'join a channel to use the shared player', tone: 'var(--theme-primary)' };
     }
 
     if (!channelQueue.length) {
@@ -11486,7 +11951,7 @@ export default function App({
         label: otherOnlineSharedMembers.length > 0
           ? `waiting on a client to queue audio for ${otherOnlineSharedMembers.length} other client(s)`
           : 'waiting on you to queue audio',
-        tone: '#9ca3af'
+        tone: 'var(--theme-primary)'
       };
     }
 
@@ -11495,7 +11960,7 @@ export default function App({
         label: otherOnlineSharedMembers.length > 0
           ? 'waiting on another client to start the shared player'
           : 'waiting on you to start the shared player',
-        tone: '#9ca3af'
+        tone: 'var(--theme-primary)'
       };
     }
 
@@ -11529,7 +11994,7 @@ export default function App({
         label: otherOnlineSharedMembers.length > 0
           ? `paused at ${formatTime(channelPlayerState.current_time)}; waiting on another client to resume`
           : `paused at ${formatTime(channelPlayerState.current_time)}; waiting on you to resume`,
-        tone: '#9ca3af'
+        tone: 'var(--theme-primary)'
       };
     }
 
@@ -11537,7 +12002,7 @@ export default function App({
       label: otherOnlineSharedMembers.length > 0
         ? 'ready to play; waiting on another client'
         : 'ready to play; waiting on you',
-      tone: '#9ca3af'
+      tone: 'var(--theme-primary)'
     };
   })();
   const recentDebugEntries = debugEntries.slice(-120).reverse();
@@ -11636,7 +12101,7 @@ export default function App({
     letterSpacing: '0.04em'
   };
   const wireSectionMetaStyle = {
-    color: '#9ca3af',
+    color: 'var(--theme-primary)',
     fontSize: '10px',
     marginTop: '4px',
     textTransform: 'lowercase',
@@ -11658,7 +12123,7 @@ export default function App({
   });
   const wireEmptyStyle = {
     textAlign: 'center',
-    color: '#9ca3af',
+    color: '#fff',
     fontSize: '12px',
     padding: '28px 12px'
   };
@@ -11707,7 +12172,7 @@ export default function App({
   const onlineUserIds = new Set(allUsers.filter((entry) => entry.is_online).map((entry) => entry.id));
   onlineUserIds.add(currentUserId);
   const nameColorFor = (userId, online = onlineUserIds.has(userId)) => {
-    if (!online) return '#6b7280';
+    if (!online) return '#fff';
     const color = userThemeColorMap[userId] || themeColor;
     return `rgb(${color.r}, ${color.g}, ${color.b})`;
   };
@@ -11730,11 +12195,14 @@ export default function App({
       return null;
     }
 
+    const real = creditReal && currentTrack.videoId ? identities[currentTrack.videoId] : null;
     return {
-      title: currentTrack.title || '',
-      author: currentTrack.author || '',
+      title: (real && real.title) || currentTrack.title || '',
+      author: (real && real.artist) || currentTrack.author || '',
       source: playbackSource === 'shared' ? 'shared' : 'personal',
       server_id: playbackSource === 'shared' ? currentChannelId || null : null,
+      // the wrapped story shows a thumbnail for a song the account played, which needs the video (not for the person's own audio files)
+      video_id: !isLocalTrack(currentTrack) && /^[\w-]{11}$/.test(String(currentTrack.videoId || '')) ? currentTrack.videoId : '',
       is_playing: true
     };
   }, [
@@ -11742,7 +12210,9 @@ export default function App({
     currentChannelId,
     currentTrack,
     isPlaying,
-    playbackSource
+    playbackSource,
+    creditReal,
+    identities
   ]);
 
   useEffect(() => {
@@ -11799,7 +12269,7 @@ export default function App({
     alignItems: 'center',
     justifyContent: 'center',
     fontSize: '11px',
-    color: active ? '#fff' : '#9ca3af',
+    color: active ? '#fff' : 'var(--theme-primary)',
     transition: 'none'
   });
   const panelSplitStyle = {
@@ -11809,7 +12279,7 @@ export default function App({
     alignItems: 'start'
   };
   const subsectionLabelStyle = {
-    color: '#9ca3af',
+    color: 'var(--theme-primary)',
     fontSize: '10px',
     textTransform: 'uppercase',
     letterSpacing: '0.08em',
@@ -11823,12 +12293,20 @@ export default function App({
   // the saved order of a tab, with any panel it does not know about added at the end
   const panelOrderFor = (scope) => {
     // an admin also has the list of who is offline
-    const base = scope === 'social' && user?.is_admin ? [...DEFAULT_PANEL_ORDERS[scope], 'allUsers'] : DEFAULT_PANEL_ORDERS[scope];
+    const base = (scope === 'social' && user?.is_admin ? [...DEFAULT_PANEL_ORDERS[scope], 'allUsers'] : DEFAULT_PANEL_ORDERS[scope]);
     const saved = panelOrders[scope];
     if (!Array.isArray(saved)) return base;
     return [...saved.filter((id) => base.includes(id)), ...base.filter((id) => !saved.includes(id))];
   };
   const orderIndex = (scope, panelId) => panelOrderFor(scope).indexOf(panelId);
+  // a tab the person has arranged: an order was saved, or a panel sits in the other column than it starts in. on a phone (one column) such a
+  // tab follows its order, the one the change layout window shows there. a tab nobody touched keeps the layout it had
+  const arranged = (scope) => {
+    if (panelOrders[scope]) return true;
+    const defaults = { main: MAIN_LAYOUT_DEFAULTS, social: SOCIAL_LAYOUT_DEFAULTS, collab: COLLAB_LAYOUT_DEFAULTS }[scope];
+    const sides = { main: mainPanelSides, social: socialPanelSides, collab: collabPanelSides }[scope] || {};
+    return Object.keys(defaults).some((id) => sides[id] && sides[id] !== defaults[id]);
+  };
   const setPanelSide = (scope, panelId, side) => {
     if (scope === 'social') {
       setSocialPanelSides((prev) => ({ ...prev, [panelId]: side }));
@@ -11871,7 +12349,7 @@ export default function App({
   const renderMessageGuide = (scope, title, detail) => (
     <div style={wireEmptyStyle}>
       <div style={{ color: '#fff', fontSize: '12px' }}>{title}</div>
-      {detail ? <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '6px' }}>{detail}</div> : null}
+      {detail ? <div style={{ color: 'var(--theme-primary)', fontSize: '11px', marginTop: '6px' }}>{detail}</div> : null}
     </div>
   );
   const renderPanelColumn = (scope, side, panelIds, panels) => {
@@ -11952,8 +12430,8 @@ export default function App({
     <div key={entry.id} style={wireRowStyle(false)}>
       <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
         <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={{ color: nameColorFor(entry.id, entry.is_online), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
-          <div style={{ color: entry.is_online ? '#22c55e' : '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          <div style={{ color: nameColorFor(entry.id, entry.is_online), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} online={Boolean(entry.is_online)} /></div>
+          <div style={{ color: entry.is_online ? '#22c55e' : 'var(--theme-primary)', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
             {entry.is_online
               ? (entry.listening_to
                 ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
@@ -11976,7 +12454,7 @@ export default function App({
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
+                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} online /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
                         ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
@@ -12029,7 +12507,7 @@ export default function App({
                           )}
                           <div style={{ color: nameColorFor(entry.user_id), fontSize: '12px', fontWeight: isActive ? '700' : hasUnread ? '700' : 'bold' }}>{entry.username}</div>
                         </div>
-                        <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: isActive ? '600' : hasUnread ? '600' : '400' }}>
+                        <div style={{ color: 'var(--theme-primary)', fontSize: '11px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: isActive ? '600' : hasUnread ? '600' : '400' }}>
                           {(() => {
                             // always prioritize the latest message from dmMessages for dynamic updates
                             const liveMessages = dmMessages[entry.user_id] || [];
@@ -12060,7 +12538,7 @@ export default function App({
                             justifyContent: 'center'
                           }}>{entry.unread_count > 9 ? '9+' : entry.unread_count}</span>
                         )}
-                        <span style={{ color: '#9ca3af', fontSize: '10px', whiteSpace: 'nowrap' }}>
+                        <span style={{ color: 'var(--theme-primary)', fontSize: '10px', whiteSpace: 'nowrap' }}>
                           {(() => {
                             const liveMessages = dmMessages[entry.user_id] || [];
                             const latestMsg = liveMessages[liveMessages.length - 1];
@@ -12105,7 +12583,7 @@ export default function App({
                         alignItems: 'center',
                         gap: '10px',
                         margin: '12px 0',
-                        color: '#6b7280',
+                        color: '#fff',
                         fontSize: '10px'
                       }}>
                         <div style={{ flex: 1, height: '1px', background: 'rgba(107,114,128,0.3)' }} />
@@ -12124,7 +12602,7 @@ export default function App({
                         <span
                           style={{ color: senderColor, fontWeight: 'bold', fontSize: '11px' }}
                         >{message.sender_username}</span>
-                        <span style={{ color: '#9ca3af', fontSize: '10px' }}>{formatMessageTimestamp(message.created_at)}</span>
+                        <span style={{ color: 'var(--theme-primary)', fontSize: '10px' }}>{formatMessageTimestamp(message.created_at)}</span>
                       </div>
                       <div style={{ color: '#fff', fontSize: '13px', marginTop: '6px', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{message.message}</div>
                     </div>
@@ -12154,7 +12632,7 @@ export default function App({
                     cursor: !e2eBusy && e2ePassword ? 'pointer' : 'not-allowed'
                   }}
                 >
-                  unlock
+                  {e2eBusy ? 'unlocking...' : 'unlock'}
                 </button>
               </div>
             ) : (
@@ -12164,7 +12642,7 @@ export default function App({
                 onChange={(e) => setDmText(e.target.value)}
                 placeholder={selectedConversation ? `message ${selectedConversation.username}...` : 'pick a conversation first'}
                 disabled={!selectedConversation}
-                style={{ ...inputStyle, flex: 1, opacity: selectedConversation ? 1 : 0.6 }}
+                style={{ ...inputStyle, flex: 1 }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     sendDmMessage();
@@ -12206,7 +12684,7 @@ export default function App({
                   </div>
                   <div
                     title={entry.last_seen ? new Date(Number(entry.last_seen) * 1000).toLocaleString() : ''}
-                    style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+                    style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
                   >
                     {formatOfflineSince(entry.last_seen)}
                   </div>
@@ -12244,7 +12722,7 @@ export default function App({
           {roomInvites.map((invite) => (
             <div key={invite.id} style={{ ...wireRowStyle(false), background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.24)' }}>
               <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{invite.from_username}</div>
-              <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px', overflowWrap: 'anywhere' }}>invited you to {invite.server_name}</div>
+              <div style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '4px', overflowWrap: 'anywhere' }}>invited you to {invite.server_name}</div>
               <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
                 <button className="btn btn-sm btn-go" onClick={() => acceptRoomInvite(invite)} style={primaryButtonStyle}>join</button>
                 <button className="btn btn-outline-danger btn-sm" onClick={() => declineRoomInvite(invite.id)} style={dangerButtonStyle}>decline</button>
@@ -12256,7 +12734,7 @@ export default function App({
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
                 <div style={{ minWidth: 0, flex: 1 }}>
                   <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{request.receiver_username}</div>
-                  <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>waiting for an answer</div>
+                  <div style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '4px' }}>waiting for an answer</div>
                 </div>
                 <button className="btn btn-outline-light btn-sm" onClick={() => cancelFriendRequest(request.id)} style={{ ...outlineButtonStyle, flexShrink: 0 }}>cancel</button>
               </div>
@@ -12265,7 +12743,7 @@ export default function App({
           {pendingFriendRequests.map((request) => (
             <div key={request.id} style={{ ...wireRowStyle(false), background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.24)' }}>
               <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>{request.sender_username}</div>
-              <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>sent you a request</div>
+              <div style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '4px' }}>sent you a request</div>
               <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
                 <button className="btn btn-sm btn-go"
                   onClick={() => acceptFriendRequest(request.id, request.sender_username)}
@@ -12329,13 +12807,18 @@ export default function App({
             </span>
           </div>
           <div className="text-center mb-3">
-            <Marquee className="fw-bold" text={remote.track.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
-            <Marquee className="text-muted small" text={remote.track.author || ''} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
+            <Marquee className="fw-bold" animate={remote.playing} text={remote.track.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
+            <Marquee className="text-muted small" animate={remote.playing} text={remote.track.author || ''} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
           </div>
+          {remote.playing && (
+            <div className="d-flex justify-content-center mb-3" data-remote-bars-full>
+              <RemoteBars playing={remote.playing} barsRef={remoteBarsRef} color={themeColor} width={200} height={48} />
+            </div>
+          )}
           {remote.duration > 0 && (
             <div className="mb-3">
               <div style={{ height: '8px', background: `rgba(${themeColor.r}, ${themeColor.g}, ${themeColor.b}, 0.2)`, borderRadius: 'var(--border-radius-sm)', overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${Math.min(100, (remote.position / remote.duration) * 100)}%`, background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, transition: 'width 0.5s linear' }} />
+                <div style={{ height: '100%', width: `${Math.min(100, (remote.position / remote.duration) * 100)}%`, background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
               </div>
               <div className="d-flex justify-content-between mt-1">
                 <span className="text-muted small" style={{ fontSize: '11px' }}>{formatTime(remote.position)}</span>
@@ -12368,8 +12851,12 @@ export default function App({
       <>
         {renderPlayerContentBase(model)}
         {remote && remote.playing && (
-          <div className="text-center text-muted small mb-2" style={{ fontSize: '11px' }}>
-            also playing on your {remote.deviceName}: {remote.track.title}
+          <div className="remote-mini" data-remote-mini style={{ border: `1px solid ${dimBorderColor(themeColor)}`, borderRadius: 'var(--border-radius-sm)' }}>
+            <RemoteBars playing={remote.playing} barsRef={remoteBarsRef} color={themeColor} />
+            <div className="remote-mini-text">
+              <Marquee className="fw-bold" animate text={remote.track.title} style={{ fontSize: '12px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
+              <Marquee className="text-muted" animate text={[remote.track.author, remote.deviceName].filter(Boolean).join(' | ')} style={{ fontSize: '11px' }} />
+            </div>
           </div>
         )}
       </>
@@ -12377,17 +12864,33 @@ export default function App({
   };
   const renderPlayerContentBase = (model) => (
     <>
-                  {(model.heading || model.chip) && (
+                  {(model.heading || model.chip || model.track) && (
                     <div className="d-flex justify-content-between align-items-center mb-2" style={{ fontSize: '11px', gap: '8px' }}>
                       <span style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, letterSpacing: '0.04em', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{model.heading}</span>
-                      {model.chip && (
-                        <span style={{
-                          border: `1px solid ${model.chipActive ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : dimBorderColor(themeColor)}`,
-                          color: model.chipActive ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : '#9ca3af',
-                          padding: '0 8px',
-                          borderRadius: 'var(--border-radius-sm)',
-                          whiteSpace: 'nowrap'
-                        }}>{model.chip}</span>
+                      {(model.chip || model.track) && (
+                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '6px', flex: 'none' }}>
+                          {model.chip && (
+                          <span style={{
+                            border: `1px solid ${model.chipActive ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : dimBorderColor(themeColor)}`,
+                            color: model.chipActive ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'var(--theme-primary)',
+                            padding: '0 8px',
+                            borderRadius: 'var(--border-radius-sm)',
+                            whiteSpace: 'nowrap'
+                          }}>{model.chip}</span>
+                          )}
+                          {model.track && (
+                            <Button
+                              variant="outline-light"
+                              size="sm"
+                              data-lyrics-button
+                              onClick={() => setShowLyrics(true)}
+                              style={{ borderRadius: '6px', height: '24px', padding: '0 10px', fontSize: '11px', lineHeight: 1.2 }}
+                              title="lyrics"
+                            >
+                              lyrics
+                            </Button>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}
@@ -12402,8 +12905,8 @@ export default function App({
                 {}
                 {model.track && (
                   <div className="text-center mb-3">
-                    <Marquee className="fw-bold" text={model.track.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
-                    <Marquee className="text-muted small" text={model.track.author || ''} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
+                    <Marquee className="fw-bold" animate={model.playing} text={model.track.title} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
+                    <Marquee className="text-muted small" animate={model.playing} text={model.track.author || ''} style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }} />
                   </div>
                 )}
 
@@ -12437,7 +12940,6 @@ export default function App({
                           height: '100%',
                           width: `${(model.progress.current / model.progress.duration) * 100}%`,
                           borderRadius: '6px',
-                          transition: 'width 0.1s linear',
                           background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`
                         }}
                       />
@@ -12502,7 +13004,6 @@ export default function App({
                           height: '100%',
                           width: `${((model.progress.current % 10) / 10) * 100}%`,
                           borderRadius: '6px',
-                          transition: 'width 0.15s linear',
                           background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`
                         }}
                       />
@@ -12731,6 +13232,7 @@ export default function App({
                             type="range"
                             min="-12"
                             max="12"
+                            step="0.5"
                             value={value}
                             onChange={(e) => {
                               const newValues = [...eqValues];
@@ -12770,7 +13272,7 @@ export default function App({
         {bars.map((bar, index) => (
           <div key={index} title={titleOf(bar, index)} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', height: '100%' }}>
             <div data-bar={bar.seconds} style={{ height: Math.max(bar.seconds ? 3 : 1, Math.round((bar.seconds / max) * (height - 16))) + 'px', background: bar.seconds ? accentRgb : dimBorderColor(themeColor) }} />
-            <div style={{ color: '#6b7280', fontSize: '9px', height: '14px', lineHeight: '14px', display: 'flex', justifyContent: 'center' }}><span style={{ whiteSpace: 'nowrap' }}>{labelOf(bar, index)}</span></div>
+            <div style={{ color: '#fff', fontSize: '9px', height: '14px', lineHeight: '14px', display: 'flex', justifyContent: 'center' }}><span style={{ whiteSpace: 'nowrap' }}>{labelOf(bar, index)}</span></div>
           </div>
         ))}
       </div>
@@ -12779,7 +13281,7 @@ export default function App({
   const statsCard = (title, content) => (
     <Card className="glass card-hover shadow-sm border-0">
       <Card.Body className="card-body" style={panelCardBodyStyle}>
-        <div style={{ color: '#9ca3af', fontSize: '11px', marginBottom: '12px' }}>{title}</div>
+        <div style={{ color: 'var(--theme-primary)', fontSize: '11px', marginBottom: '12px' }}>{title}</div>
         {content}
       </Card.Body>
     </Card>
@@ -12802,9 +13304,9 @@ export default function App({
   const statsMetricCard = (label, value, line, tone) => (
     <Card data-card={label} className="glass card-hover shadow-sm border-0" style={{ minWidth: 0 }}>
       <Card.Body className="card-body" style={{ ...panelCardBodyStyle, padding: '16px' }}>
-        <div style={{ color: '#9ca3af', fontSize: '11px' }}>{label}</div>
+        <div style={{ color: 'var(--theme-primary)', fontSize: '11px' }}>{label}</div>
         <div title={value} style={{ color: accentRgb, fontSize: '22px', fontWeight: 'bold', marginTop: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</div>
-        <div title={line} style={{ color: tone || '#9ca3af', fontSize: '11px', marginTop: '4px', minHeight: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{line}</div>
+        <div title={line} style={{ color: tone || 'var(--theme-primary)', fontSize: '11px', marginTop: '4px', minHeight: '15px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{line}</div>
       </Card.Body>
     </Card>
   );
@@ -12813,7 +13315,7 @@ export default function App({
   const statsRankTable = (rows, kind) => (
     rows.length === 0 ? <div style={wireEmptyStyle}>nothing yet</div> : (
       <div style={{ maxHeight: '640px', overflowY: 'auto' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: statsRankColumns, gap: '8px', color: '#6b7280', fontSize: '10px', padding: '0 4px 6px', borderBottom: '1px solid ' + dimBorderColor(themeColor) }}>
+        <div style={{ display: 'grid', gridTemplateColumns: statsRankColumns, gap: '8px', color: '#fff', fontSize: '10px', padding: '0 4px 6px', borderBottom: '1px solid ' + dimBorderColor(themeColor) }}>
           <span style={{ textAlign: 'right' }}>#</span>
           <span>{kind === 'song' ? 'song' : 'artist'}</span>
           <span style={{ textAlign: 'right' }}>plays</span>
@@ -12822,10 +13324,10 @@ export default function App({
         </div>
         {rows.map((row, index) => (
           <div key={index} style={{ display: 'grid', gridTemplateColumns: statsRankColumns, gap: '8px', alignItems: 'center', padding: '8px 4px', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
-            <span style={{ textAlign: 'right', color: index === 0 ? accentRgb : '#6b7280', fontWeight: 'bold', fontSize: '12px' }}>{index + 1}</span>
+            <span style={{ textAlign: 'right', color: index === 0 ? accentRgb : '#fff', fontWeight: 'bold', fontSize: '12px' }}>{index + 1}</span>
             <span style={{ minWidth: 0 }}>
               <div style={{ color: '#fff', fontSize: '12px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{kind === 'song' ? row.title : row.author}</div>
-              <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              <div style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 {kind === 'song' ? (row.author || 'unknown artist') : row.tracks + (row.tracks === 1 ? ' song' : ' songs')}
               </div>
               <div style={{ height: '2px', marginTop: '5px', background: dimBorderColor(themeColor) }}>
@@ -12834,7 +13336,7 @@ export default function App({
             </span>
             <span style={{ textAlign: 'right', color: '#fff', fontSize: '12px' }}>{row.plays}</span>
             <span style={{ textAlign: 'right', color: accentRgb, fontSize: '12px' }}>{formatListenTime(row.seconds)}</span>
-            <span style={{ textAlign: 'right', color: '#9ca3af', fontSize: '11px' }}>{statsShare(row.seconds)}%</span>
+            <span style={{ textAlign: 'right', color: 'var(--theme-primary)', fontSize: '11px' }}>{statsShare(row.seconds)}%</span>
           </div>
         ))}
       </div>
@@ -12880,6 +13382,23 @@ export default function App({
             {label}
           </Button>
         ))}
+        {statsYears.length ? (
+          <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginLeft: 'auto' }}>
+            {statsYears.map((year) => (
+              <Button
+                key={year}
+                variant="outline-light"
+                size="sm"
+                data-wrapped-open={year}
+                disabled={wrappedLoading !== null}
+                onClick={() => openWrapped(year)}
+                style={{ borderRadius: '6px', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, background: 'transparent', border: `1px solid ${dimBorderColor(themeColor)}` }}
+              >
+                {year} wrapped
+              </Button>
+            ))}
+          </div>
+        ) : null}
       </div>
       {!currentUserId ? (
         <div style={wireEmptyStyle}>sign in to see your stats</div>
@@ -12914,7 +13433,7 @@ export default function App({
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 300px), 1fr))', columnGap: '28px' }}>
               {statsDetailRows().map(([label, value]) => (
                 <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', padding: '8px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)', fontSize: '12px' }}>
-                  <span style={{ color: '#9ca3af', flexShrink: 0 }}>{label}</span>
+                  <span style={{ color: '#fff', flexShrink: 0 }}>{label}</span>
                   <span style={{ color: '#fff', textAlign: 'right', minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={value}>{value}</span>
                 </div>
               ))}
@@ -12958,7 +13477,7 @@ export default function App({
                   <div key={row.user_id} style={wireRowStyle(false)}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', fontSize: '12px' }}>
                       <span style={{ color: row.me ? accentRgb : '#fff', fontWeight: row.me ? 'bold' : 'normal' }}>{row.me ? 'you' : row.username}</span>
-                      <span style={{ color: '#9ca3af', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.top_artist ? row.top_artist + ' · ' : ''}{formatListenTime(row.seconds)}</span>
+                      <span style={{ color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.top_artist ? row.top_artist + ' · ' : ''}{formatListenTime(row.seconds)}</span>
                     </div>
                     <div style={{ height: '4px', marginTop: '6px', background: dimBorderColor(themeColor) }}>
                       <div style={{ height: '100%', width: Math.round((row.seconds / most) * 100) + '%', background: accentRgb }} />
@@ -12974,7 +13493,7 @@ export default function App({
   );
 
   const socialView = (
-    <div className={`social-flat${panelOrders.social ? ' custom-order' : ''}`} style={snapLayoutStyle}>
+    <div className={`social-flat${arranged('social') ? ' custom-order' : ''}`} style={snapLayoutStyle}>
       {renderPanelColumn('social', 'left', socialLeftPanelIds, socialPanels)}
       {renderPanelColumn('social', 'right', socialRightPanelIds, socialPanels)}
     </div>
@@ -12985,16 +13504,16 @@ export default function App({
         <div className="collab-setup-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
           <Card className="glass-dark p-3" style={{ maxHeight: '220px', overflow: 'hidden' }}>
             <div className="fw-bold mb-2" style={{ color: '#fff', fontSize: '12px' }}>server</div>
-            <div style={{ fontSize: '11px', color: '#ccc' }}>
-              <div style={{ marginBottom: '4px' }}><span style={{ color: '#9ca3af' }}>name:</span> {currentChannel.name}</div>
+            <div style={{ fontSize: '11px', color: '#fff' }}>
+              <div style={{ marginBottom: '4px' }}><span style={{ color: '#fff' }}>name:</span> {currentChannel.name}</div>
               {currentChannel.description && (
-                <div style={{ marginBottom: '4px' }}><span style={{ color: '#9ca3af' }}>desc:</span> {currentChannel.description}</div>
+                <div style={{ marginBottom: '4px' }}><span style={{ color: '#fff' }}>desc:</span> {currentChannel.description}</div>
               )}
-              <div style={{ marginBottom: '4px' }}><span style={{ color: '#9ca3af' }}>host:</span> {currentChannel.host_username}</div>
-              <div style={{ marginBottom: '4px' }}><span style={{ color: '#9ca3af' }}>members:</span> {currentChannelMembers.length}</div>
+              <div style={{ marginBottom: '4px' }}><span style={{ color: '#fff' }}>host:</span> {currentChannel.host_username}</div>
+              <div style={{ marginBottom: '4px' }}><span style={{ color: '#fff' }}>members:</span> {currentChannelMembers.length}</div>
               {currentChannel.is_private ? (
                 <div style={{ marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
-                  <span style={{ color: '#9ca3af' }}>private, code:</span>
+                  <span style={{ color: '#fff' }}>private, code:</span>
                   <strong style={{ letterSpacing: '0.12em', color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{currentChannel.join_code || '...'}</strong>
                   {currentChannel.join_code ? (
                     <button className="btn btn-outline-light btn-sm"
@@ -13073,9 +13592,9 @@ export default function App({
                 <div style={{ minWidth: 0 }}>
                   <div style={{ color: nameColorFor(member.user_id, member.user_id === currentUserId || Boolean(member.is_online)), fontSize: '11px', fontWeight: 'bold', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {member.username} {member.user_id === currentUserId ? '(you)' : ''}
-                    <PlatformIcons platforms={member.platforms} />
+                    <PlatformIcons platforms={member.platforms} online={Boolean(member.is_online)} />
                   </div>
-                  <div style={{ color: member.is_online ? '#22c55e' : '#9ca3af', fontSize: '9px', marginTop: '2px' }}>
+                  <div style={{ color: member.is_online ? '#22c55e' : 'var(--theme-primary)', fontSize: '9px', marginTop: '2px' }}>
                     {member.is_online ? 'online' : 'offline'} {member.is_admin ? '| admin' : ''}
                   </div>
                 </div>
@@ -13125,7 +13644,7 @@ export default function App({
         <div style={sectionStackStyle}>
           <input value={newChannelName} onChange={(e) => setNewChannelName(e.target.value)} placeholder="channel name" style={inputStyle} />
           <div style={{ display: 'flex', gap: '12px', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#9ca3af', fontSize: '11px', cursor: 'pointer' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--theme-primary)', fontSize: '11px', cursor: 'pointer' }}>
               <input type="checkbox" checked={newChannelPrivate} onChange={(e) => setNewChannelPrivate(e.target.checked)} />
               private (people need a code to join)
             </label>
@@ -13168,13 +13687,13 @@ export default function App({
                     {channel.is_private ? (
                       <span
                         title="private: you need the code to join"
-                        style={{ marginLeft: '8px', padding: '0 6px', fontSize: '9px', fontWeight: 'normal', border: '1px solid #9ca3af', color: '#9ca3af', borderRadius: 'var(--border-radius-sm)' }}
+                        style={{ marginLeft: '8px', padding: '0 6px', fontSize: '9px', fontWeight: 'normal', border: '1px solid #9ca3af', color: 'var(--theme-primary)', borderRadius: 'var(--border-radius-sm)' }}
                       >
                         private
                       </span>
                     ) : null}
                   </div>
-                  <div style={{ color: '#9ca3af', fontSize: '10px', marginTop: '4px' }}>host: {channel.host_username} | {(channel.members || []).length} members</div>
+                  <div style={{ color: 'var(--theme-primary)', fontSize: '10px', marginTop: '4px' }}>host: {channel.host_username} | {(channel.members || []).length} members</div>
                   <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {channel.is_private && !joined && channel.host_id !== currentUserId ? (
                       <button className="btn btn-outline-light btn-sm"
@@ -13213,7 +13732,7 @@ export default function App({
               <div key={entry.id} style={wireRowStyle(false)}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'center' }}>
                   <div style={{ minWidth: 0, flex: 1 }}>
-                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} /></div>
+                    <div style={{ color: nameColorFor(entry.id, true), fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center' }}>{entry.username}<PlatformIcons platforms={entry.platforms} online /></div>
                     <div style={{ color: '#22c55e', fontSize: '10px', marginTop: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       {entry.listening_to
                         ? (entry.listening_to.is_playing === false ? 'paused on: ' : 'listening to: ') + formatListeningActivity(entry.listening_to)
@@ -13524,7 +14043,7 @@ export default function App({
                           });
                         }}
                       >{message.username}</span>
-                      <span style={{ color: '#9ca3af', fontSize: '10px' }}>{formatMessageTimestamp(message.created_at)}</span>
+                      <span style={{ color: 'var(--theme-primary)', fontSize: '10px' }}>{formatMessageTimestamp(message.created_at)}</span>
                     </div>
                     <div style={{ color: '#fff', fontSize: '13px', marginTop: '6px', overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{roomMessageText(message)}</div>
                   </div>
@@ -13555,7 +14074,7 @@ export default function App({
                     cursor: !e2eBusy && e2ePassword ? 'pointer' : 'not-allowed'
                   }}
                 >
-                  unlock
+                  {e2eBusy ? 'unlocking...' : 'unlock'}
                 </button>
               </div>
             ) : (
@@ -13670,14 +14189,14 @@ export default function App({
                     display: 'flex',
                     alignItems: 'center',
                     gap: '8px',
-                    color: currentCollabPlaylistId === playlist.id ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : '#ccc',
+                    color: currentCollabPlaylistId === playlist.id ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : '#fff',
                     transition: 'none'
                   }}
                 >
                   {isCollabType ? SVGIcons.collabPlaylist : SVGIcons.folder}
                   {playlist.name}
                   {isCollabType && !canEdit && (
-                    <span style={{ fontSize: '9px', color: '#9ca3af' }}>(read-only)</span>
+                    <span style={{ fontSize: '9px', color: 'var(--theme-primary)' }}>(read-only)</span>
                   )}
                   {isCollabType && canEdit && (
                     <Dropdown align="end" className="d-inline ms-1">
@@ -13875,7 +14394,7 @@ export default function App({
     margin: 0
   };
   const collabView = (
-    <div className={`social-flat collab-flat${currentChannel ? ' in-channel' : ''}${panelOrders.collab ? ' custom-order' : ''}`} style={collabLayoutStyle}>
+    <div className={`social-flat collab-flat${currentChannel ? ' in-channel' : ''}${arranged('collab') ? ' custom-order' : ''}`} style={collabLayoutStyle}>
       {renderPanelColumn('collab', 'left', collabLeftPanelIds, collabPanels)}
       {renderPanelColumn('collab', 'right', collabRightPanelIds, collabPanels)}
     </div>
@@ -13884,7 +14403,7 @@ export default function App({
   // a function, not a value: it reads mainPanels, which is built further down
   const renderMainView = () => (
     <div className="main-content">
-      <div className={`row g-4 main-flat${panelOrders.main ? ' custom-order' : ''}`}>
+      <div className={`row g-4 main-flat${arranged('main') ? ' custom-order' : ''}`}>
         <div className="col-lg-6 d-flex flex-column gap-4">{mainLeftIds.map((panelId) => mainPanels[panelId])}</div>
         <div className="col-lg-6 d-flex flex-column gap-4">{mainRightIds.map((panelId) => mainPanels[panelId])}</div>
       </div>
@@ -13942,8 +14461,10 @@ export default function App({
     setLayoutDraft((draft) => (draft ? { ...draft, [scope]: update(draft[scope]) } : draft));
   };
   const draftSetSide = (scope, id, side) => changeDraft(scope, (part) => ({ ...part, sides: { ...part.sides, [id]: side } }));
-  const draftMoveTile = (scope, id, direction) => changeDraft(scope, (part) => {
-    const sameColumn = part.order.filter((other) => (part.sides[other] === 'right') === (part.sides[id] === 'right'));
+  // on a phone there is one list in the order of the page, so a panel changes places with the one next to it in that list. on a computer it
+  // changes places with the next one in its own column
+  const draftMoveTile = (scope, id, direction, oneList = false) => changeDraft(scope, (part) => {
+    const sameColumn = oneList ? part.order : part.order.filter((other) => (part.sides[other] === 'right') === (part.sides[id] === 'right'));
     const neighbour = sameColumn[sameColumn.indexOf(id) + direction];
     if (!neighbour) return part;
     const order = [...part.order];
@@ -13952,19 +14473,17 @@ export default function App({
     [order[a], order[b]] = [order[b], order[a]];
     return { ...part, order };
   });
-  // dropped on another tile: it goes into that tile's column, just before it.
-  // dropped on an empty part of a column: it goes to the end of that column
-  const draftDrop = (scope, draggedId, targetId, side) => changeDraft(scope, (part) => {
-    if (!draggedId || draggedId === targetId) return part;
+  // put a panel in a column: just before another panel, or at the end of the column when there is none to go before
+  const draftPlace = (scope, draggedId, beforeId, side) => changeDraft(scope, (part) => {
+    if (!draggedId || draggedId === beforeId) return part;
     const order = part.order.filter((id) => id !== draggedId);
-    const toSide = targetId ? part.sides[targetId] : side;
-    if (targetId) order.splice(order.indexOf(targetId), 0, draggedId);
+    if (beforeId && order.includes(beforeId)) order.splice(order.indexOf(beforeId), 0, draggedId);
     else order.push(draggedId);
-    return { order, sides: { ...part.sides, [draggedId]: toSide === 'right' ? 'right' : 'left' } };
+    return { order, sides: { ...part.sides, [draggedId]: side === 'right' ? 'right' : 'left' } };
   });
   const draftReset = (scope) => {
     const defaults = { main: MAIN_LAYOUT_DEFAULTS, social: SOCIAL_LAYOUT_DEFAULTS, collab: COLLAB_LAYOUT_DEFAULTS }[scope];
-    changeDraft(scope, () => ({ sides: { ...defaults }, order: [...DEFAULT_PANEL_ORDERS[scope]] }));
+    changeDraft(scope, () => ({ sides: { ...defaults }, order: DEFAULT_PANEL_ORDERS[scope] }));
   };
   const saveLayoutDraft = () => {
     if (!layoutDraft) return;
@@ -13988,10 +14507,19 @@ export default function App({
     showNotification('layout saved', 'success');
   };
 
-  const stableQueuePlay = useStableCallback((idx) => playTrackAtIndex(idx, queue, { source: 'personal', stayOnFail: true }));
+  const stableQueuePlay = useStableCallback((idx) => {
+    keepDiscoverRef.current(queue[idx] && queue[idx].videoId);
+    return playTrackAtIndex(idx, queue, { source: 'personal', stayOnFail: true });
+  });
   const stableQueueRemove = useStableCallback((idx) => removeFromQueue(idx));
-  const stableQueueAddToPlaylist = useStableCallback((track) => addTrackToPlaylist(track));
-  const stableQueueDownload = useStableCallback((item) => downloadSingle(item));
+  const stableQueueAddToPlaylist = useStableCallback((track) => {
+    keepDiscoverRef.current(track && track.videoId);
+    return addTrackToPlaylist(track);
+  });
+  const stableQueueDownload = useStableCallback((item) => {
+    keepDiscoverRef.current(item && item.videoId);
+    return downloadSingle(item);
+  });
   const stableQueueProcess = useStableCallback(() => processQueue());
   const stableQueueSaveAll = useStableCallback(() => addAllToPlaylist());
   const stableQueueClear = useStableCallback(() => clearQueue());
@@ -14174,7 +14702,7 @@ export default function App({
                       <span style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, fontSize: '12px', fontWeight: 'bold' }}>
                         downloading{progress.total ? ` - ${Math.round((progress.loaded / progress.total) * 100)}%` : '...'}
                       </span>
-                      <span style={{ color: '#9ca3af', fontSize: '11px' }}>
+                      <span style={{ color: 'var(--theme-primary)', fontSize: '11px' }}>
                         {progress.total
                           ? `${Math.round(progress.loaded / 1024)} kb / ${Math.round(progress.total / 1024)} kb`
                           : `${Math.round(progress.loaded / 1024)} kb downloaded`}
@@ -14317,14 +14845,14 @@ export default function App({
                         display: 'flex',
                         alignItems: 'center',
                         gap: '8px',
-                        color: currentPlaylistId === playlist.id ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : '#ccc',
+                        color: currentPlaylistId === playlist.id ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : '#fff',
                         transition: 'none'
                       }}
                     >
                       {playlist.type === 'collab' ? SVGIcons.collabPlaylist : SVGIcons.folder}
                       {playlist.name}
                       {playlist.type === 'collab' && (
-                        <span style={{ fontSize: '9px', color: '#9ca3af' }}>(collab)</span>
+                        <span style={{ fontSize: '9px', color: 'var(--theme-primary)' }}>(collab)</span>
                       )}
                       {playlist.type !== 'collab' && playlist.type !== 'saved' && playlist.id !== 'default' && (
                         <Dropdown align="end" className="d-inline ms-1">
@@ -14493,7 +15021,7 @@ export default function App({
                         {waitingImports.map((item) => (
                           <div key={item.id} data-helper-import style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
                             <span className="text-truncate" style={{ flex: 1, minWidth: 0, color: '#fff', fontSize: '12px' }} title={item.name}>{item.name}</span>
-                            <span style={{ color: '#9ca3af', fontSize: '11px', flexShrink: 0 }}>{item.track_count}</span>
+                            <span style={{ color: 'var(--theme-primary)', fontSize: '11px', flexShrink: 0 }}>{item.track_count}</span>
                             <Button
                               variant="outline-light"
                               size="sm"
@@ -14553,7 +15081,7 @@ export default function App({
                           ) : importLists[importPanel].items.map((item) => (
                             <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', borderBottom: '1px solid rgba(255, 255, 255, 0.06)' }}>
                               <span className="text-truncate" style={{ flex: 1, minWidth: 0, color: '#fff', fontSize: '12px' }} title={item.name}>{item.name}</span>
-                              {item.count !== null && item.count !== undefined ? <span style={{ color: '#9ca3af', fontSize: '11px', flexShrink: 0 }}>{item.count}</span> : null}
+                              {item.count !== null && item.count !== undefined ? <span style={{ color: 'var(--theme-primary)', fontSize: '11px', flexShrink: 0 }}>{item.count}</span> : null}
                               <Button
                                 variant="outline-light"
                                 size="sm"
@@ -14735,8 +15263,8 @@ export default function App({
             // down in the corner where the toasts are, so it never covers a control
             position: 'fixed',
             left: '24px',
-            bottom: 'calc(env(safe-area-inset-bottom, 0px) + 24px)',
-            maxWidth: 'calc(100vw - 48px)',
+            bottom: 'calc(env(safe-area-inset-bottom, 0px) / var(--ui-scale, 1) + 24px)',
+            maxWidth: 'calc(calc(100 * var(--vw)) - 48px)',
             zIndex: 1000,
             display: 'flex',
             flexWrap: 'wrap',
@@ -14827,8 +15355,8 @@ export default function App({
           <span
             title="offline mode: only songs saved on this phone can be loaded"
             style={{
-              border: '1px dashed #9ca3af',
-              color: '#9ca3af',
+              border: '1px dashed var(--theme-primary)',
+              color: 'var(--theme-primary)',
               fontSize: '10px',
               padding: '1px 6px',
               borderRadius: 'var(--border-radius-sm)',
@@ -14922,7 +15450,7 @@ export default function App({
             margin: '0 0 12px',
             padding: '8px 12px',
             border: `1px solid ${dimBorderColor(themeColor)}`,
-            color: '#9ca3af',
+            color: 'var(--theme-primary)',
             fontSize: '12px',
             textAlign: 'center'
           }}
@@ -14936,8 +15464,8 @@ export default function App({
           style={{
             margin: '0 0 12px',
             padding: '8px 12px',
-            border: '1px dashed #9ca3af',
-            color: '#9ca3af',
+            border: '1px dashed var(--theme-primary)',
+            color: 'var(--theme-primary)',
             fontSize: '12px',
             textAlign: 'center'
           }}
@@ -14965,7 +15493,7 @@ export default function App({
             margin: '0 0 12px',
             padding: '8px 12px',
             border: `1px solid ${dimBorderColor(themeColor)}`,
-            color: '#9ca3af',
+            color: 'var(--theme-primary)',
             fontSize: '12px',
             textAlign: 'center'
           }}
@@ -14984,108 +15512,19 @@ export default function App({
 
       {isPip && <PipPlayer nowPlaying={buildNowPlayingPayload()} />}
 
-      <Modal
+      <LayoutEditor
         show={showLayoutEditor}
         onHide={() => setShowLayoutEditor(false)}
-        centered
-        size="lg"
-        className="settings-modal"
-        animation={false}
-      >
-        <Modal.Header closeButton style={{ borderBottom: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
-          <Modal.Title style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, fontSize: '18px' }}>change layout</Modal.Title>
-        </Modal.Header>
-        <Modal.Body style={{ background: '#000', color: '#fff', padding: '20px' }}>
-          {layoutDraft && (() => {
-            const scope = layoutEditorTab;
-            const part = layoutDraft[scope];
-            const labels = PANEL_LABELS[scope];
-            const columnIds = (side) => part.order.filter((id) => (part.sides[id] === 'right') === (side === 'right'));
-            const tile = (id) => {
-              const sideNow = part.sides[id] === 'right' ? 'right' : 'left';
-              const smallButton = { background: 'transparent', border: `1px solid ${dimBorderColor(themeColor)}`, color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, padding: '2px 8px', fontSize: '12px', lineHeight: 1.2 };
-              return (
-                <div
-                  key={id}
-                  draggable
-                  onDragStart={(e) => { setDraggedTile({ scope, id }); e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); }}
-                  onDragEnd={() => setDraggedTile(null)}
-                  onDragOver={(e) => { if (draggedTile && draggedTile.scope === scope) e.preventDefault(); }}
-                  onDrop={(e) => { e.preventDefault(); e.stopPropagation(); if (draggedTile && draggedTile.scope === scope) draftDrop(scope, draggedTile.id, id); setDraggedTile(null); }}
-                  style={{
-                    border: `1px dashed rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                    background: 'rgba(255,255,255,0.03)',
-                    padding: '12px',
-                    cursor: 'grab',
-                    minHeight: '74px',
-                    opacity: draggedTile && draggedTile.id === id ? 0.45 : 1
-                  }}
-                >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px' }}>
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, fontWeight: 'bold', fontSize: '13px' }}>{labels[id][0]}</div>
-                      <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '2px' }}>{labels[id][1]}</div>
-                    </div>
-                    <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
-                      <button type="button" title="move up" onClick={() => draftMoveTile(scope, id, -1)} style={smallButton}>{'\u25B2'}</button>
-                      <button type="button" title="move down" onClick={() => draftMoveTile(scope, id, 1)} style={smallButton}>{'\u25BC'}</button>
-                      <button type="button" title={sideNow === 'left' ? 'move to the right column' : 'move to the left column'} onClick={() => draftSetSide(scope, id, sideNow === 'left' ? 'right' : 'left')} style={smallButton}>{sideNow === 'left' ? '\u25B6' : '\u25C0'}</button>
-                    </div>
-                  </div>
-                </div>
-              );
-            };
-            const column = (side) => (
-              <div
-                onDragOver={(e) => { if (draggedTile && draggedTile.scope === scope) e.preventDefault(); }}
-                onDrop={(e) => { e.preventDefault(); if (draggedTile && draggedTile.scope === scope) draftDrop(scope, draggedTile.id, null, side); setDraggedTile(null); }}
-                style={{ display: 'flex', flexDirection: 'column', gap: '10px', minHeight: '120px', padding: '8px', border: '1px solid rgba(255,255,255,0.08)' }}
-              >
-                <div style={{ color: '#6b7280', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{side} column</div>
-                {columnIds(side).map(tile)}
-                {columnIds(side).length === 0 && <div style={{ color: '#6b7280', fontSize: '11px', padding: '14px 0', textAlign: 'center' }}>drop a panel here</div>}
-              </div>
-            );
-            return (
-              <>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '14px', flexWrap: 'wrap' }}>
-                  {[['main', 'home'], ['social', 'social'], ['collab', 'collab']].map(([key, label]) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => setLayoutEditorTab(key)}
-                      style={{
-                        padding: '6px 14px',
-                        border: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                        background: layoutEditorTab === key ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
-                        color: layoutEditorTab === key ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-                        fontSize: '12px'
-                      }}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-                <div style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '12px' }}>
-                  these are stand-ins for the real panels. drag them, or use the arrows, then save and the tab is laid out this way.
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
-                  {column('left')}
-                  {column('right')}
-                </div>
-                <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '12px' }}>
-                  on a phone, where everything is one column, it reads top to bottom: {part.order.map((id) => labels[id][0]).join(', then ')}.
-                </div>
-                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px', flexWrap: 'wrap' }}>
-                  <button type="button" onClick={() => draftReset(scope)} style={{ padding: '8px 14px', background: 'transparent', border: `1px solid ${dimBorderColor(themeColor)}`, color: '#9ca3af', fontSize: '12px' }}>reset this tab</button>
-                  <button type="button" onClick={() => setShowLayoutEditor(false)} style={{ padding: '8px 14px', background: 'transparent', border: `1px solid ${dimBorderColor(themeColor)}`, color: '#fff', fontSize: '12px' }}>cancel</button>
-                  <button type="button" onClick={saveLayoutDraft} style={{ padding: '8px 18px', background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, border: 'none', color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>save layout</button>
-                </div>
-              </>
-            );
-          })()}
-        </Modal.Body>
-      </Modal>
+        draft={layoutDraft}
+        tab={layoutEditorTab}
+        onTab={setLayoutEditorTab}
+        labels={PANEL_LABELS[layoutEditorTab]}
+        onMove={draftMoveTile}
+        onSide={draftSetSide}
+        onPlace={draftPlace}
+        onReset={draftReset}
+        onSave={saveLayoutDraft}
+      />
 
       {}
       <Modal
@@ -15132,81 +15571,7 @@ export default function App({
             </div>
 
             {}
-            <div style={{ marginTop: '15px' }}>
-              <input
-                type="range"
-                min="0"
-                max="360"
-                value={(() => {
-                  const r = themeColor.r / 255;
-                  const g = themeColor.g / 255;
-                  const b = themeColor.b / 255;
-                  const max = Math.max(r, g, b);
-                  const min = Math.min(r, g, b);
-                  let h = 0;
-                  if (max !== min) {
-                    const d = max - min;
-                    switch (max) {
-                      case r: h = ((g - b) / d + (g < b ? 6 : 0)) / 6; break;
-                      case g: h = ((b - r) / d + 2) / 6; break;
-                      case b: h = ((r - g) / d + 4) / 6; break;
-                    }
-                  }
-                  return Math.round(h * 360);
-                })()}
-                onChange={(e) => {
-                  const hue = parseInt(e.target.value);
-                  
-                  const s = 1;
-                  const l = 0.5;
-                  const c = (1 - Math.abs(2 * l - 1)) * s;
-                  const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
-                  const m = l - c / 2;
-                  let r, g, b;
-                  if (hue < 60) { r = c; g = x; b = 0; }
-                  else if (hue < 120) { r = x; g = c; b = 0; }
-                  else if (hue < 180) { r = 0; g = c; b = x; }
-                  else if (hue < 240) { r = 0; g = x; b = c; }
-                  else if (hue < 300) { r = x; g = 0; b = c; }
-                  else { r = c; g = 0; b = x; }
-                  handleThemeColorChange({
-                    r: Math.round((r + m) * 255),
-                    g: Math.round((g + m) * 255),
-                    b: Math.round((b + m) * 255)
-                  });
-                }}
-                style={{
-                  width: '100%',
-                  height: '24px',
-                  borderRadius: '6px',
-                  background: 'linear-gradient(to right, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000)',
-                  outline: 'none',
-                  cursor: 'pointer',
-                  WebkitAppearance: 'none',
-                  appearance: 'none'
-                }}
-              />
-              <style>{`
-                input[type="range"]::-webkit-slider-thumb {
-                  -webkit-appearance: none;
-                  appearance: none;
-                  width: 8px;
-                  height: 24px;
-                  border-radius: 0;
-                  background: #fff;
-                  border: 1px solid #000;
-                  cursor: pointer;
-                }
-                input[type="range"]::-moz-range-thumb {
-                  width: 8px;
-                  height: 24px;
-                  border-radius: 0;
-                  background: #fff;
-                  border: 1px solid #000;
-                  cursor: pointer;
-                }
-              `}</style>
-            </div>
+            <ColorPicker color={themeColor} onChange={handleThemeColorChange} />
 
           </div>
 
@@ -15228,6 +15593,30 @@ export default function App({
           >
             reset to default
           </button>
+
+          <div style={{ marginBottom: '30px' }}>
+            <h4 style={settingsTitleStyle}>real artist</h4>
+            <button
+              className="smp-setting"
+              data-real-artist
+              onClick={() => setCreditReal((on) => !on)}
+              style={creditReal ? settingsOnStyle : undefined}
+            >
+              {creditReal ? 'on' : 'off'}
+            </button>
+          </div>
+
+          <div style={{ marginBottom: '30px' }}>
+            <h4 style={settingsTitleStyle}>thumbnail color</h4>
+            <button
+              className="smp-setting"
+              data-thumbnail-color
+              onClick={() => setThemeFromArt((on) => !on)}
+              style={themeFromArt ? settingsOnStyle : undefined}
+            >
+              {themeFromArt ? 'on' : 'off'}
+            </button>
+          </div>
 
           {}
           <div style={{ marginBottom: '30px' }}>
@@ -15289,6 +15678,63 @@ export default function App({
             </button>
           </div>
 
+          {isAndroidApp() && (
+            <div style={{ marginBottom: '30px' }} data-ui-size>
+              <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>ui size</h4>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '8px' }}>
+                {[
+                  { key: 'smaller', label: 'smaller', run: () => stepUiScale(-1) },
+                  { key: 'value', label: scalePercent(uiScaleNow) },
+                  { key: 'bigger', label: 'bigger', run: () => stepUiScale(1) }
+                ].map((item) => {
+                  // three cells of the same size: the two buttons, and between them the size as it is now (a plain number, not a button)
+                  const cell = { minWidth: 0, boxSizing: 'border-box', height: '40px', padding: '0 10px', border: '1px solid transparent', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center', textAlign: 'center' };
+                  return item.run ? (
+                    <button
+                      key={item.key}
+                      className="smp-ui-size-button"
+                      data-ui-size-button={item.key}
+                      onClick={item.run}
+                      style={{
+                        ...cell,
+                        background: 'transparent',
+                        border: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                        color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                        cursor: 'pointer'
+                      }}
+                    >
+                      {item.label}
+                    </button>
+                  ) : (
+                    <div key={item.key} className="smp-ui-size-value" data-ui-size-value style={{ ...cell, color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>
+                      {item.label}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          <div style={{ marginBottom: '30px' }}>
+            <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>history</h4>
+            <button
+              className="smp-setting"
+              data-recent-changes
+              onClick={() => { setShowSettingsModal(false); setShowChanges(true); }}
+              style={{
+                width: '100%',
+                padding: '10px',
+                background: 'transparent',
+                border: `1px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+                cursor: 'pointer',
+                fontSize: '13px'
+              }}
+            >
+              recent changes
+            </button>
+          </div>
+
           {((isTauriDesktop && !isAndroidApp()) || (isAndroidApp() && floatingStatus)) && (
             <div style={{ marginBottom: '30px' }}>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>mini player</h4>
@@ -15305,7 +15751,7 @@ export default function App({
                         try {
                           if (needsPermission) {
                             const opened = window.SmpNative.requestFloatingPermission && window.SmpNative.requestFloatingPermission();
-                            if (!opened) showNotification('could not open that settings screen, find the app under display over other apps in android settings', 'warning');
+                            if (!opened) showNotification('could not open that settings screen', 'error');
                           } else {
                             window.SmpNative.setFloatingEnabled(floatingStatus !== 'ready');
                             setFloatingStatus(String(window.SmpNative.floatingStatus()));
@@ -15324,6 +15770,35 @@ export default function App({
             </div>
           )}
 
+          {((isTauriDesktop && !isAndroidApp() && /Windows/i.test(typeof navigator !== 'undefined' ? navigator.userAgent : '')) || (isAndroidApp() && phoneWallpaper)) && (
+            <div style={{ marginBottom: '30px' }}>
+              <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>live wallpaper</h4>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                {(() => {
+                  const phone = isAndroidApp();
+                  const on = phone ? phoneWallpaper === 'on' : wallpaperOn;
+                  return (
+                    <button
+                      className="smp-setting"
+                      onClick={() => {
+                        if (!phone) { setWallpaperOn((value) => !value); return; }
+                        // the phone only lets the person set it, on the system's own screen
+                        try {
+                          if (!window.SmpNative.openWallpaperPicker()) showNotification('could not open the wallpaper screen', 'error');
+                        } catch {
+                          showNotification('could not open the wallpaper screen', 'error');
+                        }
+                      }}
+                      style={on ? settingsOnStyle : undefined}
+                    >
+                      {on ? 'on' : 'off'}
+                    </button>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+
           {isAndroidApp() && (
             <div style={{ marginBottom: '30px' }}>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>home screen player</h4>
@@ -15332,7 +15807,7 @@ export default function App({
                 onClick={() => {
                   try {
                     const asked = window.SmpNative.pinWidget && window.SmpNative.pinWidget();
-                    showNotification(asked ? 'confirm in the box that popped up to add it' : 'your launcher does not allow adding it from here, long press the home screen and pick widgets', asked ? 'info' : 'warning');
+                    showNotification(asked ? 'confirm in the box that popped up to add it' : 'launcher blocked it, add it from the home screen widgets', asked ? 'info' : 'error');
                   } catch {
                     showNotification('could not ask for the widget', 'error');
                   }
@@ -15359,7 +15834,7 @@ export default function App({
           {isAndroidApp() && (
             <div style={{ marginBottom: '30px' }}>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>offline</h4>
-              <div style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '10px' }}>
+              <div style={{ fontSize: '12px', color: '#fff', marginBottom: '10px' }}>
                 saved on this phone: <strong style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{offlineIds.size}</strong> {offlineIds.size === 1 ? 'song' : 'songs'}
                 {offlineBytes > 0 ? ` (${Math.max(1, Math.round(offlineBytes / (1024 * 1024)))} MB)` : ''}.
                 tap the arrow on a song to save it. without a connection the app switches to offline mode by itself.
@@ -15399,7 +15874,7 @@ export default function App({
           {localHave.size > 0 && (
             <div style={{ marginBottom: '30px' }} data-settings-audio-files>
               <h4 style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, marginBottom: '15px', fontSize: '14px', fontWeight: 'normal' }}>audio files</h4>
-              <div style={{ fontSize: '12px', color: '#9ca3af', marginBottom: '10px' }}>
+              <div style={{ fontSize: '12px', color: '#fff', marginBottom: '10px' }}>
                 on this device: <strong style={{ color: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` }}>{localHave.size}</strong> {localHave.size === 1 ? 'file' : 'files'}
                 {localBytes > 0 ? ` (${Math.max(1, Math.round(localBytes / (1024 * 1024)))} MB)` : ''}
               </div>
@@ -15570,7 +16045,21 @@ export default function App({
             {currentVersion || versionMismatch ? (
               <span className="smp-footer-version">
                 {currentVersion ? (
-                  <span style={{ color: '#9ca3af' }}>v{currentVersion}{shellVersion && shellVersion !== currentVersion ? ` (app ${shellVersion})` : ''}</span>
+                  <span
+                    data-version-tap
+                    style={{ color: 'var(--theme-primary)' }}
+                    onClick={() => {
+                      // five quick taps on the version open a made up wrapped, to look at it without waiting for january 1st
+                      const taps = versionTapsRef.current;
+                      const now = Date.now();
+                      taps.count = now - taps.at > 2500 ? 1 : taps.count + 1;
+                      taps.at = now;
+                      if (taps.count >= 5) {
+                        taps.count = 0;
+                        setWrappedView({ year: new Date().getFullYear(), data: demoWrapped(new Date(), buildTrackIndex(wrappedKnownLists()).tracks) });
+                      }
+                    }}
+                  >v{currentVersion}{shellVersion && shellVersion !== currentVersion ? ` (app ${shellVersion})` : ''}</span>
                 ) : null}
                 {versionMismatch ? (
                   <button className="smp-footer-button" onClick={applyUpdate} disabled={updateBusy}>
@@ -15592,7 +16081,7 @@ export default function App({
               ? { left: debugConsolePos.x, top: debugConsolePos.y }
               : { right: 18, bottom: 18 }),
             width: '820px',
-            maxWidth: 'calc(100vw - 16px)',
+            maxWidth: 'calc(calc(100 * var(--vw)) - 16px)',
             height: '380px',
             minWidth: '300px',
             minHeight: '200px',
@@ -15630,7 +16119,7 @@ export default function App({
           >
             <div>
               <div style={{ color: '#fff', fontSize: '12px', fontWeight: 'bold' }}>debug console</div>
-              <div style={{ color: '#c0c0c0', fontSize: '10px', marginTop: '2px' }}>
+              <div style={{ color: '#fff', fontSize: '10px', marginTop: '2px' }}>
                 socket: {isConnected ? 'connected' : 'disconnected'} | frontend logs: {debugEntries.length} | backend logs: {backendDebugLoadedAt ? `loaded ${new Date(backendDebugLoadedAt).toLocaleTimeString()}` : 'not loaded'}
               </div>
             </div>
@@ -15707,15 +16196,15 @@ export default function App({
               </div>
               <div style={{ flex: 1, overflowY: 'auto', padding: '4px 8px' }}>
                 {recentDebugEntries.length === 0 ? (
-                  <div style={{ color: '#808080', fontSize: '11px' }}>no frontend logs yet</div>
+                  <div style={{ color: '#fff', fontSize: '11px' }}>no frontend logs yet</div>
                 ) : recentDebugEntries.map((entry) => (
                   <div key={entry.id} style={{ padding: '4px 0', borderBottom: '1px dotted #333' }}>
                     <div style={{ color: entry.category === 'error' ? '#ff5555' : '#00ff41', fontSize: '10px' }}>
                       {entry.ts} [{entry.category}]
                     </div>
-                    <div style={{ color: '#c0c0c0', fontSize: '11px', marginTop: '2px', wordBreak: 'break-word' }}>{entry.message}</div>
+                    <div style={{ color: '#fff', fontSize: '11px', marginTop: '2px', wordBreak: 'break-word' }}>{entry.message}</div>
                     {entry.details ? (
-                      <div style={{ color: '#808080', fontSize: '10px', marginTop: '2px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      <div style={{ color: '#fff', fontSize: '10px', marginTop: '2px', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                         {formatDebugDetails(entry.details)}
                       </div>
                     ) : null}
@@ -15732,11 +16221,11 @@ export default function App({
                 {backendDebugError ? (
                   <div style={{ color: '#ff5555', fontSize: '11px', whiteSpace: 'pre-wrap' }}>{backendDebugError}</div>
                 ) : backendDebugSnapshot ? (
-                  <pre style={{ margin: 0, color: '#c0c0c0', fontSize: '10px', fontFamily: 'inherit', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  <pre style={{ margin: 0, color: '#fff', fontSize: '10px', fontFamily: 'inherit', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                     {backendDebugSnapshot}
                   </pre>
                 ) : (
-                  <div style={{ color: '#808080', fontSize: '11px' }}>no backend logs loaded yet</div>
+                  <div style={{ color: '#fff', fontSize: '11px' }}>no backend logs loaded yet</div>
                 )}
               </div>
             </div>
@@ -15792,13 +16281,13 @@ export default function App({
         >
           <div style={{ color: '#fff', fontSize: '14px', fontWeight: 'bold', marginBottom: '8px' }}>
             {chatPopupUserData.username}
-            <PlatformIcons platforms={chatPopupUserData.platforms} />
+            <PlatformIcons platforms={chatPopupUserData.platforms} online={Boolean(chatPopupUserData.is_online)} />
           </div>
-          <div style={{ fontSize: '11px', color: '#ccc', lineHeight: '1.6' }}>
-            <div><span style={{ color: '#9ca3af' }}>status:</span> <span style={{ color: chatPopupUserData.status === 'offline' ? '#9ca3af' : '#22c55e' }}>{chatPopupUserData.status}</span></div>
-            <div><span style={{ color: '#9ca3af' }}>joined:</span> {chatPopupUserData.joinedAt}</div>
+          <div style={{ fontSize: '11px', color: '#fff', lineHeight: '1.6' }}>
+            <div><span style={{ color: '#fff' }}>status:</span> <span style={{ color: chatPopupUserData.status === 'offline' ? '#fff' : '#22c55e' }}>{chatPopupUserData.status}</span></div>
+            <div><span style={{ color: '#fff' }}>joined:</span> {chatPopupUserData.joinedAt}</div>
             {chatPopupUserData.listeningTo && (
-              <div><span style={{ color: '#9ca3af' }}>{chatPopupUserData.listeningTo.prefix}:</span> {chatPopupUserData.listeningTo.label}</div>
+              <div><span style={{ color: '#fff' }}>{chatPopupUserData.listeningTo.prefix}:</span> {chatPopupUserData.listeningTo.label}</div>
             )}
           </div>
         </div>
@@ -15862,13 +16351,12 @@ export default function App({
             disabled={!newPlaylistName.trim()}
             style={{
               borderRadius: '6px',
-              background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-              border: 'none',
-              color: '#fff',
+              background: newPlaylistName.trim() ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
+              border: newPlaylistName.trim() ? 'none' : `1px dashed rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+              color: newPlaylistName.trim() ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
               padding: '10px 20px',
               fontWeight: 'bold',
-              cursor: newPlaylistName.trim() ? 'pointer' : 'not-allowed',
-              opacity: newPlaylistName.trim() ? 1 : 0.5
+              cursor: newPlaylistName.trim() ? 'pointer' : 'not-allowed'
             }}
           >
             create
@@ -15911,7 +16399,7 @@ export default function App({
               }}
             />
           </Form.Group>
-          <div style={{ color: '#9ca3af', fontSize: '11px', marginTop: '12px' }}>
+          <div style={{ color: 'var(--theme-primary)', fontSize: '11px', marginTop: '12px' }}>
             all current members ({currentChannelMembers.length}) will be able to edit this playlist
           </div>
         </Modal.Body>
@@ -15934,13 +16422,12 @@ export default function App({
             disabled={!newCollabPlaylistName.trim()}
             style={{
               borderRadius: '6px',
-              background: `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
-              border: 'none',
-              color: '#fff',
+              background: newCollabPlaylistName.trim() ? `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})` : 'transparent',
+              border: newCollabPlaylistName.trim() ? 'none' : `1px dashed rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
+              color: newCollabPlaylistName.trim() ? '#fff' : `rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`,
               padding: '10px 20px',
               fontWeight: 'bold',
-              cursor: newCollabPlaylistName.trim() ? 'pointer' : 'not-allowed',
-              opacity: newCollabPlaylistName.trim() ? 1 : 0.5
+              cursor: newCollabPlaylistName.trim() ? 'pointer' : 'not-allowed'
             }}
           >
             create
@@ -15964,7 +16451,7 @@ export default function App({
           <div style={{ color: '#fff', fontSize: '14px', marginBottom: '12px' }}>
             are you sure you want to permanently delete <strong style={{ color: '#ff4444' }}>{deleteUserConfirm?.username}</strong>?
           </div>
-          <div style={{ color: '#9ca3af', fontSize: '12px' }}>
+          <div style={{ color: '#fff', fontSize: '12px' }}>
             this will remove all their data including messages, friends, playlists, and server memberships. this cannot be undone.
           </div>
         </Modal.Body>
@@ -16012,7 +16499,7 @@ export default function App({
         <Modal.Header style={{ borderBottom: `2px solid rgb(${themeColor.r}, ${themeColor.g}, ${themeColor.b})`, background: '#000000' }}>
           <Modal.Title style={{ color: '#ffffff', fontSize: '18px' }}>hey, welcome</Modal.Title>
         </Modal.Header>
-        <Modal.Body style={{ background: `rgba(${themeColor.r}, ${themeColor.g}, ${themeColor.b}, 0.1)`, padding: '24px', maxHeight: '65vh', overflowY: 'auto', color: '#fff', fontSize: '14px', lineHeight: 1.6 }}>
+        <Modal.Body style={{ background: `rgba(${themeColor.r}, ${themeColor.g}, ${themeColor.b}, 0.1)`, padding: '24px', maxHeight: 'calc(65 * var(--vh))', overflowY: 'auto', color: '#fff', fontSize: '14px', lineHeight: 1.6 }}>
           <p>
             hi, i'm shibenchi. this is a private project i've built over the course of a year. use
             it if you want, no risk to you.
@@ -16105,19 +16592,21 @@ export default function App({
               key: shibby.state,
               narrow: false,
               text: shibby.state === 'ask'
-                ? `yo bro, "${shibby.title.length > 70 ? shibby.title.slice(0, 70) + '...' : shibby.title}" is unavailable. i can search for the same title and replace it (not very confident unfortunately) or you can do it yourself. just letting you know`
+                ? `error: ${shibby.text || 'cause unknown'}`
                 : shibby.state === 'searching'
                   ? 'searching...'
-                  : "couldn't find anything that matches, sorry bro. you can delete it or skip it",
+                  : 'error: no other upload found',
+              checked: shibby.state === 'ask' ? [clipText(shibby.title, 60), ...(shibby.checked || [])].join(' | ') : '',
               buttons: [
-                ...(shibby.state === 'ask' ? [{ label: 'search and replace', onClick: shibbyReplace }] : []),
+                ...(shibby.state === 'ask' && !['gone', 'blocked'].includes(shibby.kind) ? [{ label: 'try again', onClick: shibbyRetry }] : []),
+                ...(shibby.state === 'ask' && ['gone', 'blocked', 'unknown'].includes(shibby.kind) ? [{ label: 'search and replace', onClick: shibbyReplace }] : []),
                 ...(shibby.state !== 'searching' ? [{ label: 'delete from queue', onClick: shibbyDelete }, { label: 'skip', onClick: shibbySkip }] : [])
               ]
             }
             : null;
         if (!view) return null;
         return (
-          <div data-shibby={view.key} style={{ position: 'fixed', right: '24px', bottom: '90px', zIndex: 2000, display: 'flex', alignItems: 'flex-start', gap: '16px', width: view.narrow ? 'min(340px, calc(100vw - 32px))' : 'min(440px, calc(100vw - 32px))' }}>
+          <div data-shibby={view.key} style={{ position: 'fixed', right: '24px', bottom: '90px', zIndex: 2000, display: 'flex', alignItems: 'flex-start', gap: '16px', width: view.narrow ? 'min(340px, calc(calc(100 * var(--vw)) - 32px))' : 'min(440px, calc(calc(100 * var(--vw)) - 32px))' }}>
             <div
               aria-hidden="true"
               style={{
@@ -16133,6 +16622,7 @@ export default function App({
               <div style={{ position: 'absolute', left: '-6px', top: '24px', width: '10px', height: '10px', background: 'rgb(20, 20, 20)', borderLeft: `1px solid ${accentRgb}`, borderBottom: `1px solid ${accentRgb}`, transform: 'rotate(45deg)' }} />
               <div style={{ color: accentRgb, fontWeight: 'bold', fontSize: '13px', marginBottom: '6px' }}>Shibby</div>
               <div style={{ color: '#fff', fontSize: '12px', lineHeight: 1.5, overflowWrap: 'anywhere' }}>{view.text}</div>
+              {view.checked ? <div data-shibby-checked style={{ color: '#fff', fontSize: '11px', lineHeight: 1.45, marginTop: '8px', overflowWrap: 'anywhere' }}>{view.checked}</div> : null}
               {view.buttons.length ? (
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' }}>
                   {view.buttons.map((button) => (
@@ -16145,9 +16635,37 @@ export default function App({
         );
       })()}
 
+      {showLyrics && currentTrack ? (
+        <LyricsMode
+          track={currentTrack}
+          audioRef={audioRef}
+          themeColor={themeColor}
+          canvasRef={particleCanvasRef}
+          duration={trackProgress.duration}
+          onClose={() => setShowLyrics(false)}
+        />
+      ) : null}
+
+      {wrappedView ? <Wrapped data={wrappedView.data} color={themeColor} lookup={wrappedIndex ? wrappedIndex.lookup : undefined} onClose={() => setWrappedView(null)} /> : null}
+
+      <ChangesModal
+        show={showChanges}
+        onHide={() => setShowChanges(false)}
+        entries={undoHistory}
+        onUndo={(id) => undoChangeRef.current(id)}
+      />
+
       {showToast && (
         <div className={`toast ${showToast.variant}`}>
           <span>{showToast.message}</span>
+          {showToast.action ? (
+            <button
+              type="button"
+              className="toast-action"
+              data-toast-action
+              onClick={() => { const run = showToast.action.run; setShowToast(null); run(); }}
+            >{showToast.action.label}</button>
+          ) : null}
         </div>
       )}
     </Container>

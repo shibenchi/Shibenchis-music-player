@@ -39,6 +39,15 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex
 
 // turn on foreign keys
 db.pragma('foreign_keys = ON');
+// writes: WAL with synchronous NORMAL. the default made every separate write wait for the disk to confirm it (560 ms each on a slow drive, with
+// the whole server standing still meanwhile: it is one thread and the database calls are synchronous). WAL with NORMAL cannot corrupt the file,
+// a power cut can only cost the last moments. the mode stays in the file, so older code opens it fine
+try {
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+} catch (error) {
+  // a drive that cannot do it (read only, a network share): the old way
+}
 
 // a changed or deleted row is overwritten with zeros instead of staying readable in the file (scrambling the old
 // messages would otherwise leave their text behind in the freed space)
@@ -316,6 +325,18 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
+  -- a device without the account key asks the account's other devices for it. requester_pub is the public half of a one time key of that device,
+  -- wrapped is the account key locked for it by the device that answered (only those two devices can open it, the server holds a locked blob).
+  -- rows are deleted when the answer is fetched and after 15 minutes
+  CREATE TABLE IF NOT EXISTS e2e_transfers (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    requester_pub TEXT NOT NULL,
+    wrapped TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   -- what each account has listened to, for its own stats. one row is a stretch of one song (a pause and a
   -- resume a few minutes later extend the row), plays is 0 on the row that only continues a song
   CREATE TABLE IF NOT EXISTS listen_events (
@@ -409,6 +430,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_server_members_user_id ON server_members(user_id);
 `);
 
+// migration: the video a listened song is from (for thumbnails in the wrapped story). older rows keep an empty one
+try {
+  db.prepare("ALTER TABLE listen_events ADD COLUMN video_id TEXT NOT NULL DEFAULT ''").run();
+} catch (err) {
+  // already there
+}
+
 // migration: add is_admin col for older dbs that dont have it yet
 try {
   db.prepare('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0').run();
@@ -469,6 +497,17 @@ try {
   db.prepare('ALTER TABLE collab_playlist_tracks ADD COLUMN position INTEGER').run();
 } catch (err) {
   // already there
+}
+
+// the sealed copies of account keys of the day they existed (the server could open them): gone. secure_delete zeroes the freed pages
+try {
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user_key_escrow'").get()) {
+    db.exec('DROP TABLE user_key_escrow');
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    console.log('the sealed copies of the account keys were deleted from the database');
+  }
+} catch (err) {
+  console.error('could not delete the sealed key copies:', err.message);
 }
 
 // make the configured admin accounts admin if they already exist
@@ -979,6 +1018,9 @@ const statements = {
   removeServerMemberByUserId: db.prepare(`
     DELETE FROM server_members WHERE server_id = ? AND user_id = ?
   `),
+  setServerMemberAdmin: db.prepare(`
+    UPDATE server_members SET is_admin = ? WHERE server_id = ? AND user_id = ?
+  `),
   getUserServers: db.prepare(`
     SELECT s.*, sm.is_admin, sm.joined_at FROM server_members sm
     JOIN active_servers s ON sm.server_id = s.id
@@ -1065,6 +1107,14 @@ const statements = {
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `),
   listUserKeyIds: db.prepare(`SELECT user_id FROM user_keys`),
+  createTransfer: db.prepare(`INSERT INTO e2e_transfers (id, user_id, requester_pub, created_at) VALUES (?, ?, ?, ?)`),
+  pendingTransfers: db.prepare(`SELECT id, requester_pub, created_at FROM e2e_transfers WHERE user_id = ? AND wrapped IS NULL AND created_at >= ? ORDER BY created_at DESC LIMIT 5`),
+  getTransfer: db.prepare(`SELECT id, wrapped, created_at FROM e2e_transfers WHERE id = ? AND user_id = ?`),
+  answerTransfer: db.prepare(`UPDATE e2e_transfers SET wrapped = ? WHERE id = ? AND user_id = ? AND wrapped IS NULL AND created_at >= ?`),
+  deleteTransfer: db.prepare(`DELETE FROM e2e_transfers WHERE id = ? AND user_id = ?`),
+  purgeTransfers: db.prepare(`DELETE FROM e2e_transfers WHERE created_at < ?`),
+  countOpenTransfers: db.prepare(`SELECT COUNT(*) AS n FROM e2e_transfers WHERE user_id = ? AND created_at >= ?`),
+  dropOldestTransfers: db.prepare(`DELETE FROM e2e_transfers WHERE id IN (SELECT id FROM e2e_transfers WHERE user_id = ? ORDER BY created_at ASC LIMIT ?)`),
   getIntegration: db.prepare(`SELECT * FROM integrations WHERE user_id = ? AND provider = ?`),
   saveIntegration: db.prepare(`
     INSERT INTO integrations (user_id, provider, access_token, refresh_token, expires_at, account_name)
@@ -1096,10 +1146,10 @@ const statements = {
   `),
   lastListen: db.prepare(`SELECT * FROM listen_events WHERE user_id = ? ORDER BY id DESC LIMIT 1`),
   insertListen: db.prepare(`
-    INSERT INTO listen_events (user_id, track_key, title, author, source, started_at, ended_at, seconds, plays)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO listen_events (user_id, track_key, title, author, source, started_at, ended_at, seconds, plays, video_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
-  extendListen: db.prepare(`UPDATE listen_events SET seconds = seconds + ?, ended_at = ? WHERE id = ?`),
+  extendListen: db.prepare(`UPDATE listen_events SET seconds = seconds + ?, ended_at = ?, video_id = CASE WHEN video_id = '' THEN ? ELSE video_id END WHERE id = ?`),
   upsertInvite: db.prepare(`
     INSERT INTO room_invites (id, server_id, from_id, to_id) VALUES (?, ?, ?, ?)
     ON CONFLICT(server_id, to_id) DO UPDATE SET id = excluded.id, from_id = excluded.from_id, created_at = strftime('%s', 'now')
@@ -1243,12 +1293,13 @@ function recordListening(userId, track, startedAt, endedAt) {
   const title = String(track.title).trim().slice(0, 200);
   const author = String(track.author || '').trim().slice(0, 120);
   const key = trackKeyOf(title, author);
+  const videoId = /^[\w-]{11}$/.test(String(track.video_id || '')) ? String(track.video_id) : '';
   const last = statements.lastListen.get(userId);
   const continues = last && last.track_key === key && start - last.ended_at <= MERGE_GAP_SECONDS && start >= last.ended_at - 60;
   if (continues && Math.floor(last.started_at / 3600) === Math.floor(start / 3600)) {
-    statements.extendListen.run(seconds, Math.max(last.ended_at, start + seconds), last.id);
+    statements.extendListen.run(seconds, Math.max(last.ended_at, start + seconds), videoId, last.id);
   } else {
-    statements.insertListen.run(userId, key, title, author, String(track.source || 'personal').slice(0, 20), start, start + seconds, seconds, continues ? 0 : 1);
+    statements.insertListen.run(userId, key, title, author, String(track.source || 'personal').slice(0, 20), start, start + seconds, seconds, continues ? 0 : 1, videoId);
   }
   return true;
 }
@@ -1354,6 +1405,122 @@ function getListeningStats(userId, { range = 'week', offsetMin = 0, nowSec = Mat
   };
 }
 
+// the calendar years an account has listening in (in the person's own clock), newest first
+function getListeningYears(userId, offsetMin = 0) {
+  const offset = Math.max(-14 * 60, Math.min(14 * 60, Math.trunc(Number(offsetMin) || 0))) * 60;
+  return db.prepare(`SELECT DISTINCT CAST(strftime('%Y', started_at + ?, 'unixepoch') AS INTEGER) AS y FROM listen_events WHERE user_id = ? ORDER BY y DESC`)
+    .all(offset, userId).map((row) => row.y);
+}
+
+// one calendar year of listening, for the wrapped story: a year is Jan 1 to Dec 31 on the person's own clock. nothing in it is shared
+// with anyone, it is the same data as the stats tab
+function getWrapped(userId, { year, offsetMin = 0, nowSec = Math.floor(Date.now() / 1000) } = {}) {
+  const y = Math.trunc(Number(year));
+  if (!(y >= 2000 && y <= 2200)) return null;
+  const offset = Math.max(-14 * 60, Math.min(14 * 60, Math.trunc(Number(offsetMin) || 0))) * 60;
+  const from = Date.UTC(y, 0, 1) / 1000 - offset;
+  const to = Date.UTC(y + 1, 0, 1) / 1000 - offset;
+  const previousFrom = Date.UTC(y - 1, 0, 1) / 1000 - offset;
+  const q = (sql, ...params) => db.prepare(sql).all(...params);
+  const where = 'user_id = ? AND started_at >= ? AND started_at < ?';
+  const base = [userId, from, to];
+
+  const totals = q(`SELECT COALESCE(SUM(seconds), 0) AS seconds, COALESCE(SUM(plays), 0) AS plays,
+      COUNT(DISTINCT track_key) AS tracks, COUNT(DISTINCT CASE WHEN author <> '' THEN lower(author) END) AS artists
+    FROM listen_events WHERE ${where}`, ...base)[0];
+  const previousSeconds = q('SELECT COALESCE(SUM(seconds), 0) AS seconds FROM listen_events WHERE user_id = ? AND started_at >= ? AND started_at < ?', userId, previousFrom, from)[0].seconds;
+
+  // video_id is the one a thumbnail can be made from ('' for listening from before it was kept, the app then looks the song up on the device)
+  const topTrackRows = q(`SELECT track_key, title, author, SUM(seconds) AS seconds, SUM(plays) AS plays, MAX(video_id) AS video_id FROM listen_events WHERE ${where}
+    GROUP BY track_key ORDER BY seconds DESC, plays DESC LIMIT 10`, ...base);
+  const topArtistRows = q(`SELECT lower(author) AS k, MIN(author) AS author, SUM(seconds) AS seconds, SUM(plays) AS plays, COUNT(DISTINCT track_key) AS tracks
+    FROM listen_events WHERE ${where} AND author <> '' GROUP BY lower(author) ORDER BY seconds DESC, plays DESC LIMIT 10`, ...base);
+
+  // every song in every month of the year: the month by month curve of the top songs, and the song that led each month
+  const perMonth = q(`SELECT track_key, MIN(title) AS title, MIN(author) AS author, CAST(strftime('%m', started_at + ?, 'unixepoch') AS INTEGER) AS m, SUM(seconds) AS s, MAX(video_id) AS v
+    FROM listen_events WHERE ${where} GROUP BY track_key, m`, offset, ...base);
+  const videoOf = new Map();
+  const monthsOf = new Map(topTrackRows.map((row) => [row.track_key, new Array(12).fill(0)]));
+  const leaders = new Array(12).fill(null);
+  perMonth.forEach((row) => {
+    if (row.v && row.v > (videoOf.get(row.track_key) || '')) videoOf.set(row.track_key, row.v);
+    if (monthsOf.has(row.track_key)) monthsOf.get(row.track_key)[row.m - 1] = row.s;
+    const lead = leaders[row.m - 1];
+    if (!lead || row.s > lead.seconds) leaders[row.m - 1] = { key: row.track_key, title: row.title, author: row.author, seconds: row.s };
+  });
+  const monthLeaders = leaders.map((lead) => (lead ? { title: lead.title, author: lead.author, seconds: lead.seconds, video_id: videoOf.get(lead.key) || '' } : null));
+  const topTracks = topTrackRows.map((row) => ({ title: row.title, author: row.author, seconds: row.seconds, plays: row.plays, video_id: row.video_id, months: monthsOf.get(row.track_key) }));
+
+  // an artist's picture is the thumbnail of its most listened song that has one
+  const artistTop = new Map();
+  q(`SELECT lower(author) AS k, MIN(title) AS title, SUM(seconds) AS s, MAX(video_id) AS v FROM listen_events WHERE ${where} AND author <> '' GROUP BY k, track_key ORDER BY s DESC`, ...base)
+    .forEach((row) => {
+      const have = artistTop.get(row.k) || { title: row.title, video_id: '' };
+      if (!have.video_id && row.v) have.video_id = row.v;
+      artistTop.set(row.k, have);
+    });
+  const topArtists = topArtistRows.map((row) => ({ author: row.author, seconds: row.seconds, plays: row.plays, tracks: row.tracks, top_title: (artistTop.get(row.k) || {}).title || '', video_id: (artistTop.get(row.k) || {}).video_id || '' }));
+
+  // the songs played again and again (by how many times, not how long)
+  const repeats = q(`SELECT title, author, SUM(plays) AS plays, SUM(seconds) AS seconds, MAX(video_id) AS video_id FROM listen_events WHERE ${where}
+    GROUP BY track_key HAVING SUM(plays) > 1 ORDER BY plays DESC, seconds DESC LIMIT 10`, ...base);
+
+  const hours = new Array(24).fill(0);
+  q(`SELECT (CAST(started_at + ? AS INTEGER) % 86400) / 3600 AS h, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY h`, offset, ...base)
+    .forEach((row) => { hours[row.h] = row.s; });
+  const weekdays = new Array(7).fill(0);
+  q(`SELECT ((CAST(started_at + ? AS INTEGER) / 86400) + 4) % 7 AS d, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY d`, offset, ...base)
+    .forEach((row) => { weekdays[row.d] = row.s; });
+  const months = new Array(12).fill(0);
+  q(`SELECT CAST(strftime('%m', started_at + ?, 'unixepoch') AS INTEGER) AS m, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY m`, offset, ...base)
+    .forEach((row) => { months[row.m - 1] = row.s; });
+
+  const dayRows = q(`SELECT CAST(started_at + ? AS INTEGER) / 86400 AS d, SUM(seconds) AS s FROM listen_events WHERE ${where} GROUP BY d ORDER BY d`, offset, ...base);
+  let bestDay = null;
+  let best = 0; let run = 0; let prev = null;
+  for (const row of dayRows) {
+    if (!bestDay || row.s > bestDay.seconds) bestDay = { day: dayName(row.d), seconds: row.s };
+    run = prev !== null && row.d - prev === 1 ? run + 1 : 1;
+    best = Math.max(best, run);
+    prev = row.d;
+  }
+
+  const firstSeen = (column) => q(`SELECT COUNT(*) AS n FROM (SELECT MIN(started_at) AS f FROM listen_events WHERE user_id = ? ${column === 'artist' ? "AND author <> ''" : ''} GROUP BY ${column === 'artist' ? 'lower(author)' : 'track_key'}) WHERE f >= ? AND f < ?`, userId, from, to)[0].n;
+  const longestRow = q(`SELECT title, author, seconds FROM listen_events WHERE ${where} ORDER BY seconds DESC LIMIT 1`, ...base)[0];
+  const firstRow = q(`SELECT title, author, started_at FROM listen_events WHERE ${where} ORDER BY started_at ASC LIMIT 1`, ...base)[0];
+
+  return {
+    year: y,
+    from,
+    to,
+    // the year is not over yet: what is shown is the year so far
+    complete: nowSec >= to,
+    totals: {
+      seconds: totals.seconds, plays: totals.plays, tracks: totals.tracks, artists: totals.artists,
+      previous_seconds: previousSeconds, new_tracks: firstSeen('track'), new_artists: firstSeen('artist')
+    },
+    top_tracks: topTracks,
+    top_artists: topArtists,
+    repeats,
+    month_leaders: monthLeaders,
+    hours,
+    weekdays,
+    months,
+    // seconds listened on each day of the year (index 0 is january 1st), for the calendar
+    days: (() => {
+      const startDay = Math.floor(Date.UTC(y, 0, 1) / 86400000);
+      const list = new Array(Math.round((Date.UTC(y + 1, 0, 1) - Date.UTC(y, 0, 1)) / 86400000)).fill(0);
+      dayRows.forEach((row) => { const i = row.d - startDay; if (i >= 0 && i < list.length) list[i] = row.s; });
+      return list;
+    })(),
+    active_days: dayRows.length,
+    best_streak: best,
+    best_day: bestDay,
+    longest: longestRow ? { title: longestRow.title, author: longestRow.author, seconds: longestRow.seconds } : null,
+    first: firstRow ? { title: firstRow.title, author: firstRow.author, at: firstRow.started_at } : null
+  };
+}
+
 // how much each of these accounts listened in a range (for a list of friends)
 function getListeningBoard(userIds, { range = 'week', offsetMin = 0, nowSec = Math.floor(Date.now() / 1000) } = {}) {
   const r = statsRange(range, nowSec, offsetMin);
@@ -1395,10 +1562,17 @@ if (scrambledAtStart > 0) {
   // rewrite the file so no old copy of the text is left in pages that were freed
   try {
     db.exec('VACUUM');
+    // and the log of the WAL mode, which holds the old pages until it is folded back into the file and cut
+    db.pragma('wal_checkpoint(TRUNCATE)');
   } catch (error) {
     console.error('could not compact the database after scrambling:', error.message);
   }
 }
+// the log is folded back into the file and cut every few minutes, so a deleted or scrambled message does not stay readable in it for long
+const walCleaner = setInterval(() => {
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (error) { /* busy, next time */ }
+}, 5 * 60 * 1000);
+if (walCleaner.unref) walCleaner.unref();
 
 module.exports = {
   db,
@@ -1418,9 +1592,10 @@ module.exports = {
   normalizeStoredTrack,
 
   // user management
-  createUser: (username, password) => {
+  // async: the hashing gives other requests a turn between its rounds (the sync one froze the server for a quarter of a second each time)
+  createUser: async (username, password) => {
     const id = `user_${crypto.randomUUID()}`;
-    const passwordHash = bcrypt.hashSync(password, 10);
+    const passwordHash = await bcrypt.hash(password, 10);
     const isAdmin = ADMIN_USERNAMES.includes(String(username).toLowerCase()) ? 1 : 0;
 
     // stick the user in with their admin flag
@@ -1442,15 +1617,15 @@ module.exports = {
       || null;
   },
 
-  authenticateUser: (username, password) => {
+  authenticateUser: async (username, password) => {
     const user = statements.getUserByUsername.get(username)
       || statements.getUserByUsernameNoCase.get(username);
     if (!user) {
-      bcrypt.compareSync(password, DUMMY_PASSWORD_HASH);
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return null;
     }
 
-    const valid = bcrypt.compareSync(password, user.password_hash);
+    const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return null;
 
     return { id: user.id, username: user.username, is_admin: user.is_admin === 1 };
@@ -1761,6 +1936,22 @@ module.exports = {
     statements.clearUserQueue.run(userId);
   },
 
+  // a whole queue replaced at once, in one transaction: one write to the disk instead of one for every song (800 songs saved one at a time
+  // froze the whole server for as long as the disk took to confirm 800 separate writes). a bad song undoes the lot instead of leaving half
+  replaceUserQueue: (userId, tracks) => {
+    const run = db.transaction(() => {
+      statements.clearUserQueue.run(userId);
+      tracks.forEach((track, index) => {
+        const t = normalizeTrackInput(track);
+        statements.addToUserQueue.run(createServerQueueId(), userId, t.videoId, t.title, t.author, t.format, t.source, t.thumbnail, t.externalUrl, t.durationMs, index);
+      });
+    });
+    run();
+  },
+
+  // several writes as one: for a loop that would otherwise wait for the disk once per item
+  runInTransaction: (work) => db.transaction(work)(),
+
   updateUserQueuePosition: (trackId, newPosition) => {
     statements.updateUserQueuePosition.run(newPosition, trackId);
   },
@@ -1953,6 +2144,11 @@ module.exports = {
     statements.removeServerMemberByUserId.run(serverId, userId);
   },
 
+  // promote or demote a member of a room (the flag on their membership, nothing on the account itself)
+  setServerMemberAdmin: (serverId, userId, isAdmin) => {
+    return statements.setServerMemberAdmin.run(isAdmin ? 1 : 0, serverId, userId).changes > 0;
+  },
+
   getUserServers: (userId) => {
     return statements.getUserServers.all(userId);
   },
@@ -2026,6 +2222,29 @@ module.exports = {
     return result.changes > 0;
   },
   userIdsWithKeys: () => statements.listUserKeyIds.all().map((row) => row.user_id),
+  // handing the account key from one device to another (see the routes /api/e2e/transfer): only public halves of one time keys and a locked blob
+  TRANSFER_TTL_SECONDS: 15 * 60,
+  createTransfer: (userId, requesterPub) => {
+    const now = Math.floor(Date.now() / 1000);
+    statements.purgeTransfers.run(now - 15 * 60);
+    const open = statements.countOpenTransfers.get(userId, now - 15 * 60).n;
+    if (open >= 5) statements.dropOldestTransfers.run(userId, open - 4);
+    const id = `xfer_${crypto.randomUUID()}`;
+    statements.createTransfer.run(id, userId, requesterPub, now);
+    return id;
+  },
+  pendingTransfers: (userId) => statements.pendingTransfers.all(userId, Math.floor(Date.now() / 1000) - 15 * 60),
+  answerTransfer: (userId, id, wrapped) => statements.answerTransfer.run(wrapped, id, userId, Math.floor(Date.now() / 1000) - 15 * 60).changes > 0,
+  // the answer, once: the row goes when it is fetched. null: no such request (or it ran out), { wrapped: null }: not answered yet
+  takeTransfer: (userId, id) => {
+    const row = statements.getTransfer.get(id, userId);
+    if (!row || row.created_at < Math.floor(Date.now() / 1000) - 15 * 60) {
+      if (row) statements.deleteTransfer.run(id, userId);
+      return null;
+    }
+    if (row.wrapped) statements.deleteTransfer.run(id, userId);
+    return { wrapped: row.wrapped || null };
+  },
 
   // ---- invites to rooms (kept a day)
   INVITE_TTL_SECONDS,
@@ -2090,6 +2309,8 @@ module.exports = {
   recordListening: (userId, track, startedAt, endedAt) => recordListening(userId, track, startedAt, endedAt),
   getListeningStats: (userId, options) => getListeningStats(userId, options),
   getListeningBoard: (userIds, options) => getListeningBoard(userIds, options),
+  getListeningYears: (userId, offsetMin) => getListeningYears(userId, offsetMin),
+  getWrapped: (userId, options) => getWrapped(userId, options),
 
   createDirectMessage: (senderId, senderUsername, receiverId, receiverUsername, message, senderThemeColor = null) => {
     const id = `dm_${crypto.randomUUID()}`;

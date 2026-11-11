@@ -91,6 +91,20 @@ function scheduleLauncherIcon(color) {
   }, 700);
 }
 
+// the shortcuts on the computer are files that get written again, which windows is then told about. the first change goes out at once,
+// and a slider that keeps moving is not written more than about 2.5 times a second: the last color always goes out
+const SHORTCUT_GAP_MS = 400;
+let lastShortcutAt = 0;
+let shortcutTimer = null;
+function recolorShortcutsSoon(bytes, key) {
+  clearTimeout(shortcutTimer);
+  const wait = Math.max(0, lastShortcutAt + SHORTCUT_GAP_MS - Date.now());
+  shortcutTimer = setTimeout(() => {
+    lastShortcutAt = Date.now();
+    recolorShortcuts(bytes, key);
+  }, wait);
+}
+
 // the icon on the computer's window (taskbar and title bar), the browser tab, and
 // on the phone both the launcher icon and the home screen shortcut
 export async function applyAppIconColor(color) {
@@ -114,7 +128,7 @@ export async function applyAppIconColor(color) {
         frontendLog('appIcon', `window icon not changed: ${err?.message || err}`);
       }
       // the desktop shortcut and the taskbar pin, which are files with an icon of their own
-      await recolorShortcuts(bytes, `${color.r}-${color.g}-${color.b}`);
+      recolorShortcutsSoon(bytes, `${color.r}-${color.g}-${color.b}`);
     }
   } catch {
     // an icon that does not change is no reason to complain

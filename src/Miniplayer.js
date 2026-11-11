@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { announceMiniplayerReady, frontendLog } from './tauriApi';
 import Marquee from './Marquee';
+import { createVisualizerRenderers } from './vizRenderers';
+import { ampFromSpectrum, unpackFrame } from './wallpaperFrame';
 
 // catches anything that wouldve crashed this window silently. a blank,
 // totally dead miniplayer looks EXACTLY the same whether its a real bug or
@@ -74,6 +76,12 @@ const formatTime = (seconds) => {
 // MINI_HEIGHT in src-tauri/src/desktop.rs
 const MINI_BASE_WIDTH = 300;
 const MINI_BASE_HEIGHT = 150;
+// the drawings of the app are made for a whole screen (line widths, rings, glows), so the mini player draws the picture at this size on a
+// canvas of its own and scales it down into the window. same aspect as the window
+const VIZ_WIDTH = 800;
+const VIZ_HEIGHT = 400;
+// bars the way the drawings ask for them, out of the 96 that come with a frame
+const ampForBarRange = (index, count, data) => (data ? ampFromSpectrum(index, count, data) : 0);
 
 export default function Miniplayer() {
   const [nowPlaying, setNowPlaying] = useState(null);
@@ -123,9 +131,17 @@ export default function Miniplayer() {
           frameSerial += 1;
         });
 
-        // same softening the main window uses on the bars: untouched up to
-        // 0.65, then easing toward 1 instead of going flat against a ceiling
-        const softCeiling = (x) => (x <= 0.65 ? x : 0.65 + 0.35 * Math.tanh((x - 0.65) / 0.35));
+        // the drawing of the preset the main window has picked, the same code as the background of the app. what it needs is in the frame:
+        // the bars, the waveform and the tempo (see wallpaperFrame.js)
+        const picture = document.createElement('canvas');
+        picture.width = VIZ_WIDTH;
+        picture.height = VIZ_HEIGHT;
+        const pictureCtx = picture.getContext('2d');
+        const vizState = {};
+        const fade = { progress: 0 };
+        let renderers = null;
+        let rendererPreset = '';
+        let lastDrawAt = 0;
 
         const drawViz = () => {
           vizAnimationId = requestAnimationFrame(drawViz);
@@ -135,45 +151,50 @@ export default function Miniplayer() {
           if (!canvas) return;
           const ctx = canvas.getContext('2d');
           ctx.clearRect(0, 0, canvas.width, canvas.height);
-          const { baseHue, isPlaying, preset, bins, wave, bassPulse = 0 } = latestFrame || {};
-          if (!isPlaying) return;
-
-          if (preset === 'wave' && wave && wave.length > 1) {
-            // the main window's wave: a wide faint stroke under a sharp one, swings
-            // around the middle that grow with the bass
-            const midY = canvas.height / 2;
-            const swing = midY * 0.8 * (1 + bassPulse * 0.9);
-            const stepX = canvas.width / (wave.length - 1);
-            ctx.beginPath();
-            for (let i = 0; i < wave.length; i++) {
-              const y = midY + ((wave[i] - 128) / 128) * swing;
-              if (i === 0) ctx.moveTo(0, y);
-              else ctx.lineTo(i * stepX, y);
-            }
-            ctx.lineJoin = 'round';
-            ctx.lineWidth = 6 + bassPulse * 6;
-            ctx.strokeStyle = `hsla(${baseHue}, 85%, 60%, 0.14)`;
-            ctx.stroke();
-            ctx.lineWidth = 2;
-            ctx.strokeStyle = `hsla(${baseHue}, 85%, 60%, 0.7)`;
-            ctx.stroke();
-          } else if (bins) {
-            const barCount = bins.length;
-            const gap = 2;
-            const barWidth = canvas.width / barCount - gap;
-            for (let i = 0; i < barCount; i++) {
-              // the bass bars get the same extra push on a hit as in the main window
-              const bassWeight = Math.max(0, 1 - i / (barCount * 0.3));
-              const boosted = softCeiling((bins[i] / 255) * (1 + bassPulse * bassWeight * 2.5));
-              const height = Math.max(2, boosted * canvas.height * 0.8);
-              const x = i * (barWidth + gap);
-              const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - height);
-              gradient.addColorStop(0, `hsla(${baseHue}, 85%, 55%, 0.5)`);
-              gradient.addColorStop(1, `hsla(${baseHue}, 90%, 65%, 0.1)`);
-              ctx.fillStyle = gradient;
-              ctx.fillRect(x, canvas.height - height, barWidth, height);
-            }
+          const frame = latestFrame ? unpackFrame(latestFrame) : null;
+          if (!frame || !frame.isPlaying) {
+            fade.progress = 0;
+            return;
           }
+          // the plain background has no drawing of its own: the mini player keeps showing bars then
+          const preset = frame.preset === 'none' ? 'bars' : frame.preset;
+          if (!renderers || rendererPreset !== preset) {
+            Object.keys(vizState).forEach((key) => delete vizState[key]);
+            renderers = createVisualizerRenderers({ canvas: picture, ctx: pictureCtx, state: vizState, ampForBarRange });
+            rendererPreset = preset;
+          }
+          fade.progress = Math.min(1, fade.progress + 0.1);
+          const now = performance.now();
+          pictureCtx.clearRect(0, 0, VIZ_WIDTH, VIZ_HEIGHT);
+          (renderers[preset] || renderers.bars)({
+            soft: frame.soft,
+            beat: frame.beat,
+            bar: frame.bar,
+            bpm: frame.bpm,
+            locked: frame.locked,
+            phase: frame.phase,
+            period: frame.period,
+            beatCount: frame.beatCount,
+            barCount: frame.barCount,
+            beatInBar: frame.beatInBar,
+            now,
+            dt: Math.min(100, Math.max(4, now - (lastDrawAt || now - 33))),
+            baseHue: frame.baseHue,
+            sat: frame.sat,
+            light: frame.light,
+            isPlaying: true,
+            fadeProgress: fade.progress,
+            bassLevel: frame.bassLevel,
+            bassPulse: frame.bassPulse,
+            volumeLevel: frame.volumeLevel,
+            dataArray: frame.spec,
+            timeData: frame.wave
+          });
+          lastDrawAt = now;
+          // a little see through, the title and the buttons are on top of it
+          ctx.globalAlpha = 0.8;
+          ctx.drawImage(picture, 0, 0, canvas.width, canvas.height);
+          ctx.globalAlpha = 1;
         };
         if (!cancelled) vizAnimationId = requestAnimationFrame(drawViz);
 
@@ -370,7 +391,7 @@ export default function Miniplayer() {
           title="close miniplayer"
           style={{
             position: 'absolute', top: 6, right: 6,
-            background: 'transparent', border: 'none', color: 'rgba(255,255,255,0.5)',
+            background: 'transparent', border: 'none', color: '#fff',
             cursor: 'pointer', padding: 3, display: 'flex', zIndex: 2
           }}
         >
@@ -390,8 +411,8 @@ export default function Miniplayer() {
             )}
           </div>
           <div data-tauri-drag-region="deep" style={{ flex: 1, minWidth: 0, paddingRight: 14 }}>
-            <Marquee text={title} style={{ fontSize: 13, fontWeight: 600 }} />
-            <Marquee text={author} style={{ fontSize: 11, opacity: 0.7, marginTop: 1 }} />
+            <Marquee text={title} animate={isPlaying} style={{ fontSize: 13, fontWeight: 600 }} />
+            <Marquee text={author} animate={isPlaying} style={{ fontSize: 11, opacity: 0.7, marginTop: 1 }} />
           </div>
         </div>
 
@@ -412,19 +433,24 @@ export default function Miniplayer() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
-          {iconButton(<ShuffleIcon />, 'shuffle', shuffleOn ? 'shuffle on' : 'shuffle off', shuffleOn ? accent : dim)}
-          {iconButton(<PrevIcon />, 'previous', 'previous', accent)}
-          {iconButton(isPlaying ? <PauseIcon /> : <PlayIcon />, 'toggle', 'play/pause', accent, 3)}
-          {iconButton(<NextIcon />, 'next', 'next', accent)}
-          {iconButton(<RepeatIcon one={repeatMode === 'one'} />, 'repeat', `repeat ${repeatMode}`, repeatMode === 'off' ? dim : accent)}
-        </div>
+        <div
+          data-tauri-drag-region="false"
+          style={{ background: 'rgba(0,0,0,0.68)', border: `1px solid ${accent}`, borderRadius: 4, padding: '0 5px', width: 'fit-content', maxWidth: '100%', margin: '0 auto' }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+            {iconButton(<ShuffleIcon />, 'shuffle', shuffleOn ? 'shuffle on' : 'shuffle off', shuffleOn ? accent : dim)}
+            {iconButton(<PrevIcon />, 'previous', 'previous', accent)}
+            {iconButton(isPlaying ? <PauseIcon /> : <PlayIcon />, 'toggle', 'play/pause', accent, 3)}
+            {iconButton(<NextIcon />, 'next', 'next', accent)}
+            {iconButton(<RepeatIcon one={repeatMode === 'one'} />, 'repeat', `repeat ${repeatMode}`, repeatMode === 'off' ? dim : accent)}
+          </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
-          {iconButton(<VolumeIcon muted={muted} />, 'mute', muted ? 'unmute' : 'mute', muted ? dim : accent, 4)}
-          {iconButton(<MinusIcon />, 'volume_down', 'volume down', accent, 4)}
-          <span style={{ fontSize: 11, minWidth: 38, textAlign: 'center', color: muted ? dim : '#fef3e2' }}>{muted ? 'muted' : `${volumePct}%`}</span>
-          {iconButton(<PlusIcon />, 'volume_up', 'volume up', accent, 4)}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}>
+            {iconButton(<VolumeIcon muted={muted} />, 'mute', muted ? 'unmute' : 'mute', muted ? dim : accent, 4)}
+            {iconButton(<MinusIcon />, 'volume_down', 'volume down', accent, 4)}
+            <span style={{ fontSize: 11, minWidth: 38, textAlign: 'center', color: muted ? dim : '#fef3e2' }}>{muted ? 'muted' : `${volumePct}%`}</span>
+            {iconButton(<PlusIcon />, 'volume_up', 'volume up', accent, 4)}
+          </div>
         </div>
       </div>
     </div>

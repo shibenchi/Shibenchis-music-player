@@ -15,6 +15,8 @@
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
+    <!-- the live wallpaper is a bonus, the app installs on a phone without live wallpapers too -->
+    <uses-feature android:name="android.software.live_wallpaper" android:required="false" />
 
     <application
         android:icon="@mipmap/ic_launcher"
@@ -206,6 +208,20 @@
             android:name=".PlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
+
+        <!-- the live wallpaper: the visualizer behind the icons, picked on the system's own screen (see SmpWallpaperService) -->
+        <service
+            android:name=".SmpWallpaperService"
+            android:label="@string/wallpaper_label"
+            android:permission="android.permission.BIND_WALLPAPER"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/smp_wallpaper" />
+        </service>
 
         <receiver
             android:name=".MediaActionReceiver"

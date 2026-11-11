@@ -9,7 +9,7 @@ fn main() {
   // frontend specifically surfaces that rejection.
   tauri_build::try_build(
     tauri_build::Attributes::new().app_manifest(
-      tauri_build::AppManifest::new().commands(&["toggle_miniplayer", "frontend_log", "apply_shortcut_prefs", "set_shortcut_icon", "set_miniplayer_enabled"]),
+      tauri_build::AppManifest::new().commands(&["toggle_miniplayer", "frontend_log", "apply_shortcut_prefs", "set_shortcut_icon", "set_miniplayer_enabled", "set_wallpaper_enabled"]),
     ),
   )
   .expect("failed to run tauri-build");

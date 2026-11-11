@@ -25,12 +25,30 @@ html, body, #root {
 }
 
 /* and the drawing itself a little brighter (on a phone the media query further down takes over) */
+/* ctrl + h: only the visualizer is left (the keys keep working). the page and every popup become invisible, the canvas stays, the background is black */
+body.smp-ui-hidden,
+html:has(body.smp-ui-hidden) {
+  background: #000 !important;
+}
+body.smp-ui-hidden #root,
+body.smp-ui-hidden > *:not(#root) {
+  visibility: hidden !important;
+}
+body.smp-ui-hidden .visualizer-canvas {
+  visibility: visible !important;
+}
+
 .visualizer-canvas {
+  /* back to the committed values: the extra saturation and contrast pushed the drawings away from the theme color and the lower brightness made the quiet ones dim */
   filter: brightness(1.18) saturate(1.1);
 }
 
 /* theme vars, react updates these live */
 :root {
+  /* the size of the interface (uiScale.js) and a hundredth of the viewport with that size taken out */
+  --ui-scale: 1;
+  --vh: calc(1vh / var(--ui-scale));
+  --vw: calc(1vw / var(--ui-scale));
   --theme-primary: rgb(255, 89, 0);
   --theme-primary-rgb: 255, 89, 0;
   --theme-primary-rgba: rgba(255, 89, 0, 0.25);
@@ -283,7 +301,7 @@ html, body, #root {
 
 /* placeholder text actually needs to be visible on a dark bg lol */
 .form-control::placeholder {
-  color: rgba(255, 255, 255, 0.85);
+  color: #fff;
   opacity: 1;
 }
 
@@ -321,7 +339,11 @@ html, body, #root {
   position: relative;
   overflow: hidden;
   margin: 0 auto;
-  animation: spin 12s linear infinite;
+  /* a lap in 360 steps: 30 updates a second, one degree each, which looks the same as a smooth turn but is not redrawn at the full
+     refresh rate of the screen (a 144 hz laptop screen redrew the whole window 144 times a second for a record that turns once in 12) */
+  animation: spin 12s steps(360) infinite;
+  /* its own layer, so the turning is done by the compositor and not by the page's thread on every frame */
+  will-change: transform;
 }
 
 .vinyl-record.paused {
@@ -1118,7 +1140,7 @@ input[type="range"].eq-slider::-moz-range-track {
     display: none !important;
   }
   .top-nav-user {
-    max-width: 22vw;
+    max-width: calc(22 * var(--vw));
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1294,7 +1316,8 @@ input[type="range"].eq-slider::-moz-range-track {
 
 .settings-modal input[type="text"]::placeholder,
 .settings-modal input[type="password"]::placeholder {
-  color: #8a8a8a;
+  color: #fff;
+  opacity: 1;
 }
 
 .settings-modal input[type="range"]::-webkit-slider-thumb,
@@ -1318,6 +1341,7 @@ input[type="range"].eq-slider::-moz-range-track {
   background: transparent;
   color: #ffffff;
   border: 1px solid var(--theme-primary);
+  border-radius: 6px;
   cursor: pointer;
 }
 
@@ -1394,7 +1418,8 @@ input[type="range"].eq-slider::-moz-range-track {
 
 .social-flat input::placeholder,
 .social-flat textarea::placeholder {
-  color: #8a8a8a;
+  color: #fff;
+  opacity: 1;
 }
 
 /* long words and links wrap instead of running past the edge of a panel */
@@ -1488,7 +1513,7 @@ input[type="range"].eq-slider::-moz-range-track {
     -webkit-backdrop-filter: blur(3px) !important;
   }
   .visualizer-canvas {
-    filter: brightness(1.45) saturate(1.25);
+    filter: brightness(1.2) saturate(1.5) contrast(1.1);
   }
 }
 
@@ -1496,9 +1521,12 @@ input[type="range"].eq-slider::-moz-range-track {
    step aside and each panel is placed by the number it carries, so the order
    can cross from one column to the other */
 @media (max-width: 991.98px) {
+  /* nowrap: bootstrap's row wraps, and a wrapping column sizes its one line by the widest panel, so one long song title made every
+     panel as wide as a computer screen */
   .main-flat.custom-order {
     display: flex;
     flex-direction: column;
+    flex-wrap: nowrap;
     gap: 1.5rem;
     margin: 0;
   }
@@ -1507,6 +1535,8 @@ input[type="range"].eq-slider::-moz-range-track {
   }
   .main-flat.custom-order [data-panel] {
     order: var(--panel-order, 0);
+    min-width: 0;
+    max-width: 100%;
   }
 }
 @media (max-width: 720px) {
@@ -1523,3 +1553,361 @@ input[type="range"].eq-slider::-moz-range-track {
 .stats-top { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 @media (max-width: 900px) { .stats-top { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 480px) { .stats-top { grid-template-columns: minmax(0, 1fr); } }
+
+/* the change layout window, drawn like the settings window it is opened from: the same outlined boxes, the same small type, the same
+   hover. a panel is a plain row with its name and a few small buttons */
+.layout-editor .le-tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+.layout-editor .le-tab {
+  flex: 1 1 0;
+  padding: 6px 8px;
+  background: transparent;
+  color: var(--theme-primary);
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.layout-editor .le-tab.le-on { background: var(--theme-primary); color: #000; }
+
+.layout-editor .le-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.layout-editor .le-column,
+.layout-editor .le-list { display: flex; flex-direction: column; gap: 8px; min-height: 60px; }
+.layout-editor .le-column-name {
+  margin-bottom: 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--theme-primary);
+  color: var(--theme-primary);
+  font-size: 13px;
+}
+
+.layout-editor .le-tile {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--theme-primary);
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+.layout-editor .le-tile.le-lifted { opacity: 0.35; }
+.layout-editor .le-name { flex: 1 1 auto; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.layout-editor .le-buttons { flex: 0 0 auto; display: flex; gap: 6px; }
+.layout-editor .le-small {
+  padding: 3px 9px;
+  background: transparent;
+  color: var(--theme-primary);
+  border: 1px solid var(--theme-primary);
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.layout-editor .le-drop { flex: 0 0 auto; height: 2px; margin: -5px 0; background: var(--theme-primary); }
+.layout-editor .le-dragging, .layout-editor .le-dragging * { cursor: grabbing !important; }
+
+.layout-editor .le-footer { display: flex; align-items: center; gap: 8px; margin-top: 22px; }
+.layout-editor .le-spacer { flex: 1 1 auto; }
+.layout-editor .le-button {
+  padding: 6px 14px;
+  background: transparent;
+  color: var(--theme-primary);
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.layout-editor .le-button.le-save { background: var(--theme-primary); color: #000; }
+
+/* the copy of a tile that follows the pointer, it lives on the page and not in the window. straight, like the tile it came from */
+.le-ghost {
+  position: fixed;
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  padding: 6px 12px;
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  background: #000;
+  color: var(--theme-primary);
+  opacity: 0.92;
+  pointer-events: none;
+}
+.le-ghost .le-name { flex: 1 1 auto; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 480px) {
+  .layout-editor .le-tile { padding-left: 10px; }
+  .layout-editor .le-footer { gap: 6px; }
+  .layout-editor .le-button { padding: 6px 10px; }
+}
+
+/* wide enough for the panel names next to their buttons. a page wide rule (public/index.html) holds every modal to 400px, which left the
+   names no room at all */
+.layout-editor.modal .modal-dialog { max-width: 640px !important; }
+.layout-editor .modal-content { max-width: none !important; width: 100% !important; }
+
+/* recent changes: one outlined row per change, what it was, when, and the button that takes it back */
+.changes-modal .ch-list { display: flex; flex-direction: column; gap: 8px; max-height: calc(60 * var(--vh)); overflow-y: auto; }
+.changes-modal .ch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 6px 8px 6px 12px;
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+}
+.changes-modal .ch-label { flex: 1 1 auto; min-width: 0; font-size: 13px; color: #fff; overflow-wrap: anywhere; }
+.changes-modal .ch-time { flex: 0 0 auto; font-size: 11px; color: var(--theme-primary); white-space: nowrap; }
+.changes-modal .ch-empty { padding: 18px 0; text-align: center; font-size: 13px; color: #fff; }
+.changes-modal .le-small:hover { background: var(--theme-primary); color: #000; }
+@media (max-width: 480px) {
+  .changes-modal .ch-row { flex-wrap: wrap; }
+  .changes-modal .ch-time { order: 3; }
+}
+
+/* the button in a toast (undo) */
+.toast .toast-action {
+  flex: none;
+  padding: 3px 12px;
+  background: transparent;
+  color: var(--theme-primary);
+  border: 1px solid var(--theme-primary);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.toast .toast-action:hover { background: var(--theme-primary); color: #000; }
+
+/* the small section under the player card while another device of the account plays: a little wave, the song, where it plays */
+.remote-mini {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  min-width: 0;
+}
+.remote-mini .remote-mini-text {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: left;
+  line-height: 1.35;
+}
+
+/* wrapped: a year in music told as full screen slides (Wrapped.js). every slide is one outlined panel like the ones in the app, on a color
+   scheme of its own built from the player color: --w-ink is the plain text, --w-accent the headings, numbers and outlines (the player
+   color or what goes with it), --w-panel what the panel is filled with, --w-on the text on something filled with the accent */
+.wrapped-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  color: var(--w-ink, #fff);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  outline: none;
+  padding: calc(env(safe-area-inset-top) / var(--ui-scale, 1)) calc(env(safe-area-inset-right) / var(--ui-scale, 1)) calc(env(safe-area-inset-bottom) / var(--ui-scale, 1)) calc(env(safe-area-inset-left) / var(--ui-scale, 1));
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.wrapped-top { position: relative; z-index: 3; padding: 14px 16px 12px; display: flex; align-items: center; gap: 12px; border-bottom: 2px solid var(--w-top, #fff); }
+.wrapped-progress { flex: 1; display: flex; gap: 4px; }
+.wrapped-progress-seg { flex: 1; height: 4px; background: rgba(var(--w-top-rgb, 255, 255, 255), 0.28); border-radius: var(--border-radius-sm); overflow: hidden; }
+.wrapped-progress-fill { display: block; height: 100%; width: 0; background: var(--w-top, #fff); }
+.wrapped-progress-fill.wrapped-done { width: 100%; }
+.wrapped-progress-fill.wrapped-running { animation-name: wrapped-fill; animation-timing-function: linear; animation-fill-mode: forwards; }
+.wrapped-x {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--w-top, #fff);
+  color: var(--w-top, #fff);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.wrapped-x:hover { background: var(--w-top, #fff); color: var(--w-top-on, #000); }
+.wrapped-zone { position: absolute; top: 56px; bottom: 0; z-index: 1; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.wrapped-zone-back { left: 0; width: 35%; }
+.wrapped-zone-next { right: 0; width: 65%; }
+.wrapped-slide {
+  position: relative;
+  z-index: 2;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  padding: 16px clamp(14px, calc(4 * var(--vw)), 40px) 22px;
+  pointer-events: none;
+}
+.wrapped-slide button { pointer-events: auto; }
+.wrapped-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  width: 100%;
+  max-width: 640px;
+  max-height: 100%;
+  min-width: 0;
+  padding: clamp(16px, calc(3.4 * var(--vh)), 28px) clamp(16px, calc(4 * var(--vw)), 28px);
+  text-align: left;
+  border: 1px solid var(--w-line, #fff);
+  border-radius: var(--border-radius-sm);
+  background: var(--w-panel, transparent);
+}
+.wrapped-small { font-size: clamp(13px, calc(3.2 * var(--vw)), 15px); font-weight: 700; letter-spacing: 0.04em; color: var(--w-accent, #fff); }
+.wrapped-huge { font-size: clamp(64px, calc(20 * var(--vw)), 132px); font-weight: 800; line-height: 0.95; letter-spacing: -0.04em; color: var(--w-accent, #fff); }
+.wrapped-big { font-size: clamp(26px, calc(7 * var(--vw)), 44px); font-weight: 700; line-height: 1.1; }
+.wrapped-name { font-size: clamp(34px, calc(9.5 * var(--vw)), 68px); font-weight: 800; line-height: 1.02; letter-spacing: -0.03em; overflow-wrap: anywhere; max-width: 100%; }
+.wrapped-sub { color: var(--w-accent, #fff); }
+.wrapped-note { font-size: clamp(14px, calc(3.4 * var(--vw)), 17px); margin-top: 10px; color: var(--w-ink, #fff); }
+.wrapped-month { font-size: clamp(48px, calc(15 * var(--vw)), 104px); }
+.wrapped-row { display: flex; align-items: baseline; gap: 14px; font-size: clamp(16px, calc(4.2 * var(--vw)), 22px); font-weight: 600; min-width: 0; max-width: 100%; }
+.wrapped-rank { flex: none; min-width: 1.4em; font-weight: 700; color: var(--w-accent, #fff); }
+.wrapped-row-text { display: flex; flex-direction: column; min-width: 0; }
+.wrapped-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.wrapped-row-sub { color: var(--w-accent, #fff); font-size: 0.7em; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wrapped-summary-row { margin-top: 6px; }
+.wrapped-bars { display: flex; align-items: flex-end; gap: 6px; height: 110px; margin-top: 14px; width: 100%; max-width: 420px; }
+.wrapped-bar { flex: 1 1 0; min-width: 0; max-width: 14px; background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.35); border-radius: 2px 2px 0 0; }
+.wrapped-bar-top { background: var(--w-accent, #fff); }
+.wrapped-close-row { margin-top: 22px; }
+.wrapped-rise { max-width: 100%; }
+@keyframes wrapped-fill { from { width: 0; } to { width: 100%; } }
+/* one short fade when a slide comes in, nothing else moves */
+.wrapped-slide { animation: wrapped-slide-in 0.22s ease both; }
+@keyframes wrapped-slide-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .wrapped-slide { animation: none; }
+}
+.wrapped-close-row .btn { color: var(--w-accent, #fff) !important; border-color: var(--w-accent, #fff) !important; background: transparent !important; }
+.wrapped-close-row .btn:hover { color: var(--w-on, #000) !important; background: var(--w-accent, #fff) !important; }
+
+.wrapped-bg { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+.wrapped-name-song { font-size: clamp(26px, calc(7.5 * var(--vw)), 50px); }
+.wrapped-sub-line { overflow-wrap: anywhere; max-width: 100%; }
+.wrapped-huge-small { font-size: clamp(52px, calc(15 * var(--vw)), 100px); }
+
+/* thumbnails: a square picture, a round one for artists, or a tile with the first letter when nothing can be found */
+.wrapped-thumb { flex: none; display: inline-block; position: relative; width: var(--w-thumb, 44px); height: var(--w-thumb, 44px); border-radius: var(--border-radius-sm); overflow: hidden; border: 1px solid var(--w-line, #fff); background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.18); }
+.wrapped-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.wrapped-thumb-round { border-radius: 50%; }
+.wrapped-thumb-large { --w-thumb: clamp(100px, calc(28 * var(--vw)), 170px); margin-bottom: 8px; }
+.wrapped-thumb-large.wrapped-thumb-round { border-radius: 50%; }
+.wrapped-thumb-tile { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: calc(var(--w-thumb, 44px) * 0.46); color: var(--w-accent, #fff); }
+
+/* ranked charts (top 10 artists and songs, the repeats, the song of each month) */
+.wrapped-chart { --w-row: clamp(19px, calc((calc(100 * var(--vh)) - 430px) / 10), 44px); margin-top: 8px; display: flex; flex-direction: column; gap: clamp(2px, calc(0.55 * var(--vh)), 7px); width: 100%; min-width: 0; }
+.wrapped-chart .wrapped-thumb { --w-thumb: var(--w-row); }
+.wrapped-trow { display: flex; align-items: center; gap: clamp(8px, calc(2.4 * var(--vw)), 14px); min-width: 0; max-width: 100%; font-size: clamp(12px, calc(var(--w-row) * 0.4), 18px); font-weight: 600; }
+.wrapped-trow .wrapped-rank { min-width: 1.5em; text-align: right; }
+.wrapped-trow .wrapped-row-text { flex: 1 1 0; min-width: 0; gap: 1px; }
+.wrapped-trow .wrapped-row-sub { font-size: 0.8em; }
+.wrapped-trow-bar { display: block; height: 4px; border-radius: 2px; background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.25); margin-top: 3px; overflow: hidden; }
+.wrapped-trow-bar > span { display: block; height: 100%; border-radius: 2px; background: var(--w-accent, #fff); }
+.wrapped-trow-curve .wrapped-spark { flex: none; width: clamp(64px, calc(22 * var(--vw)), 110px); height: auto; }
+.wrapped-chart-months { --w-row: clamp(17px, calc((calc(100 * var(--vh)) - 400px) / 12), 36px); gap: clamp(1px, calc(0.4 * var(--vh)), 5px); }
+.wrapped-month-tag { min-width: 2.4em !important; text-align: left !important; }
+.wrapped-spark-fill { fill: rgba(var(--w-accent-rgb, 255, 255, 255), 0.25); }
+.wrapped-spark-line { fill: none; stroke: var(--w-accent, #fff); stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
+.wrapped-spark-dot { fill: var(--w-accent, #fff); }
+.wrapped-axis { display: flex; justify-content: space-between; width: 100%; max-width: 420px; font-size: 11px; color: var(--w-accent, #fff); margin-top: 4px; }
+.wrapped-bars-hours { height: 70px; gap: 3px; margin-top: 12px; }
+.wrapped-bars-hours .wrapped-bar { max-width: none; }
+.wrapped-bars-week { height: 44px; margin-top: 8px; gap: 8px; max-width: 220px; }
+.wrapped-bars-week .wrapped-bar { max-width: none; }
+.wrapped-axis-week { max-width: 220px; display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; text-align: center; }
+.wrapped-axis-spark { align-self: flex-end; width: clamp(64px, calc(22 * var(--vw)), 110px); max-width: none; }
+
+/* the calendar of the year */
+.wrapped-calwrap { width: 100%; margin-top: 10px; }
+.wrapped-cal { display: grid; grid-template-rows: repeat(7, auto); grid-auto-flow: column; gap: 2px; width: 100%; }
+.wrapped-cal-cell { display: block; aspect-ratio: 1; border-radius: 2px; background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.14); }
+.wrapped-cal-empty { background: transparent; }
+.wrapped-cal-1 { background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.36); }
+.wrapped-cal-2 { background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.56); }
+.wrapped-cal-3 { background: rgba(var(--w-accent-rgb, 255, 255, 255), 0.78); }
+.wrapped-cal-4 { background: var(--w-accent, #fff); }
+
+/* the last panel */
+.wrapped-slide-summary .wrapped-card { max-width: 780px; gap: 8px; }
+.wrapped-summary-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 14px; max-width: 100%; }
+.wrapped-summary-head .wrapped-big { font-size: clamp(22px, calc(5.2 * var(--vw)), 36px); }
+.wrapped-summary-grid, .wrapped-twin { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px 26px; width: 100%; min-width: 0; margin-top: 4px; }
+.wrapped-summary-col { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.wrapped-summary-label { font-size: 12px; font-weight: 700; letter-spacing: 0.04em; color: var(--w-accent, #fff); margin-top: 4px; }
+.wrapped-summary-hero { display: flex; align-items: center; gap: 10px; min-width: 0; --w-thumb: 52px; }
+.wrapped-summary-hero .wrapped-row-text { gap: 0; flex: 1 1 0; min-width: 0; }
+.wrapped-hero-name { font-size: clamp(17px, calc(4.6 * var(--vw)), 24px); font-weight: 800; }
+.wrapped-chart-summary { --w-row: clamp(22px, calc((calc(100 * var(--vh)) - 470px) / 5), 34px); margin-top: 0; gap: clamp(2px, calc(0.5 * var(--vh)), 6px); }
+.wrapped-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px 14px; margin-top: 8px; width: 100%; }
+.wrapped-fact { display: flex; flex-direction: column; min-width: 0; line-height: 1.15; }
+.wrapped-fact b { font-size: clamp(15px, calc(3.8 * var(--vw)), 19px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wrapped-fact i { font-style: normal; font-size: 11px; color: var(--w-accent, #fff); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wrapped-slide-summary .wrapped-close-row { margin-top: 10px; }
+.wrapped-slide-tops .wrapped-card { max-width: 780px; }
+/* a phone: the two columns stay side by side, five rows each, narrower: a small picture and the name, no bar and no number */
+@media (max-width: 620px) {
+  .wrapped-summary-grid, .wrapped-twin { gap: 6px 12px; }
+  .wrapped-twin .wrapped-chart-summary, .wrapped-summary-grid .wrapped-chart-summary { --w-row: 26px; }
+  .wrapped-summary-grid .wrapped-trow, .wrapped-twin .wrapped-trow { gap: 6px; font-size: 11px; }
+  .wrapped-summary-grid .wrapped-rank, .wrapped-twin .wrapped-rank { display: none; }
+  .wrapped-summary-grid .wrapped-trow-bar, .wrapped-twin .wrapped-trow-bar { display: none; }
+  .wrapped-summary-grid .wrapped-row-sub, .wrapped-twin .wrapped-row-sub { display: none; }
+  .wrapped-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .wrapped-facts .wrapped-fact:nth-child(n+5) { display: none; }
+}
+@media (max-width: 620px) and (max-height: 760px) {
+  .wrapped-facts .wrapped-fact:nth-child(n+3) { display: none; }
+}
+/* a short window (a small laptop, a phone on its side): no bars under the rows, smaller text, a tighter card, so ten rows fit */
+@media (max-height: 700px) {
+  .wrapped-trow-bar { display: none; }
+  .wrapped-chart { --w-row: 20px; }
+  .wrapped-trow .wrapped-row-sub { font-size: 0.72em; }
+  .wrapped-card { padding: 12px 18px; gap: 3px; }
+  .wrapped-facts .wrapped-fact:nth-child(n+5) { display: none; }
+}
+
+/* the search above the queue */
+[data-queue-search]::placeholder { color: #fff; opacity: 1; }
+[data-queue-search]:focus { border-color: var(--theme-primary, #fff) !important; }
+
+/* the buttons of the ui size row: three cells of one size, the outline of the other settings buttons */
+.smp-ui-size-button { cursor: pointer; border-radius: 6px; transition: none; }
+.smp-ui-size-button:hover { background: var(--theme-primary) !important; color: #000 !important; }
+.settings-modal .smp-ui-size-button, .settings-modal .smp-ui-size-value { width: 100%; margin: 0; padding-left: 10px; padding-right: 10px; }
+
+/* the lyrics screen: the visualizer blurred a little as the background, plain words in time with the song, the line that is sung in the middle, the others fading with the distance */
+.lyrics-overlay { position: fixed; inset: 0; z-index: 3000; display: flex; flex-direction: column; color: var(--lyr-ink, #fff); background: var(--lyr-base, #000); overflow: hidden; }
+.lyrics-back { position: absolute; inset: -24px; width: calc(100% + 48px); height: calc(100% + 48px); filter: blur(7px); z-index: 0; pointer-events: none; }
+.lyrics-top { position: relative; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; }
+.lyrics-song { min-width: 0; display: flex; flex-direction: column; }
+.lyrics-song-title { font-weight: 700; font-size: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lyrics-song-artist { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--lyr-ink, #fff); }
+.lyrics-view { position: relative; z-index: 1; flex: 1 1 0; min-height: 0; overflow: hidden; padding: 0 clamp(18px, 6vw, 80px); }
+.lyrics-column { display: flex; flex-direction: column; gap: 14px; padding: 40vh 0; transition: transform 0.3s ease-out; max-width: 900px; margin: 0 auto; }
+.lyrics-line { font-size: clamp(20px, 3.4vw, 30px); font-weight: 600; line-height: 1.25; cursor: pointer; opacity: 0.3; overflow-wrap: anywhere; color: var(--lyr-ink, #fff); }
+[data-lyrics-ink="black"] .lyrics-line { text-shadow: 0 0 3px rgba(255, 255, 255, 0.98), 0 0 9px rgba(255, 255, 255, 0.82), 0 0 18px rgba(255, 255, 255, 0.55); }
+.lyrics-line[data-state="now"] { opacity: 1; font-weight: 800; }
+.lyrics-line[data-state="next"], .lyrics-line[data-state="just"] { opacity: 0.6; }
+.lyrics-line:hover { opacity: 0.85; }
+.lyrics-message { position: relative; z-index: 1; margin: auto; font-size: 16px; opacity: 0.85; padding: 0 20px; text-align: center; }
+.lyrics-note { position: relative; z-index: 2; text-align: center; font-size: 12px; opacity: 0.85; padding: 0 18px 10px; color: var(--lyr-ink, #fff); }
+.lyrics-plain { position: relative; z-index: 1; flex: 1 1 0; overflow-y: auto; white-space: pre-wrap; text-align: center; padding: 10px clamp(18px, 6vw, 80px) 60px; max-width: 900px; margin: 0 auto; font-size: clamp(18px, 3vw, 24px); font-weight: 600; line-height: 1.5; width: 100%; }

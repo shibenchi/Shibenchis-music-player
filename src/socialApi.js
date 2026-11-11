@@ -191,6 +191,7 @@ const SOCIAL_PREFIXES = [
   '/api/e2e/',
   '/api/invites',
   '/api/stats',
+  '/api/wrapped',
   '/api/integrations',
   '/api/export/',
   '/api/import/',

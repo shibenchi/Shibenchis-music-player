@@ -81,7 +81,7 @@
     // what the window shows until the app answers: a browser that does not let this page open the app leaves it blank for ever otherwise
     try {
       popup.document.open();
-      popup.document.write('<!doctype html><title>Shibenchi\'s music player</title><body style="background:#000;color:#fff;font:13px system-ui,sans-serif;padding:24px">opening your shibenchi window...<p style="color:#9ca3af">if this stays like this, your browser is not letting the spotify page open the app. press save file on the spotify page instead and import the file in the app</p></body>');
+      popup.document.write('<!doctype html><title>Shibenchi\'s music player</title><body style="background:#000;color:#fff;font:13px system-ui,sans-serif;padding:24px">opening your shibenchi window...<p style="color:#fff">if this stays like this, your browser is not letting the spotify page open the app. press save file on the spotify page instead and import the file in the app</p></body>');
       popup.document.close();
     } catch (e) { /* the window is already somewhere else */ }
     popup.location.href = ORIGIN + '/?view=spotify-send';

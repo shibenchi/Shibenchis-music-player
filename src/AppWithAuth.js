@@ -105,6 +105,10 @@ export default function AppWithAuth() {
     return readGuestThemeColor();
   });
 
+  // the color the thumbnail of the playing song asks for (the "thumbnail color" setting), or none. it only covers the chosen theme color on the screen,
+  // it is never saved: the chosen color is kept as it is and is back when this is none
+  const [autoColor, setAutoColor] = useState(null);
+
   // debug mode toggle
   const [debugMode, setDebugMode] = useState(() => {
     return readGuestDebugMode();
@@ -370,9 +374,11 @@ export default function AppWithAuth() {
       {}
       <OriginalApp
         user={user || null}
-        themeColor={themeColor}
+        themeColor={autoColor || themeColor}
         debugMode={debugMode}
         onThemeColorChange={handleThemeColorChange}
+        onAutoThemeColor={setAutoColor}
+        baseThemeColor={themeColor}
         onDebugModeToggle={handleDebugModeToggle}
         hideListening={hideListening}
         onHideListeningToggle={handleHideListeningToggle}

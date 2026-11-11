@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Marquee from './Marquee';
+import { createVisualizerRenderers } from './vizRenderers';
+import { ampFromSpectrum, unpackFrame } from './wallpaperFrame';
 
 // what the app shows while it is shrunk into android's floating picture in
 // picture window: the player card from the app and the desktop mini player, drawn
@@ -96,51 +98,71 @@ export default function PipPlayer({ nowPlaying }) {
   useEffect(() => {
     let animationId = 0;
     let drawn = null;
-    const softCeiling = (x) => (x <= 0.65 ? x : 0.65 + 0.35 * Math.tanh((x - 0.65) / 0.35));
+    // the drawing the app has picked (the same code as its background), drawn 800 wide on a canvas of its own and scaled into the card
+    const picture = document.createElement('canvas');
+    picture.width = 800;
+    picture.height = 400;
+    const pictureCtx = picture.getContext('2d');
+    const state = {};
+    const fade = { progress: 0 };
+    const ampForBarRange = (index, count, data) => (data ? ampFromSpectrum(index, count, data) : 0);
+    let renderers = null;
+    let rendererPreset = '';
+    let lastDrawAt = 0;
     const draw = () => {
       animationId = requestAnimationFrame(draw);
-      const frame = window.__smpVizFrame;
-      if (frame === drawn) return;
-      drawn = frame;
+      const raw = window.__smpVizFrame;
+      if (raw === drawn) return;
+      drawn = raw;
       const canvas = canvasRef.current;
       if (!canvas) return;
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (!frame || !frame.isPlaying) return;
-      const { baseHue, preset, bins, wave, bassPulse = 0 } = frame;
-
-      if (preset === 'wave' && wave && wave.length > 1) {
-        const midY = canvas.height / 2;
-        const swing = midY * 0.8 * (1 + bassPulse * 0.9);
-        const stepX = canvas.width / (wave.length - 1);
-        ctx.beginPath();
-        for (let i = 0; i < wave.length; i++) {
-          const y = midY + ((wave[i] - 128) / 128) * swing;
-          if (i === 0) ctx.moveTo(0, y);
-          else ctx.lineTo(i * stepX, y);
-        }
-        ctx.lineJoin = 'round';
-        ctx.lineWidth = 6 + bassPulse * 6;
-        ctx.strokeStyle = `hsla(${baseHue}, 85%, 60%, 0.18)`;
-        ctx.stroke();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = `hsla(${baseHue}, 85%, 60%, 0.8)`;
-        ctx.stroke();
-      } else if (bins) {
-        const barCount = bins.length;
-        const gap = 2;
-        const barWidth = canvas.width / barCount - gap;
-        for (let i = 0; i < barCount; i++) {
-          const bassWeight = Math.max(0, 1 - i / (barCount * 0.3));
-          const boosted = softCeiling((bins[i] / 255) * (1 + bassPulse * bassWeight * 2.5));
-          const height = Math.max(2, boosted * canvas.height * 0.85);
-          const gradient = ctx.createLinearGradient(0, canvas.height, 0, canvas.height - height);
-          gradient.addColorStop(0, `hsla(${baseHue}, 85%, 55%, 0.6)`);
-          gradient.addColorStop(1, `hsla(${baseHue}, 90%, 65%, 0.12)`);
-          ctx.fillStyle = gradient;
-          ctx.fillRect(i * (barWidth + gap), canvas.height - height, barWidth, height);
-        }
+      const frame = raw ? unpackFrame(raw) : null;
+      if (!frame || !frame.isPlaying) {
+        fade.progress = 0;
+        return;
       }
+      const preset = frame.preset === 'none' ? 'bars' : frame.preset;
+      if (!renderers || rendererPreset !== preset) {
+        Object.keys(state).forEach((key) => delete state[key]);
+        renderers = createVisualizerRenderers({ canvas: picture, ctx: pictureCtx, state, ampForBarRange });
+        rendererPreset = preset;
+      }
+      // the picture keeps the card's shape
+      const wanted = Math.max(2, Math.round(800 * (canvas.height / Math.max(1, canvas.width))));
+      if (picture.height !== wanted) picture.height = wanted;
+      fade.progress = Math.min(1, fade.progress + 0.1);
+      const now = performance.now();
+      pictureCtx.clearRect(0, 0, picture.width, picture.height);
+      (renderers[preset] || renderers.bars)({
+        soft: frame.soft,
+        beat: frame.beat,
+        bar: frame.bar,
+        bpm: frame.bpm,
+        locked: frame.locked,
+        phase: frame.phase,
+        period: frame.period,
+        beatCount: frame.beatCount,
+        barCount: frame.barCount,
+        beatInBar: frame.beatInBar,
+        now,
+        dt: Math.min(100, Math.max(4, now - (lastDrawAt || now - 33))),
+        baseHue: frame.baseHue,
+        sat: frame.sat,
+        light: frame.light,
+        isPlaying: true,
+        fadeProgress: fade.progress,
+        bassLevel: frame.bassLevel,
+        bassPulse: frame.bassPulse,
+        volumeLevel: frame.volumeLevel,
+        dataArray: frame.spec,
+        timeData: frame.wave
+      });
+      lastDrawAt = now;
+      ctx.globalAlpha = 0.8;
+      ctx.drawImage(picture, 0, 0, canvas.width, canvas.height);
+      ctx.globalAlpha = 1;
     };
     animationId = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(animationId);
@@ -234,8 +256,8 @@ export default function PipPlayer({ nowPlaying }) {
               )}
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <Marquee text={nowPlaying?.title || 'nothing playing'} style={{ fontSize: 13, fontWeight: 600 }} />
-              <Marquee text={nowPlaying?.author || ' '} style={{ fontSize: 11, opacity: 0.7, marginTop: 1 }} />
+              <Marquee text={nowPlaying?.title || 'nothing playing'} animate={isPlaying} style={{ fontSize: 13, fontWeight: 600 }} />
+              <Marquee text={nowPlaying?.author || ' '} animate={isPlaying} style={{ fontSize: 11, opacity: 0.7, marginTop: 1 }} />
             </div>
           </div>
 

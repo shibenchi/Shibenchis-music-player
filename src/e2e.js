@@ -4,7 +4,8 @@
 // that person. the private half is stored on the server too, but locked with a key made from the person's password
 // (PBKDF2 then AES-GCM, done here in the app), so a new device can get it back by typing the password and the
 // server (or someone looking through its files) has nothing but a locked blob. each device keeps the unlocked
-// private key in its own storage so the password is only typed once per device
+// private key in its own storage so the password is only typed once per device. a device that is signed in without the key (the phone,
+// signed in before the key existed) gets it from another device of the account by itself, with no password: see requestKey and answerRequests
 //
 // a message to somebody is locked with a key both of them can work out: ECDH between my private key and their
 // public key (the same number comes out from their private key and my public key), stretched with HKDF, used
@@ -24,6 +25,7 @@ const KDF_ITERATIONS = 250000;
 const CONTEXT = 'smp-dm-v1';
 const ROOM_CONTEXT = 'smp-room-v1';
 const ROOM_KEY_CONTEXT = 'smp-room-key-v1';
+const TRANSFER_CONTEXT = 'smp-key-transfer-v1';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -112,6 +114,22 @@ async function conversationKey(local, peer) {
     ['encrypt', 'decrypt']
   );
 }
+
+// the lock of the account key on its way from one device to another: the AES key both devices can work out from their one time key pairs
+async function transferLock(ownPrivateKey, otherPublicJwk, requesterPub, answererPub) {
+  const other = await subtle().importKey('jwk', cleanPublic(otherPublicJwk), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const bits = await subtle().deriveBits({ name: 'ECDH', public: other }, ownPrivateKey, 256);
+  const material = await subtle().importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+  const info = `${requesterPub.x}.${requesterPub.y}|${answererPub.x}.${answererPub.y}`;
+  return subtle().deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: encoder.encode(TRANSFER_CONTEXT), info: encoder.encode(info) },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+const transferAad = (userId) => encoder.encode(`${TRANSFER_CONTEXT}|${userId}`);
 
 const aadFor = (senderId, receiverId) => encoder.encode(`${CONTEXT}|${senderId}|${receiverId}`);
 // a locked copy of a room key is bound to the room, the key, who locked it and who it is for. a locked message to the room
@@ -301,6 +319,65 @@ export function createE2e({ userId, api, storage }) {
       }
       saveLocalKey(userId, local, storage);
       return true;
+    },
+
+    // ---- the key from another device of the account. a device without the key makes a one time key pair, posts the public half (the server
+    // only passes it on) and waits. a device that has the key locks the account key for that public half and puts the lock back on the server.
+    // nothing the server holds can open it: it is not a copy of the key
+    // handle: what the asking device waits with
+    async requestKey() {
+      const pair = await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+      const pub = cleanPublic(await subtle().exportKey('jwk', pair.publicKey));
+      const made = await api.post('/api/e2e/transfer', { pub: JSON.stringify(pub) });
+      return { id: made.id, pub, privateKey: pair.privateKey };
+    },
+
+    // true: the key came and this device has it now. false: not answered yet. throws (error.status 404) when the request ran out
+    async collectKey(handle) {
+      if (local) return true;
+      const answer = await api.get(`/api/e2e/transfer/${encodeURIComponent(handle.id)}`);
+      if (!answer || !answer.wrapped) return false;
+      let pack;
+      try { pack = JSON.parse(answer.wrapped); } catch { return false; }
+      const answerPub = cleanPublic(pack.pub || {});
+      const lock = await transferLock(handle.privateKey, answerPub, handle.pub, answerPub);
+      let jwk;
+      try {
+        const plain = await subtle().decrypt({ name: 'AES-GCM', iv: fromB64(pack.iv), additionalData: transferAad(userId) }, lock, fromB64(pack.ct));
+        jwk = JSON.parse(decoder.decode(plain));
+      } catch {
+        return false;
+      }
+      if (!jwk || typeof jwk.d !== 'string') return false;
+      // the key has to be the account's key as it is now
+      const current = await api.get('/api/e2e/key');
+      if (!current || !current.key) return false;
+      const publicJwk = cleanPublic(jwk);
+      const kid = await kidOf(publicJwk);
+      if (kid !== current.key.kid) return false;
+      local = { privateJwk: { ...publicJwk, d: jwk.d }, publicJwk, kid };
+      saveLocalKey(userId, local, storage);
+      return true;
+    },
+
+    // a device that has the key answers the devices that ask for it. the number answered
+    async answerRequests() {
+      if (!local) return 0;
+      const list = await api.get('/api/e2e/transfer/pending');
+      let answered = 0;
+      for (const request of (list && list.requests) || []) {
+        let requester;
+        try { requester = cleanPublic(JSON.parse(request.pub)); } catch { continue; }
+        if (typeof requester.x !== 'string' || typeof requester.y !== 'string') continue;
+        const pair = await subtle().generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+        const answerPub = cleanPublic(await subtle().exportKey('jwk', pair.publicKey));
+        const lock = await transferLock(pair.privateKey, requester, requester, answerPub);
+        const iv = randomBytes(12);
+        const ct = await subtle().encrypt({ name: 'AES-GCM', iv, additionalData: transferAad(userId) }, lock, encoder.encode(JSON.stringify(local.privateJwk)));
+        await api.put(`/api/e2e/transfer/${encodeURIComponent(request.id)}`, { wrapped: JSON.stringify({ v: 1, pub: answerPub, iv: toB64(iv), ct: toB64(ct) }) });
+        answered += 1;
+      }
+      return answered;
     },
 
     // does this person have private messages turned on? (null: their app is older)

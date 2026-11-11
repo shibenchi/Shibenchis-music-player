@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,7 +45,11 @@ struct BackendProcesses(Mutex<Vec<(bool, Child)>>);
 static BACKEND_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn port_open(port: u16) -> bool {
-    TcpStream::connect(("127.0.0.1", port)).is_ok()
+    // windows says "refused" for a closed port only after about 2 seconds (it retries the connection first). that was paid
+    // twice at every launch before the servers were even started (3001, then 3002) and on every lap of the wait for the
+    // server. an open port answers at once, so a short limit costs nothing
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
 }
 
 // desktop shortcuts / taskbar pins are a windows-only concept - mac
@@ -199,11 +203,42 @@ pub fn recolor_shortcuts(png: &[u8], key: &str) {
                     link.set_working_dir(Some(parent.to_string_lossy().to_string()));
                 }
                 match link.create_lnk(&link_path) {
-                    Ok(_) => log_line(&format!("recolor_shortcuts: updated {}", link_path.display())),
+                    Ok(_) => {
+                        log_line(&format!("recolor_shortcuts: updated {}", link_path.display()));
+                        // explorer keeps showing the icon it had until it hears the file changed, which it does by itself only
+                        // after a long while. telling it makes the desktop (and the pin, which explorer reads from the same file)
+                        // pick up the new color right away
+                        tell_shell_about(&link_path);
+                    }
                     Err(e) => log_line(&format!("recolor_shortcuts: writing {} FAILED: {e}", link_path.display())),
                 }
             }
             Err(e) => log_line(&format!("recolor_shortcuts: ShellLink::new FAILED: {e}")),
+        }
+    }
+}
+
+// SHChangeNotify from shell32, declared here so no extra crate is needed for one call
+#[link(name = "shell32")]
+extern "system" {
+    fn SHChangeNotify(event: i32, flags: u32, item1: *const std::ffi::c_void, item2: *const std::ffi::c_void);
+}
+const SHCNE_UPDATEDIR: i32 = 0x0000_1000;
+const SHCNE_UPDATEITEM: i32 = 0x0000_2000;
+const SHCNF_PATHW: u32 = 0x0005;
+const SHCNF_FLUSHNOWAIT: u32 = 0x3000;
+
+// the file itself changed, and so did the folder that holds it (the desktop, the folder of the taskbar pins)
+fn tell_shell_about(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let file = wide(path);
+    // SAFETY: both buffers are null terminated utf-16 that live until the calls return, and the second item is not used for these events
+    unsafe {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, file.as_ptr() as *const std::ffi::c_void, std::ptr::null());
+        if let Some(folder) = path.parent() {
+            let folder = wide(folder);
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, folder.as_ptr() as *const std::ffi::c_void, std::ptr::null());
         }
     }
 }
@@ -500,13 +535,11 @@ fn create_or_show_miniplayer(app: &tauri::AppHandle) {
     }
     if let Some(window) = app.get_webview_window(MINIPLAYER_LABEL) {
         log_line("create_or_show_miniplayer: window already exists, showing it");
+        // shown, never focused: it pops up while the person is on their way to another window, and a focused mini player took the
+        // next key press (a space bar hit one of its buttons) and sat first in the alt tab list
         match window.show() {
             Ok(_) => log_line("create_or_show_miniplayer: show() ok"),
             Err(e) => log_line(&format!("create_or_show_miniplayer: show() FAILED: {e}")),
-        }
-        match window.set_focus() {
-            Ok(_) => {}
-            Err(e) => log_line(&format!("create_or_show_miniplayer: set_focus() FAILED: {e}")),
         }
         return;
     }
@@ -525,6 +558,11 @@ fn create_or_show_miniplayer(app: &tauri::AppHandle) {
     .always_on_top(true)
     .decorations(false)
     .skip_taskbar(true)
+    // a window that cannot be activated: it does not take the keyboard when it appears (alt tab out of the player, then type, and the
+    // keys went to the mini player's buttons), and windows leaves it out of the alt tab list. clicks on its buttons and dragging it work
+    // as before, they do not need it to be the active window
+    .focused(false)
+    .focusable(false)
     // the same near black as the card, so a resize never flashes a white
     // frame in before the page has repainted
     .background_color(tauri::window::Color(10, 10, 10, 255))
@@ -619,6 +657,155 @@ fn set_miniplayer_enabled(app: tauri::AppHandle, enabled: bool) {
     }
 }
 
+// ---- the live wallpaper (windows) -----------------------------------------------------------------------------------------------
+// a window with the page ?view=wallpaper (the visualizer, drawn from frames the main window sends), put behind the desktop icons
+// (wallpaper_win.rs). it only exists while the setting is on. a watcher looks once a second whether the desktop can be seen at all
+// (a maximized window or a fullscreen game covers it, or the screen is locked): then the window is hidden and both pages are told
+// ('wallpaper-visible'), so nothing is drawn or sent. when explorer restarts the window goes with it and the watcher builds it again
+#[cfg(windows)]
+mod wallpaper {
+    use super::{log_line, APP_URL};
+    use crate::wallpaper_win as win;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+    use std::thread;
+    use std::time::Duration;
+    use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+    pub const LABEL: &str = "wallpaper";
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    // the window handle while the wallpaper is attached (0: none)
+    static HWND: AtomicIsize = AtomicIsize::new(0);
+    // counts the times it was switched on, so an old watcher ends when it was switched off and on again
+    static RUN: AtomicU64 = AtomicU64::new(0);
+    // the shell's own wallpaper window as it was when ours was put behind the icons (see wallpaper_win::shell_worker)
+    static SHELL_WORKER: AtomicIsize = AtomicIsize::new(0);
+
+    fn build_and_attach(app: &tauri::AppHandle) -> Result<isize, String> {
+        if let Some(old) = app.get_webview_window(LABEL) {
+            let _ = old.destroy();
+        }
+        let url = format!("{APP_URL}/?view=wallpaper");
+        let window = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::External(url.parse().map_err(|e| format!("bad url: {e}"))?))
+            .title("wallpaper")
+            .decorations(false)
+            .skip_taskbar(true)
+            .focused(false)
+            .resizable(false)
+            .shadow(false)
+            // never visible as a normal window: it is shown by attach(), already as a child of the desktop
+            .visible(false)
+            .background_color(tauri::window::Color(10, 10, 10, 255))
+            .build()
+            .map_err(|e| format!("build failed: {e}"))?;
+        let hwnd = window.hwnd().map_err(|e| format!("no window handle: {e}"))?.0 as isize;
+        match win::attach(hwnd) {
+            Ok(attached) => {
+                SHELL_WORKER.store(attached.layer.shell_worker, Ordering::SeqCst);
+                log_line(&format!(
+                    "wallpaper: attached ({} desktop, parent 0x{:X}, {}x{})",
+                    if attached.layer.raised { "raised" } else { "classic" },
+                    attached.layer.parent,
+                    attached.size.0,
+                    attached.size.1
+                ));
+                Ok(hwnd)
+            }
+            Err(e) => {
+                let _ = window.destroy();
+                Err(e)
+            }
+        }
+    }
+
+    fn watch(app: tauri::AppHandle, run: u64) {
+        thread::spawn(move || {
+            let mut hidden_before: Option<bool> = None;
+            let mut failures = 0;
+            loop {
+                // twice a second: the desktop shows up again quickly after a window is minimized
+                thread::sleep(Duration::from_millis(500));
+                if RUN.load(Ordering::SeqCst) != run || !ENABLED.load(Ordering::SeqCst) {
+                    return;
+                }
+                let hwnd = HWND.load(Ordering::SeqCst);
+                if hwnd == 0 || !win::is_window(hwnd) {
+                    // not built yet, or explorer restarted and took the window with it
+                    if failures >= 4 {
+                        log_line("wallpaper: giving up after 4 failed attempts");
+                        ENABLED.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    match build_and_attach(&app) {
+                        Ok(handle) => {
+                            HWND.store(handle, Ordering::SeqCst);
+                            hidden_before = None;
+                            failures = 0;
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            log_line(&format!("wallpaper: attach FAILED ({failures}): {e}"));
+                        }
+                    }
+                    continue;
+                }
+                // the shell made a new wallpaper window of its own (the wallpaper was changed): ours goes back behind the icons
+                let worker = win::shell_worker();
+                if worker != SHELL_WORKER.load(Ordering::SeqCst) {
+                    match win::attach(hwnd) {
+                        Ok(_) => log_line("wallpaper: the shell changed its wallpaper window, put back behind the icons"),
+                        Err(e) => log_line(&format!("wallpaper: could not put it back: {e}")),
+                    }
+                    SHELL_WORKER.store(worker, Ordering::SeqCst);
+                    hidden_before = None;
+                }
+                let hidden = win::desktop_hidden(hwnd);
+                if hidden_before != Some(hidden) {
+                    hidden_before = Some(hidden);
+                    win::show(hwnd, !hidden);
+                    let _ = app.emit_to(LABEL, "wallpaper-visible", !hidden);
+                    let _ = app.emit_to("main", "wallpaper-visible", !hidden);
+                    log_line(&format!("wallpaper: desktop {}", if hidden { "covered or locked, window hidden" } else { "on screen, window shown" }));
+                }
+            }
+        });
+    }
+
+    pub fn set_enabled(app: tauri::AppHandle, enabled: bool) {
+        let was = ENABLED.swap(enabled, Ordering::SeqCst);
+        if enabled == was && (!enabled || HWND.load(Ordering::SeqCst) != 0) {
+            return;
+        }
+        log_line(&format!("set_wallpaper_enabled: {enabled}"));
+        let run = RUN.fetch_add(1, Ordering::SeqCst) + 1;
+        if enabled {
+            thread::spawn(move || {
+                match build_and_attach(&app) {
+                    Ok(handle) => HWND.store(handle, Ordering::SeqCst),
+                    Err(e) => log_line(&format!("wallpaper: attach FAILED: {e}")),
+                }
+                // also when the first try failed (explorer not ready yet): the watcher tries again
+                watch(app, run);
+            });
+        } else {
+            HWND.store(0, Ordering::SeqCst);
+            if let Some(window) = app.get_webview_window(LABEL) {
+                let _ = window.destroy();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn set_wallpaper_enabled(app: tauri::AppHandle, enabled: bool) {
+    wallpaper::set_enabled(app, enabled);
+}
+
+// no wallpaper layer on the other systems
+#[cfg(not(windows))]
+#[tauri::command]
+fn set_wallpaper_enabled(_enabled: bool) {}
+
 #[tauri::command]
 fn toggle_miniplayer(app: tauri::AppHandle) {
     log_line("toggle_miniplayer invoked from frontend");
@@ -665,7 +852,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![toggle_miniplayer, frontend_log, apply_shortcut_prefs, set_shortcut_icon, set_miniplayer_enabled])
+        .invoke_handler(tauri::generate_handler![toggle_miniplayer, frontend_log, apply_shortcut_prefs, set_shortcut_icon, set_miniplayer_enabled, set_wallpaper_enabled])
         .manage(BackendProcesses(Mutex::new(Vec::new())))
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -774,6 +961,10 @@ pub fn run() {
                 .inner_size(1400.0, 760.0)
                 .min_inner_size(1000.0, 560.0)
                 .resizable(true)
+                // on Windows the window's own drop handler takes every drag before the page sees it, so the page's dragstart fired and
+                // its dragover and drop never did: nothing that is dragged inside the app (queue, playlists, panels) could be put down.
+                // index.js stops a file dropped on the window from opening in it instead
+                .disable_drag_drop_handler()
                 .build();
 
                 match window {

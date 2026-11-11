@@ -4,7 +4,8 @@
   "description": "enables the default permissions",
   "windows": [
     "main",
-    "miniplayer"
+    "miniplayer",
+    "wallpaper"
   ],
   "permissions": [
     "core:default",
@@ -13,6 +14,7 @@
     "allow-apply-shortcut-prefs",
     "allow-set-shortcut-icon",
     "allow-set-miniplayer-enabled",
+    "allow-set-wallpaper-enabled",
     "core:window:allow-start-dragging",
     "core:window:allow-set-icon",
     "dialog:allow-save",

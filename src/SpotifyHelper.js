@@ -102,7 +102,7 @@ export function SpotifyHelperPage() {
         <Card className="card-hover shadow-sm" style={{ marginBottom: '16px', color: '#fff' }}>
           <Card.Body>
             <Label>spotify helper</Label>
-            <p style={{ color: '#9ca3af', fontSize: '12px', marginBottom: '16px' }}>for spotify playlists with more than 100 songs. it reads the whole list on the spotify website and sends it to your account</p>
+            <p style={{ color: 'var(--theme-primary)', fontSize: '12px', marginBottom: '16px' }}>for spotify playlists with more than 100 songs. it reads the whole list on the spotify website and sends it to your account</p>
             {step(1, (
               <>
                 <div>drag this button up to your bookmarks bar</div>
@@ -110,14 +110,14 @@ export function SpotifyHelperPage() {
                   <a ref={linkRef} className="btn btn-outline-light btn-sm" data-bookmark draggable="true" title="drag me to the bookmarks bar" onClick={(e) => e.preventDefault()}>send to shibenchi</a>
                   <Button variant="outline-light" size="sm" data-copy-bookmark onClick={copy}>{copied ? 'copied' : 'copy the code'}</Button>
                 </div>
-                <div style={{ color: '#9ca3af', fontSize: '12px', marginTop: '8px' }}>the bookmark does nothing: copy the code, open the spotify page, press F12, open the console tab, paste the code there and press enter. if the window does not open, press save file on the spotify page and import the file in the app (import, from file)</div>
+                <div style={{ color: 'var(--theme-primary)', fontSize: '12px', marginTop: '8px' }}>the bookmark does nothing: copy the code, open the spotify page, press F12, open the console tab, paste the code there and press enter. if the window does not open, press save file on the spotify page and import the file in the app (import, from file)</div>
               </>
             ))}
             {step(2, <div>open the playlist on <strong style={{ color: rgb(color) }}>open.spotify.com</strong> in your browser and press the bookmark. a small window opens, sign in there with your shibenchi account</div>)}
             {step(3, <div>the list goes to your account on its own. in the app open a playlist, press <strong style={{ color: rgb(color) }}>import</strong>, <strong style={{ color: rgb(color) }}>from spotify</strong>, and press import on it</div>)}
           </Card.Body>
         </Card>
-        <p style={{ color: '#9ca3af', fontSize: '12px' }}>the helper only reads the page you have open and sends the song names to your own account. your password is typed in its own window, never on the spotify page</p>
+        <p style={{ color: 'var(--theme-primary)', fontSize: '12px' }}>the helper only reads the page you have open and sends the song names to your own account. your password is typed in its own window, never on the spotify page</p>
       </div>
     </div>
   );

@@ -47,3 +47,6 @@ build-split/
 update-files/
 
 build-desktop/
+
+# build outputs made while testing (the folders that start with build-)
+build-*/
