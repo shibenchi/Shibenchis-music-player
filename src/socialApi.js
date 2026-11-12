@@ -228,9 +228,18 @@ async function fetchOnce(path, options) {
     if (caller.aborted) controller.abort();
     else caller.addEventListener('abort', onCallerAbort, { once: true });
   }
-  const timer = setTimeout(() => controller.abort(), 15000);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 15000);
   try {
     return await fetch(socialUrl(path), { ...options, signal: controller.signal });
+  } catch (error) {
+    // the address did not answer in time. this is a connection problem, the same as a failed connect, so it is reported as one
+    // (not as the browser's own "aborted without reason") and the other address is tried
+    if (timedOut) throw new TypeError('failed to fetch');
+    throw error;
   } finally {
     clearTimeout(timer);
     if (caller) caller.removeEventListener('abort', onCallerAbort);
@@ -248,6 +257,11 @@ async function withFailover(run, callerSignal) {
     if (callerSignal?.aborted) {
       retargetSocialBase();
       throw error;
+    }
+    // a connection that failed (or got no answer in time) looks at both addresses now and tries the one that answers
+    if (error instanceof TypeError) {
+      await chooseSocialBase();
+      return run();
     }
     if (!(await retargetSocialBase())) throw error;
     return run();

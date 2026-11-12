@@ -1,6 +1,6 @@
 {
   "name": "shibenchi-music-player",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "smp": {
     "minShell": "1.6.1"
   },
